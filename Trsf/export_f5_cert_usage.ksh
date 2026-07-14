@@ -60,7 +60,10 @@ cleanup()
 }
 trap cleanup EXIT HUP INT TERM
 
-printf '%s\n' 'host\tcert_name\tused_by_profile\tprofile_used_by\texpiration_date\tsecurity_type\tOrganization\tCN\tIssuer_CN' > "$OUT_FILE" || exit 1
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    'host' 'cert_name' 'used_by_profile' 'profile_used_by' \
+    'expiration_date' 'security_type' 'Organization' 'CN' 'Issuer_CN' \
+    > "$OUT_FILE" || exit 1
 
 run_tmsh()
 {
