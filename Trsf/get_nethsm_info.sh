@@ -18,8 +18,9 @@ OUTPUT_FILE="${2:-nethsm_inventory.tsv}"
 
 SSH_USER="${USER}_net"
 
-VTL_COMMAND='bash -c "/usr/safenet/lunaclient/bin/vtl listServers"'
+VTL_SERVERS_COMMAND='bash -c "/usr/safenet/lunaclient/bin/vtl listServers"'
 PARTITION_COMMAND='show sys crypto encrypted-attributes'
+VTL_VERIFY_COMMAND='bash -c "/usr/safenet/lunaclient/bin/vtl verify"'
 
 SSH_OPTIONS="
     -o StrictHostKeyChecking=no
@@ -64,6 +65,7 @@ TMP_BASE="${TMPDIR:-/tmp}/nethsm_inventory.$$"
 CLEAN_HOSTS="${TMP_BASE}.hosts"
 VTL_OUTPUT="${TMP_BASE}.vtl"
 PARTITION_OUTPUT="${TMP_BASE}.partition"
+VERIFY_OUTPUT="${TMP_BASE}.verify"
 SSH_ERROR="${TMP_BASE}.error"
 
 cleanup()
@@ -71,6 +73,7 @@ cleanup()
     rm -f "$CLEAN_HOSTS" \
           "$VTL_OUTPUT" \
           "$PARTITION_OUTPUT" \
+          "$VERIFY_OUTPUT" \
           "$SSH_ERROR"
 }
 
@@ -127,27 +130,35 @@ do
     PARTITION_NAME=""
     VTL_STATUS=0
     PARTITION_STATUS=0
+    PARTITION_SOURCE=""
 
     ###########################################################################
     # Obtain the configured Luna HSM server IP addresses
     ###########################################################################
 
-    echo "+ ssh ${SSH_USER}@${HOST} '${VTL_COMMAND}'"
+    echo "+ ssh ${SSH_USER}@${HOST} '${VTL_SERVERS_COMMAND}'"
 
     sshpass -p "$PASSNET" \
-        ssh $SSH_OPTIONS \
+        ssh -n $SSH_OPTIONS \
         "${SSH_USER}@${HOST}" \
-        "$VTL_COMMAND" \
+        "$VTL_SERVERS_COMMAND" \
         > "$VTL_OUTPUT" 2> "$SSH_ERROR"
 
     VTL_STATUS=$?
 
     if [ "$VTL_STATUS" -eq 0 ]; then
         SERVER_IPS=$(
+            sed 's/[[:space:]]*HTL required:[[:space:]]*no//g' "$VTL_OUTPUT" |
             awk '
             /^[[:space:]]*Server[[:space:]]*:/ {
                 line = $0
-                sub(/^[[:space:]]*Server[[:space:]]*:[[:space:]]*/, "", line)
+
+                sub(
+                    /^[[:space:]]*Server[[:space:]]*:[[:space:]]*/,
+                    "",
+                    line
+                )
+
                 sub(/[[:space:]]+$/, "", line)
 
                 if (line != "") {
@@ -160,7 +171,7 @@ do
             END {
                 print result
             }
-            ' "$VTL_OUTPUT"
+            '
         )
 
         if [ -n "$SERVER_IPS" ]; then
@@ -177,13 +188,13 @@ do
     fi
 
     ###########################################################################
-    # Obtain the encrypted nethsm_partition object name
+    # First try the newer BIG-IP encrypted-attributes command
     ###########################################################################
 
     echo "+ ssh ${SSH_USER}@${HOST} '${PARTITION_COMMAND}'"
 
     sshpass -p "$PASSNET" \
-        ssh $SSH_OPTIONS \
+        ssh -n $SSH_OPTIONS \
         "${SSH_USER}@${HOST}" \
         "$PARTITION_COMMAND" \
         > "$PARTITION_OUTPUT" 2> "$SSH_ERROR"
@@ -194,22 +205,84 @@ do
         PARTITION_NAME=$(
             awk '
             $1 == "nethsm_partition" {
-                print $2
-                exit
+                if (!seen[$2]++) {
+                    if (result != "")
+                        result = result "," $2
+                    else
+                        result = $2
+                }
+            }
+            END {
+                print result
             }
             ' "$PARTITION_OUTPUT"
         )
+    fi
 
-        if [ -n "$PARTITION_NAME" ]; then
-            echo "  HSM partition    : $PARTITION_NAME"
-        else
-            echo "  WARNING: nethsm_partition was not found."
-        fi
+    if [ -n "$PARTITION_NAME" ]; then
+        PARTITION_SOURCE="encrypted-attributes"
+        echo "  HSM partition    : $PARTITION_NAME"
     else
-        echo "  ERROR: Failed to retrieve nethsm_partition (SSH exit $PARTITION_STATUS)."
+        #######################################################################
+        # Fall back to vtl verify on older BIG-IP versions
+        #######################################################################
 
-        if [ -s "$SSH_ERROR" ]; then
-            sed 's/^/  /' "$SSH_ERROR"
+        if grep 'Syntax Error' "$PARTITION_OUTPUT" >/dev/null 2>&1; then
+            echo "  encrypted-attributes is not supported; trying vtl verify."
+        elif [ "$PARTITION_STATUS" -ne 0 ]; then
+            echo "  encrypted-attributes failed; trying vtl verify."
+        else
+            echo "  nethsm_partition not found; trying vtl verify."
+        fi
+
+        echo "+ ssh ${SSH_USER}@${HOST} '${VTL_VERIFY_COMMAND}'"
+
+        sshpass -p "$PASSNET" \
+            ssh -n $SSH_OPTIONS \
+            "${SSH_USER}@${HOST}" \
+            "$VTL_VERIFY_COMMAND" \
+            > "$VERIFY_OUTPUT" 2> "$SSH_ERROR"
+
+        PARTITION_STATUS=$?
+
+        if [ "$PARTITION_STATUS" -eq 0 ]; then
+            PARTITION_NAME=$(
+                awk '
+                # Expected vtl verify formats:
+                #
+                # - 450006014 ROLB-PROD-C2
+                # 1 450006014 ROLB-PROD-C2
+                #
+                ($1 == "-" || $1 ~ /^[0-9]+$/) &&
+                $2 ~ /^[0-9]+$/ &&
+                $3 != "" {
+                    label = $3
+
+                    if (!seen[label]++) {
+                        if (result != "")
+                            result = result "," label
+                        else
+                            result = label
+                    }
+                }
+                END {
+                    print result
+                }
+                ' "$VERIFY_OUTPUT"
+            )
+
+            if [ -n "$PARTITION_NAME" ]; then
+                PARTITION_SOURCE="vtl verify"
+                echo "  HSM partition    : $PARTITION_NAME"
+            else
+                echo "  WARNING: No partition labels found by vtl verify."
+            fi
+        else
+            echo "  ERROR: vtl verify failed (SSH exit $PARTITION_STATUS)."
+
+            if [ -s "$SSH_ERROR" ]; then
+                sed 's/^/  /' "$SSH_ERROR"
+            fi
         fi
     fi
 
@@ -222,7 +295,10 @@ do
         "$SERVER_IPS" \
         "$PARTITION_NAME" >> "$OUTPUT_FILE"
 
-    if [ "$VTL_STATUS" -eq 0 ] && [ "$PARTITION_STATUS" -eq 0 ]; then
+    if [ "$VTL_STATUS" -eq 0 ] &&
+       [ "$PARTITION_STATUS" -eq 0 ] &&
+       [ -n "$PARTITION_NAME" ]; then
+
         SUCCESSFUL_HOSTS=$((SUCCESSFUL_HOSTS + 1))
         echo "  Result            : SUCCESS"
     else
