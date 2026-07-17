@@ -11,6 +11,10 @@
 # Environment:
 #   USER     Base SSH username. "_net" is appended automatically.
 #   PASSNET  SSH password for the elevated account.
+#
+# Controls:
+#   Ctrl+C   Stop the current SSH command and continue processing
+#   Ctrl+\   Terminate the entire script
 ###############################################################################
 
 HOSTS_FILE="${1:-hosts.inv}"
@@ -58,7 +62,7 @@ if ! command -v sshpass >/dev/null 2>&1; then
 fi
 
 ###############################################################################
-# Temporary files
+# Temporary files and signal handling
 ###############################################################################
 
 TMP_BASE="${TMPDIR:-/tmp}/nethsm_inventory.$$"
@@ -77,9 +81,29 @@ cleanup()
           "$SSH_ERROR"
 }
 
-trap cleanup EXIT HUP INT TERM
+stop_current_command()
+{
+    echo
+    echo "  Ctrl+C received: current command interrupted; continuing."
+}
 
-# Remove blank lines, comments and surrounding whitespace.
+stop_script()
+{
+    echo
+    echo "Ctrl+\\ received: terminating the entire script."
+    exit 131
+}
+
+trap cleanup EXIT
+trap stop_current_command INT
+trap stop_script QUIT
+trap 'exit 1' HUP
+trap 'exit 143' TERM
+
+###############################################################################
+# Prepare host list
+###############################################################################
+
 awk '
 {
     sub(/\r$/, "")
@@ -109,6 +133,9 @@ echo "Output file: $OUTPUT_FILE"
 echo "SSH user   : $SSH_USER"
 echo "Hosts      : $TOTAL_HOSTS"
 echo
+echo "Ctrl+C stops the current SSH command."
+echo "Ctrl+\\ terminates the entire script."
+echo
 
 CURRENT_HOST=0
 SUCCESSFUL_HOSTS=0
@@ -128,13 +155,16 @@ do
 
     SERVER_IPS=""
     PARTITION_NAME=""
+
     VTL_STATUS=0
     PARTITION_STATUS=0
-    PARTITION_SOURCE=""
 
     ###########################################################################
     # Obtain the configured Luna HSM server IP addresses
     ###########################################################################
+
+    : > "$VTL_OUTPUT"
+    : > "$SSH_ERROR"
 
     echo "+ ssh ${SSH_USER}@${HOST} '${VTL_SERVERS_COMMAND}'"
 
@@ -152,13 +182,7 @@ do
             awk '
             /^[[:space:]]*Server[[:space:]]*:/ {
                 line = $0
-
-                sub(
-                    /^[[:space:]]*Server[[:space:]]*:[[:space:]]*/,
-                    "",
-                    line
-                )
-
+                sub(/^[[:space:]]*Server[[:space:]]*:[[:space:]]*/, "", line)
                 sub(/[[:space:]]+$/, "", line)
 
                 if (line != "") {
@@ -191,6 +215,9 @@ do
     # First try the newer BIG-IP encrypted-attributes command
     ###########################################################################
 
+    : > "$PARTITION_OUTPUT"
+    : > "$SSH_ERROR"
+
     echo "+ ssh ${SSH_USER}@${HOST} '${PARTITION_COMMAND}'"
 
     sshpass -p "$PASSNET" \
@@ -204,7 +231,7 @@ do
     if [ "$PARTITION_STATUS" -eq 0 ]; then
         PARTITION_NAME=$(
             awk '
-            $1 == "nethsm_partition" {
+            $1 == "nethsm_partition" && $2 != "" {
                 if (!seen[$2]++) {
                     if (result != "")
                         result = result "," $2
@@ -220,7 +247,6 @@ do
     fi
 
     if [ -n "$PARTITION_NAME" ]; then
-        PARTITION_SOURCE="encrypted-attributes"
         echo "  HSM partition    : $PARTITION_NAME"
     else
         #######################################################################
@@ -235,6 +261,9 @@ do
             echo "  nethsm_partition not found; trying vtl verify."
         fi
 
+        : > "$VERIFY_OUTPUT"
+        : > "$SSH_ERROR"
+
         echo "+ ssh ${SSH_USER}@${HOST} '${VTL_VERIFY_COMMAND}'"
 
         sshpass -p "$PASSNET" \
@@ -248,11 +277,6 @@ do
         if [ "$PARTITION_STATUS" -eq 0 ]; then
             PARTITION_NAME=$(
                 awk '
-                # Expected vtl verify formats:
-                #
-                # - 450006014 ROLB-PROD-C2
-                # 1 450006014 ROLB-PROD-C2
-                #
                 ($1 == "-" || $1 ~ /^[0-9]+$/) &&
                 $2 ~ /^[0-9]+$/ &&
                 $3 != "" {
@@ -272,7 +296,6 @@ do
             )
 
             if [ -n "$PARTITION_NAME" ]; then
-                PARTITION_SOURCE="vtl verify"
                 echo "  HSM partition    : $PARTITION_NAME"
             else
                 echo "  WARNING: No partition labels found by vtl verify."
@@ -287,7 +310,7 @@ do
     fi
 
     ###########################################################################
-    # Write one row for every host, including hosts with missing information
+    # Write one TSV row for every host
     ###########################################################################
 
     printf '%s\t%s\t%s\n' \
