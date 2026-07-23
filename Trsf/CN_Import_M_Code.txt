@@ -1,0 +1,476 @@
+let
+    // Extract all occurrences of CN, OU or O from a distinguished name.
+    // Commas inside quoted values are preserved, and surrounding quotes are removed.
+    ExtractDNValues = (dn as nullable text, attribute as text) as nullable text =>
+        let
+            Quote = Character.FromNumber(34),
+            Backslash = Character.FromNumber(92),
+
+            Characters =
+                if dn = null then
+                    {}
+                else
+                    Text.ToList(dn),
+
+            Parsed =
+                List.Accumulate(
+                    Characters,
+                    [
+                        Parts = {},
+                        Current = "",
+                        InQuotes = false,
+                        Escaped = false
+                    ],
+                    (State, Character) =>
+                        if State[Escaped] then
+                            [
+                                Parts = State[Parts],
+                                Current = State[Current] & Character,
+                                InQuotes = State[InQuotes],
+                                Escaped = false
+                            ]
+
+                        else if Character = Backslash then
+                            [
+                                Parts = State[Parts],
+                                Current = State[Current] & Character,
+                                InQuotes = State[InQuotes],
+                                Escaped = true
+                            ]
+
+                        else if Character = Quote then
+                            [
+                                Parts = State[Parts],
+                                Current = State[Current] & Character,
+                                InQuotes = not State[InQuotes],
+                                Escaped = false
+                            ]
+
+                        else if Character = "," and not State[InQuotes] then
+                            [
+                                Parts =
+                                    State[Parts]
+                                        & {Text.Trim(State[Current])},
+                                Current = "",
+                                InQuotes = false,
+                                Escaped = false
+                            ]
+
+                        else
+                            [
+                                Parts = State[Parts],
+                                Current = State[Current] & Character,
+                                InQuotes = State[InQuotes],
+                                Escaped = false
+                            ]
+                ),
+
+            DNParts =
+                if dn = null or Text.Trim(dn) = "" then
+                    {}
+                else
+                    Parsed[Parts]
+                        & {Text.Trim(Parsed[Current])},
+
+            MatchingParts =
+                List.Select(
+                    DNParts,
+                    each
+                        let
+                            PartName =
+                                try
+                                    Text.Trim(
+                                        Text.BeforeDelimiter(_, "=")
+                                    )
+                                otherwise
+                                    null
+                        in
+                            PartName <> null
+                                and Text.Upper(PartName)
+                                    = Text.Upper(attribute)
+                ),
+
+            ExtractedValues =
+                List.Transform(
+                    MatchingParts,
+                    each
+                        let
+                            RawValue =
+                                try
+                                    Text.Trim(
+                                        Text.AfterDelimiter(_, "=")
+                                    )
+                                otherwise
+                                    null,
+
+                            WithoutOuterQuotes =
+                                if RawValue <> null
+                                    and Text.Length(RawValue) >= 2
+                                    and Text.StartsWith(RawValue, Quote)
+                                    and Text.EndsWith(RawValue, Quote)
+                                then
+                                    Text.Range(
+                                        RawValue,
+                                        1,
+                                        Text.Length(RawValue) - 2
+                                    )
+                                else
+                                    RawValue,
+
+                            CleanValue =
+                                if WithoutOuterQuotes = null then
+                                    null
+                                else
+                                    Text.Replace(
+                                        WithoutOuterQuotes,
+                                        Quote & Quote,
+                                        Quote
+                                    )
+                        in
+                            CleanValue
+                ),
+
+            ValidValues =
+                List.Select(
+                    ExtractedValues,
+                    each _ <> null and Text.Trim(_) <> ""
+                )
+        in
+            if List.IsEmpty(ValidValues) then
+                null
+            else
+                Text.Combine(ValidValues, ", "),
+
+
+    // This is the folder selected through the From Folder dialog.
+    Source =
+        Folder.Files(
+            "C:\Users\B01638882\Downloads"
+        ),
+
+    // Include non-hidden CSV files whose names start with Export.
+    #"Filtered Export CSV Files" =
+        Table.SelectRows(
+            Source,
+            each
+                Text.Lower([Extension]) = ".csv"
+                    and Text.StartsWith(
+                        [Name],
+                        "Export",
+                        Comparer.OrdinalIgnoreCase
+                    )
+                    and Record.FieldOrDefault(
+                        [Attributes],
+                        "Hidden",
+                        false
+                    ) <> true
+        ),
+
+    #"Sorted Files" =
+        Table.Sort(
+            #"Filtered Export CSV Files",
+            {
+                {"Name", Order.Ascending}
+            }
+        ),
+
+    // Import every matching CSV separately, promote its headers,
+    // and add the filename to every imported row.
+    #"Imported Files" =
+        Table.AddColumn(
+            #"Sorted Files",
+            "Imported Data",
+            (CurrentFile as record) as table =>
+                let
+                    CsvData =
+                        Csv.Document(
+                            CurrentFile[Content],
+                            [
+                                Delimiter = ",",
+                                Encoding = 1252,
+                                QuoteStyle = QuoteStyle.Csv
+                            ]
+                        ),
+
+                    Headers =
+                        Table.PromoteHeaders(
+                            CsvData,
+                            [PromoteAllScalars = true]
+                        ),
+
+                    WithSourceFile =
+                        Table.AddColumn(
+                            Headers,
+                            "Source File",
+                            each CurrentFile[Name],
+                            type text
+                        )
+                in
+                    WithSourceFile,
+            type table
+        ),
+
+    // Append all imported files into a single table.
+    #"Combined Files" =
+        Table.Combine(
+            #"Imported Files"[Imported Data]
+        ),
+
+    #"Change Type" =
+        Table.TransformColumnTypes(
+            #"Combined Files",
+            {
+                {"Managed DN", type text},
+                {"Management Type", type text},
+                {"Processing Disabled", type logical},
+                {"In Error", type logical},
+                {"Status", type text},
+                {"Revocation Status", type text},
+                {"Description", type text},
+                {"Processing Stage", type text},
+                {"Contact(s)", type text},
+                {"Approver(s)", type text},
+                {"Last Validation State Update", type text},
+                {"Validation State", type text},
+                {"Last Validation", type text},
+                {"Last Validation Result", type text},
+                {"Private Key Stored", type logical},
+                {"Certificate Stored", type logical},
+                {"CSR Stored", type logical},
+                {"Subject DN", type text},
+                {"Issuer DN", type text},
+                {"Subject Alt Name (DNS)", type text},
+                {"Subject Alt Name (Email)", type text},
+                {"Subject Alt Name (IP)", type text},
+                {"Subject Alt Name (UPN)", type text},
+                {"Subject Alt Name (URI)", type text},
+                {"Common Name", type text},
+                {"Organization", type text},
+                {"Organizational Unit", type text},
+                {"Country", type text},
+                {"State", type text},
+                {"City", type text},
+                {"Valid From", type datetime},
+                {"Valid To", type datetime},
+                {"Signature Algorithm", type text},
+                {"Key Algorithm", type text},
+                {"Serial", type text},
+                {"Key Size", Int64.Type},
+                {"ECC Curve", type text},
+                {"Key Usage", type text},
+                {"Enhanced Key Usage", type text},
+                {"Type", type text},
+                {"Certificate Authority Template", type text},
+                {"Number of Associations", Int64.Type},
+                {
+                    "B5. Is this certificate installed off Barclays' premises?",
+                    type text
+                },
+                {
+                    "F3. Non Compliance Risk Gap Description",
+                    type text
+                },
+                {"1. OU1", type text},
+                {
+                    "E3. Second Additional Notification (30 Days)",
+                    type text
+                },
+                {"F2. Target Remediation Date", type text},
+                {"X1. Reference", type text},
+                {"B6. Off Premises Contact", type text},
+                {"Z7. Previous Serial Number", type text},
+                {"B3. Environment", type text},
+                {"X2. Previous Requester Email", type text},
+                {"Z5. Authoriser Name", type text},
+                {"C1. ITSI Correlation ID", type text},
+                {"B4. Change Number", type text},
+                {
+                    "E1. Early Additional Notification (120 Days)",
+                    type text
+                },
+                {"7. Private key storage", type text},
+                {"D4. Navigator ID/OrderBook", type text},
+                {"A2. ServiceFirst Group", type text},
+                {"Z6. Service Owner Email", type text},
+                {"C2. Transaction Cycle", type text},
+                {"E4. Authoriser/Escalation Notification", type text},
+                {"C3. IT Service Instance", type text},
+                {
+                    "F1. Non Compliance Risk Gap Reference",
+                    type text
+                },
+                {"4. Extended_Key_Usage", type text},
+                {"Z4. Requester Name", type text},
+                {"3. OU3", type text},
+                {"6. Override_Validity", type text},
+                {"B1. Purpose", type text},
+                {"A3. ServiceFirst Group Email", type text},
+                {"X3. Previous Change Number", type text},
+                {"2. OU2", type text},
+                {
+                    "E2. First Additional Notification (60 Days)",
+                    type text
+                },
+                {"B2. Host Name", type text},
+                {"C4. ITSI Description", type text},
+                {"X4. Thumbprint", type text},
+                {"D2. Project Name", type text},
+                {"D3. Project Manager", type text},
+                {"A1. Requester Email", type text},
+                {"Source File", type text}
+            }
+        ),
+
+    #"Removed Columns" =
+        Table.RemoveColumns(
+            #"Change Type",
+            {
+                "Contact(s)",
+                "Approver(s)",
+                "Last Validation State Update"
+            }
+        ),
+
+    #"Added Subject CN" =
+        Table.AddColumn(
+            #"Removed Columns",
+            "Subject CN",
+            each ExtractDNValues([Subject DN], "CN"),
+            type nullable text
+        ),
+
+    #"Added Subject OU" =
+        Table.AddColumn(
+            #"Added Subject CN",
+            "Subject OU",
+            each ExtractDNValues([Subject DN], "OU"),
+            type nullable text
+        ),
+
+    #"Added Subject O" =
+        Table.AddColumn(
+            #"Added Subject OU",
+            "Subject O",
+            each ExtractDNValues([Subject DN], "O"),
+            type nullable text
+        ),
+
+    #"Added Issuer CN" =
+        Table.AddColumn(
+            #"Added Subject O",
+            "Issuer CN",
+            each ExtractDNValues([Issuer DN], "CN"),
+            type nullable text
+        ),
+
+    #"Added Issuer OU" =
+        Table.AddColumn(
+            #"Added Issuer CN",
+            "Issuer OU",
+            each ExtractDNValues([Issuer DN], "OU"),
+            type nullable text
+        ),
+
+    #"Added Issuer O" =
+        Table.AddColumn(
+            #"Added Issuer OU",
+            "Issuer O",
+            each ExtractDNValues([Issuer DN], "O"),
+            type nullable text
+        ),
+
+    // Convert the serial to the colon-separated format displayed by F5.
+    #"Added F5 Serial" =
+        Table.AddColumn(
+            #"Added Issuer O",
+            "F5 Serial",
+            each
+                let
+                    OriginalSerial =
+                        if [Serial] = null then
+                            ""
+                        else
+                            Text.Trim(
+                                Text.From([Serial])
+                            ),
+
+                    HexOnly =
+                        Text.Lower(
+                            Text.Select(
+                                OriginalSerial,
+                                {
+                                    "0".."9",
+                                    "A".."F",
+                                    "a".."f"
+                                }
+                            )
+                        ),
+
+                    PaddedHex =
+                        if Number.Mod(
+                            Text.Length(HexOnly),
+                            2
+                        ) = 1
+                        then
+                            "0" & HexOnly
+                        else
+                            HexOnly,
+
+                    BytePairs =
+                        List.Transform(
+                            List.Split(
+                                Text.ToList(PaddedHex),
+                                2
+                            ),
+                            each Text.Combine(_)
+                        )
+                in
+                    if HexOnly = "" then
+                        null
+                    else
+                        Text.Combine(
+                            BytePairs,
+                            ":"
+                        ),
+            type nullable text
+        ),
+
+    // Put Source File first and F5 Serial immediately after Serial.
+    #"Reordered Columns" =
+        Table.ReorderColumns(
+            #"Added F5 Serial",
+            let
+                ExistingColumns =
+                    Table.ColumnNames(
+                        #"Added F5 Serial"
+                    ),
+
+                RemainingColumns =
+                    List.RemoveItems(
+                        ExistingColumns,
+                        {
+                            "Source File",
+                            "F5 Serial"
+                        }
+                    ),
+
+                SerialPosition =
+                    List.PositionOf(
+                        RemainingColumns,
+                        "Serial"
+                    ) + 1,
+
+                WithF5Serial =
+                    List.InsertRange(
+                        RemainingColumns,
+                        SerialPosition,
+                        {"F5 Serial"}
+                    ),
+
+                FinalOrder =
+                    {"Source File"} & WithF5Serial
+            in
+                FinalOrder
+        )
+in
+    #"Reordered Columns"
