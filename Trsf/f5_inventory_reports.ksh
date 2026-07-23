@@ -218,6 +218,7 @@ depth>0 { line=$0; text=trim(line); before=depth; if (before==1 && text=="cert-k
 AWK
 
 cat > "$TMPROOT/parse_virtual_config.awk" <<'AWK'
+
 BEGIN { FS=OFS="\t" }
 function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
 function unquote(s,n) { s=trim(s); n=length(s); if (n>=2 && substr(s,1,1)=="\"" && substr(s,n,1)=="\"") s=substr(s,2,n-2); return s }
@@ -225,9 +226,9 @@ function norm_name(s) { s=unquote(s); sub(/^\/Common\//, "", s); return s }
 function brace_delta(s,x,o,c) { x=s; o=gsub(/\{/, "", x); x=s; c=gsub(/\}/, "", x); return o-c }
 function clear_lists(i) { for (i=1; i<=pref_count; i++) { delete pref_name[i]; delete pref_context[i] } for (i=1; i<=rule_count; i++) delete rule_name[i]; pref_count=0; rule_count=0 }
 function finish_profile_entry() { pref_count++; pref_name[pref_count]=profile; pref_context[pref_count]=context; profile=""; context="all"; profile_entry_depth=0 }
-function finish_virtual(i) { if (mode=="base") print vip,destination,pool; else if (mode=="profiles") for (i=1; i<=pref_count; i++) print vip,pref_context[i],pref_name[i]; else if (mode=="rules") for (i=1; i<=rule_count; i++) print vip,rule_name[i] }
-/^ltm virtual[[:space:]]+/ { clear_lists(); vip=$0; sub(/^ltm virtual[[:space:]]+/, "", vip); sub(/[[:space:]]+\{[[:space:]]*$/, "", vip); vip=norm_name(vip); destination=""; pool=""; depth=1; profiles_depth=0; profile_entry_depth=0; rules_depth=0; profile=""; context="all"; next }
-depth>0 { line=$0; text=trim(line); before=depth; if (before==1 && text~/^destination[[:space:]]+/) { value=text; sub(/^destination[[:space:]]+/, "", value); destination=norm_name(value) } else if (before==1 && text~/^pool[[:space:]]+/) { value=text; sub(/^pool[[:space:]]+/, "", value); pool=norm_name(value); if (pool=="none") pool="" } else if (before==1 && text=="profiles {") profiles_depth=before+1; else if (profiles_depth>0 && before==profiles_depth && text~/[[:space:]]*\{$/) { profile=text; sub(/[[:space:]]*\{$/, "", profile); profile=norm_name(profile); context="all"; profile_entry_depth=before+1 } else if (profile_entry_depth>0 && before==profile_entry_depth && text~/^context[[:space:]]+/) { value=text; sub(/^context[[:space:]]+/, "", value); context=trim(value) } else if (before==1 && text=="rules {") rules_depth=before+1; else if (rules_depth>0 && before==rules_depth && text!="}" && text!="") { rule_count++; rule_name[rule_count]=norm_name(text) } depth+=brace_delta(line); if (profile_entry_depth>0 && depth<profile_entry_depth) finish_profile_entry(); if (profiles_depth>0 && depth<profiles_depth) profiles_depth=0; if (rules_depth>0 && depth<rules_depth) rules_depth=0; if (depth==0) finish_virtual(); next }
+function finish_virtual(i) { if (mode=="base") print vip,pool; else if (mode=="profiles") for (i=1; i<=pref_count; i++) print vip,pref_context[i],pref_name[i]; else if (mode=="rules") for (i=1; i<=rule_count; i++) print vip,rule_name[i] }
+/^ltm virtual[[:space:]]+/ { clear_lists(); vip=$0; sub(/^ltm virtual[[:space:]]+/, "", vip); sub(/[[:space:]]+\{[[:space:]]*$/, "", vip); vip=norm_name(vip); pool=""; depth=1; profiles_depth=0; profile_entry_depth=0; rules_depth=0; profile=""; context="all"; next }
+depth>0 { line=$0; text=trim(line); before=depth; if (before==1 && text~/^pool[[:space:]]+/) { value=text; sub(/^pool[[:space:]]+/, "", value); pool=norm_name(value); if (pool=="none") pool="" } else if (before==1 && text=="profiles {") profiles_depth=before+1; else if (profiles_depth>0 && before==profiles_depth && text~/[[:space:]]*\{$/) { profile=text; sub(/[[:space:]]*\{$/, "", profile); profile=norm_name(profile); context="all"; profile_entry_depth=before+1 } else if (profile_entry_depth>0 && before==profile_entry_depth && text~/^context[[:space:]]+/) { value=text; sub(/^context[[:space:]]+/, "", value); context=trim(value) } else if (before==1 && text=="rules {") rules_depth=before+1; else if (rules_depth>0 && before==rules_depth && text!="}" && text!="") { rule_count++; rule_name[rule_count]=norm_name(text) } depth+=brace_delta(line); if (profile_entry_depth>0 && depth<profile_entry_depth) finish_profile_entry(); if (profiles_depth>0 && depth<profiles_depth) profiles_depth=0; if (rules_depth>0 && depth<rules_depth) rules_depth=0; if (depth==0) finish_virtual(); next }
 AWK
 
 cat > "$TMPROOT/parse_virtual_stats.awk" <<'AWK'
@@ -253,83 +254,90 @@ depth>0 { line=$0; text=trim(line); if (text~/^ssl-profile[[:space:]]+/) { value
 AWK
 
 cat > "$TMPROOT/parse_pools.awk" <<'AWK'
+
 BEGIN { FS=OFS="\t" }
 function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-function unquote(s,n) { s=trim(s); n=length(s); if (n>=2 && substr(s,1,1)=="\"" && substr(s,n,1)=="\"") s=substr(s,2,n-2); return s }
-function norm_name(s) { s=unquote(s); sub(/^\/Common\//, "", s); return s }
+function norm_name(s) { s=trim(s); sub(/^\/Common\//, "", s); return s }
 function brace_delta(s,x,o,c) { x=s; o=gsub(/\{/, "", x); x=s; c=gsub(/\}/, "", x); return o-c }
-function clean_monitor(s) { s=unquote(s); gsub(/\/Common\//, "", s); if (s=="none") return ""; return s }
-function member_port(s,n,a,p) { s=norm_name(s); if (s~/\]:/) { p=s; sub(/^.*\]:/, "", p); return p } n=split(s,a,":"); if (n>1) return a[n]; n=split(s,a,"[.]"); if (n>1) return a[n]; return "" }
-function fallback_ip(s,n,a,p) { s=norm_name(s); if (s~/^\[/) { p=s; sub(/^\[/, "", p); sub(/\].*$/, "", p); return p } n=split(s,a,":"); if (n==2) return a[1]; return "" }
-function finish_member() { if (member_ip=="") member_ip=fallback_ip(member_name); if (mode=="members") print pool,member_ip,member_port(member_name),member_state }
-function finish_pool() { if (mode=="base") print pool,clean_monitor(monitor) }
-/^ltm pool[[:space:]]+/ { pool=$0; sub(/^ltm pool[[:space:]]+/, "", pool); sub(/[[:space:]]+\{[[:space:]]*$/, "", pool); pool=norm_name(pool); monitor=""; depth=1; members_depth=0; member_depth=0; member_name=""; member_ip=""; member_state=""; next }
-depth>0 { line=$0; text=trim(line); before=depth; if (before==1 && text~/^monitor[[:space:]]+/) { value=text; sub(/^monitor[[:space:]]+/, "", value); monitor=value } else if (before==1 && text=="members {") members_depth=before+1; else if (members_depth>0 && before==members_depth && text~/[[:space:]]*\{$/) { member_name=text; sub(/[[:space:]]*\{$/, "", member_name); member_name=norm_name(member_name); member_ip=""; member_state=""; member_depth=before+1 } else if (member_depth>0 && before==member_depth && text~/^address[[:space:]]+/) { value=text; sub(/^address[[:space:]]+/, "", value); member_ip=trim(value); sub(/%[0-9]+$/, "", member_ip) } else if (member_depth>0 && before==member_depth && text~/^state[[:space:]]+/) { value=text; sub(/^state[[:space:]]+/, "", value); member_state=trim(value) } depth+=brace_delta(line); if (member_depth>0 && depth<member_depth) { finish_member(); member_depth=0 } if (members_depth>0 && depth<members_depth) members_depth=0; if (depth==0) finish_pool(); next }
+function clean_ip(s) { s=trim(s); sub(/^\/Common\//, "", s); sub(/%[0-9]+$/, "", s); return s }
+function clean_port(s) { s=trim(s); if (s=="any" || s=="*" || s=="") return "0"; return s }
+function add_extra(k,v) { if (pool_extra=="") pool_extra=k "=" v; else pool_extra=pool_extra "," k "=" v }
+function finish_member() { if (mode=="members" && member_ip!="") print pool,member_ip,clean_port(member_port),member_admin,member_availability,member_enabled,member_reason; member_ip=""; member_port=""; member_admin=""; member_availability=""; member_enabled=""; member_reason=""; member_depth=0 }
+function finish_pool() { if (mode=="base") print pool,pool_monitor,pool_availability,pool_enabled,pool_reason,pool_extra }
+/^ltm pool[[:space:]]+/ { pool=$0; sub(/^ltm pool[[:space:]]+/, "", pool); sub(/[[:space:]]+\{[[:space:]]*$/, "", pool); pool=norm_name(pool); pool_monitor=""; pool_availability=""; pool_enabled=""; pool_reason=""; pool_extra=""; depth=1; members_depth=0; member_depth=0; next }
+depth>0 { line=$0; text=trim(line); before=depth; if (before==1 && text=="members {") members_depth=before+1; else if (members_depth>0 && before==members_depth && text~/[[:space:]]*\{$/) { member_ip=""; member_port=""; member_admin=""; member_availability=""; member_enabled=""; member_reason=""; member_depth=before+1 } else if (member_depth>0 && before==member_depth && text~/^addr[[:space:]]+/) { value=text; sub(/^addr[[:space:]]+/, "", value); member_ip=clean_ip(value) } else if (member_depth>0 && before==member_depth && text~/^node-name[[:space:]]+/ && member_ip=="") { value=text; sub(/^node-name[[:space:]]+/, "", value); member_ip=clean_ip(value) } else if (member_depth>0 && before==member_depth && text~/^port[[:space:]]+/) { value=text; sub(/^port[[:space:]]+/, "", value); member_port=clean_port(value) } else if (member_depth>0 && before==member_depth && text~/^session-status[[:space:]]+/) { value=text; sub(/^session-status[[:space:]]+/, "", value); member_admin=trim(value) } else if (member_depth>0 && before==member_depth && text~/^status[.]availability-state[[:space:]]+/) { value=text; sub(/^status[.]availability-state[[:space:]]+/, "", value); member_availability=trim(value) } else if (member_depth>0 && before==member_depth && text~/^status[.]enabled-state[[:space:]]+/) { value=text; sub(/^status[.]enabled-state[[:space:]]+/, "", value); member_enabled=trim(value) } else if (member_depth>0 && before==member_depth && text~/^status[.]status-reason[[:space:]]+/) { value=text; sub(/^status[.]status-reason[[:space:]]+/, "", value); member_reason=trim(value) } else if (before==1 && text~/^monitor-rule[[:space:]]+/) { value=text; sub(/^monitor-rule[[:space:]]+/, "", value); pool_monitor=norm_name(value) } else if (before==1 && text~/^status[.]availability-state[[:space:]]+/) { value=text; sub(/^status[.]availability-state[[:space:]]+/, "", value); pool_availability=trim(value) } else if (before==1 && text~/^status[.]enabled-state[[:space:]]+/) { value=text; sub(/^status[.]enabled-state[[:space:]]+/, "", value); pool_enabled=trim(value) } else if (before==1 && text~/^status[.]status-reason[[:space:]]+/) { value=text; sub(/^status[.]status-reason[[:space:]]+/, "", value); pool_reason=trim(value) } else if (before==1 && text~/^status[.]/) { key=text; sub(/[[:space:]].*$/, "", key); value=text; sub(/^[^[:space:]]+[[:space:]]*/, "", value); add_extra(key,value) } depth+=brace_delta(line); if (member_depth>0 && depth<member_depth) finish_member(); if (members_depth>0 && depth<members_depth) members_depth=0; if (depth==0) finish_pool(); next }
 AWK
 
 cat > "$TMPROOT/collect_dns_ips.awk" <<'AWK'
+
 BEGIN { FS=OFS="\t" }
 function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-function destination_ip(s,p,n,a) { s=trim(s); sub(/^\/Common\//, "", s); if (s=="" || s=="none" || s=="*") return ""; if (s~/^\[/) { p=s; sub(/^\[/, "", p); sub(/\].*$/, "", p) } else if (s~/^[0-9][0-9.]*%[0-9]+:/ || s~/^[0-9][0-9.]*:/) { n=split(s,a,":"); p=a[1] } else if (s~/^[0-9][0-9.]*%[0-9]+$/ || s~/^[0-9][0-9.]*$/) p=s; else if (s~/:/ && s~/[.][^.:]+$/) { p=s; sub(/[.][^.:]+$/, "", p) } else p=s; sub(/%[0-9]+$/, "", p); if (p=="0.0.0.0" || p=="::" || p=="*") return ""; return p }
+function destination_ip(s,p,n,a) { s=trim(s); sub(/^\/Common\//, "", s); if (s=="" || s=="none" || s=="*") return ""; if (s~/^\[/) { p=s; sub(/^\[/, "", p); sub(/\].*$/, "", p) } else if (s~/^[0-9][0-9.]*%[0-9]+:/ || s~/^[0-9][0-9.]*:/) { n=split(s,a,":"); p=a[1] } else if (s~/^[0-9][0-9.]*%[0-9]+$/ || s~/^[0-9][0-9.]*$/) p=s; else return ""; sub(/%[0-9]+$/, "", p); if (p=="0.0.0.0" || p=="::" || p=="*") return ""; return p }
 FILENAME==statsfile { ip=destination_ip($2); if (ip!="") print ip; next }
-FILENAME==basefile { ip=destination_ip($2); if (ip!="") print ip; next }
 FILENAME==membersfile { ip=trim($2); sub(/%[0-9]+$/, "", ip); if (ip!="" && ip!="0.0.0.0" && ip!="::" && ip!="*") print ip; next }
 AWK
 
 cat > "$TMPROOT/join_cert_report.awk" <<'AWK'
+
 BEGIN { FS=OFS="\t" }
 function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-function destination_ip(s,p,n,a) { s=trim(s); sub(/^\/Common\//, "", s); if (s=="" || s=="none" || s=="*") return ""; if (s~/^\[/) { p=s; sub(/^\[/, "", p); sub(/\].*$/, "", p) } else if (s~/^[0-9][0-9.]*%[0-9]+:/ || s~/^[0-9][0-9.]*:/) { n=split(s,a,":"); p=a[1] } else if (s~/^[0-9][0-9.]*%[0-9]+$/ || s~/^[0-9][0-9.]*$/) p=s; else if (s~/:/ && s~/[.][^.:]+$/) { p=s; sub(/[.][^.:]+$/, "", p) } else p=s; sub(/%[0-9]+$/, "", p); if (p=="0.0.0.0" || p=="::" || p=="*") return ""; return p }
+function destination_ip(s,p,n,a) { s=trim(s); sub(/^\/Common\//, "", s); if (s=="" || s=="none" || s=="*") return ""; if (s~/^\[/) { p=s; sub(/^\[/, "", p); sub(/\].*$/, "", p) } else if (s~/^[0-9][0-9.]*%[0-9]+:/ || s~/^[0-9][0-9.]*:/) { n=split(s,a,":"); p=a[1] } else if (s~/^[0-9][0-9.]*%[0-9]+$/ || s~/^[0-9][0-9.]*$/) p=s; else return ""; sub(/%[0-9]+$/, "", p); if (p=="0.0.0.0" || p=="::" || p=="*") return ""; return p }
+function destination_port(s,p,n,a) { s=trim(s); if (s=="") return ""; if (s~/^\[/) { p=s; sub(/^.*\]:/, "", p) } else { n=split(s,a,":"); if (n<2) return ""; p=a[n] } if (p=="any" || p=="*") return "0"; return p }
 FILENAME==certfile { cert_exists[$1]=1; cert_exp[$1]=$2; cert_serial[$1]=$3; cert_cu[$1]=$4; cert_org[$1]=$5; cert_cn[$1]=$6; cert_issuer[$1]=$7; cert_san[$1]=$8; next }
 FILENAME==keyfile { key_security[$1]=$2; next }
 FILENAME==profilefile { pairs[$1 SUBSEP $2 SUBSEP $3 SUBSEP $4]=1; next }
-FILENAME==basefile { configured[$1]=$2; next }
 FILENAME==reffile { if ($2=="clientside") usages["clientssl" SUBSEP $3 SUBSEP "VIP_" $1]=1; else if ($2=="serverside") usages["serverssl" SUBSEP $3 SUBSEP "VIP_" $1]=1; else { usages["clientssl" SUBSEP $3 SUBSEP "VIP_" $1]=1; usages["serverssl" SUBSEP $3 SUBSEP "VIP_" $1]=1 } next }
 FILENAME==monitorfile { usages["serverssl" SUBSEP $2 SUBSEP "HTTPS_MON_" $1]=1; next }
 FILENAME==statsfile { stat_dest[$1]=$2; stat_in[$1]=$3; stat_out[$1]=$4; stat_cur[$1]=$5; stat_max[$1]=$6; stat_tot[$1]=$7; stat_avail[$1]=$8; stat_enabled[$1]=$9; stat_reason[$1]=$10; stat_extra[$1]=$11; next }
 FILENAME==dnsfile { dns[$1]=$2; next }
-END { for (u in usages) { split(u,uf,SUBSEP); for (p in pairs) { split(p,pf,SUBSEP); if (pf[1]==uf[1] && pf[2]==uf[2] && (pf[3] in cert_exists)) { security=""; if (pf[4] in key_security) security=key_security[pf[4]]; dest=""; resolved=""; bitsin=""; bitsout=""; cur=""; max=""; tot=""; avail=""; enabled=""; reason=""; extra=""; if (substr(uf[3],1,4)=="VIP_") { vip=substr(uf[3],5); dest=stat_dest[vip]; if (dest=="") dest=configured[vip]; ip=destination_ip(dest); if (ip!="") { if (ip in dns) resolved=dns[ip]; else resolved="NR" } bitsin=stat_in[vip]; bitsout=stat_out[vip]; cur=stat_cur[vip]; max=stat_max[vip]; tot=stat_tot[vip]; avail=stat_avail[vip]; enabled=stat_enabled[vip]; reason=stat_reason[vip]; extra=stat_extra[vip] } row=pf[3] SUBSEP pf[2] SUBSEP uf[3] SUBSEP cert_exp[pf[3]] SUBSEP security SUBSEP cert_serial[pf[3]] SUBSEP cert_cu[pf[3]] SUBSEP cert_org[pf[3]] SUBSEP cert_cn[pf[3]] SUBSEP cert_issuer[pf[3]] SUBSEP cert_san[pf[3]] SUBSEP dest SUBSEP resolved SUBSEP bitsin SUBSEP bitsout SUBSEP cur SUBSEP max SUBSEP tot SUBSEP avail SUBSEP enabled SUBSEP reason SUBSEP extra; rows[row]=1 } } } for (r in rows) { split(r,f,SUBSEP); print f[1],f[2],f[3],f[4],f[5],f[6],f[7],f[8],f[9],f[10],f[11],f[12],f[13],f[14],f[15],f[16],f[17],f[18],f[19],f[20],f[21],f[22] } }
+END { for (u in usages) { split(u,uf,SUBSEP); for (p in pairs) { split(p,pf,SUBSEP); if (pf[1]==uf[1] && pf[2]==uf[2] && (pf[3] in cert_exists)) { security=""; if (pf[4] in key_security) security=key_security[pf[4]]; ip=""; port=""; resolved=""; bitsin=""; bitsout=""; cur=""; max=""; tot=""; avail=""; enabled=""; reason=""; extra=""; if (substr(uf[3],1,4)=="VIP_") { vip=substr(uf[3],5); ip=destination_ip(stat_dest[vip]); port=destination_port(stat_dest[vip]); if (ip!="") { if (ip in dns) resolved=dns[ip]; else resolved="NR" } bitsin=stat_in[vip]; bitsout=stat_out[vip]; cur=stat_cur[vip]; max=stat_max[vip]; tot=stat_tot[vip]; avail=stat_avail[vip]; enabled=stat_enabled[vip]; reason=stat_reason[vip]; extra=stat_extra[vip] } row=pf[3] SUBSEP pf[2] SUBSEP uf[3] SUBSEP cert_exp[pf[3]] SUBSEP security SUBSEP cert_serial[pf[3]] SUBSEP cert_cu[pf[3]] SUBSEP cert_org[pf[3]] SUBSEP cert_cn[pf[3]] SUBSEP cert_issuer[pf[3]] SUBSEP cert_san[pf[3]] SUBSEP ip SUBSEP port SUBSEP resolved SUBSEP bitsin SUBSEP bitsout SUBSEP cur SUBSEP max SUBSEP tot SUBSEP avail SUBSEP enabled SUBSEP reason SUBSEP extra; rows[row]=1 } } } for (r in rows) { split(r,f,SUBSEP); print f[1],f[2],f[3],f[4],f[5],f[6],f[7],f[8],f[9],f[10],f[11],f[12],f[13],f[14],f[15],f[16],f[17],f[18],f[19],f[20],f[21],f[22],f[23] } }
 AWK
 
 cat > "$TMPROOT/join_flat_report.awk" <<'AWK'
+
 BEGIN { FS=OFS="\t" }
 function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-function destination_ip(s,p,n,a) { s=trim(s); sub(/^\/Common\//, "", s); if (s=="" || s=="none" || s=="*") return ""; if (s~/^\[/) { p=s; sub(/^\[/, "", p); sub(/\].*$/, "", p) } else if (s~/^[0-9][0-9.]*%[0-9]+:/ || s~/^[0-9][0-9.]*:/) { n=split(s,a,":"); p=a[1] } else if (s~/^[0-9][0-9.]*%[0-9]+$/ || s~/^[0-9][0-9.]*$/) p=s; else if (s~/:/ && s~/[.][^.:]+$/) { p=s; sub(/[.][^.:]+$/, "", p) } else p=s; sub(/%[0-9]+$/, "", p); if (p=="0.0.0.0" || p=="::" || p=="*") return ""; return p }
-function append(list,value) { if (value=="") return list; if (list=="") return value; return list "," value }
+function destination_ip(s,p,n,a) { s=trim(s); sub(/^\/Common\//, "", s); if (s=="" || s=="none" || s=="*") return ""; if (s~/^\[/) { p=s; sub(/^\[/, "", p); sub(/\].*$/, "", p) } else if (s~/^[0-9][0-9.]*%[0-9]+:/ || s~/^[0-9][0-9.]*:/) { n=split(s,a,":"); p=a[1] } else if (s~/^[0-9][0-9.]*%[0-9]+$/ || s~/^[0-9][0-9.]*$/) p=s; else return ""; sub(/%[0-9]+$/, "", p); if (p=="0.0.0.0" || p=="::" || p=="*") return ""; return p }
+function destination_port(s,p,n,a) { s=trim(s); if (s=="") return ""; if (s~/^\[/) { p=s; sub(/^.*\]:/, "", p) } else { n=split(s,a,":"); if (n<2) return ""; p=a[n] } if (p=="any" || p=="*") return "0"; return p }
+function list_safe(value) { gsub(/,/, ";", value); return value }
+function append(list,value) { if (value=="") return list; value=list_safe(value); if (list=="") return value; return list "," value }
 function add_profile(vip,type,profile,k,p,cert) { k=vip SUBSEP type SUBSEP profile; if (!profile_seen[k]) { profile_seen[k]=1; if (type=="clientssl") client_profiles[vip]=append(client_profiles[vip],profile); else server_profiles[vip]=append(server_profiles[vip],profile) } for (p in profile_certs) { split(p,pf,SUBSEP); if (pf[1]==type && pf[2]==profile) { cert=pf[3]; k=vip SUBSEP type SUBSEP cert; if (!cert_seen[k]) { cert_seen[k]=1; if (type=="clientssl") client_certs[vip]=append(client_certs[vip],cert); else server_certs[vip]=append(server_certs[vip],cert) } } } }
 FILENAME==profilefile { profile_type[$1 SUBSEP $2]=1; profile_certs[$1 SUBSEP $2 SUBSEP $3]=1; next }
 FILENAME==dnsfile { dns[$1]=$2; next }
 FILENAME==statsfile { vips[$1]=1; raw_dest[$1]=$2; bitsin[$1]=$3; bitsout[$1]=$4; cur[$1]=$5; max[$1]=$6; tot[$1]=$7; avail[$1]=$8; enabled[$1]=$9; reason[$1]=$10; extra[$1]=$11; next }
-FILENAME==poolbasefile { pool_monitor[$1]=$2; next }
-FILENAME==poolmembersfile { pool=$1; ip=$2; port=$3; state=$4; key=pool SUBSEP ip SUBSEP port; if (!member_seen[key]) { member_seen[key]=1; resolved="NR"; if (ip in dns) resolved=dns[ip]; member_count[pool]++; if (member_count[pool]==1) { pool_ips[pool]=ip; pool_ports[pool]=port; pool_states[pool]=state; pool_resolved[pool]=resolved } else { pool_ips[pool]=pool_ips[pool] "," ip; pool_ports[pool]=pool_ports[pool] "," port; pool_states[pool]=pool_states[pool] "," state; pool_resolved[pool]=pool_resolved[pool] "," resolved } } next }
+FILENAME==poolbasefile { pool_monitor[$1]=$2; pool_avail[$1]=$3; pool_enabled[$1]=$4; pool_reason[$1]=$5; pool_extra[$1]=$6; next }
+FILENAME==poolmembersfile { pool=$1; ip=$2; port=$3; admin=$4; mavail=$5; menabled=$6; mreason=$7; key=pool SUBSEP ip SUBSEP port; if (!member_seen[key]) { member_seen[key]=1; resolved="NR"; if (ip in dns) resolved=dns[ip]; pool_ips[pool]=append(pool_ips[pool],ip); pool_ports[pool]=append(pool_ports[pool],port); pool_admin[pool]=append(pool_admin[pool],admin); pool_mavail[pool]=append(pool_mavail[pool],mavail); pool_menabled[pool]=append(pool_menabled[pool],menabled); pool_mreason[pool]=append(pool_mreason[pool],mreason); pool_resolved[pool]=append(pool_resolved[pool],resolved) } next }
 FILENAME==reffile { vip=$1; context=$2; profile=$3; vips[vip]=1; if ((context=="clientside" || context=="all") && (("clientssl" SUBSEP profile) in profile_type)) add_profile(vip,"clientssl",profile); if ((context=="serverside" || context=="all") && (("serverssl" SUBSEP profile) in profile_type)) add_profile(vip,"serverssl",profile); next }
 FILENAME==rulesfile { vip=$1; rule=$2; vips[vip]=1; key=vip SUBSEP rule; if (!rule_seen[key]) { rule_seen[key]=1; rules[vip]=append(rules[vip],rule) } next }
-FILENAME==basefile { vips[$1]=1; configured[$1]=$2; vip_pool[$1]=$3; next }
-END { for (vip in vips) { dest=raw_dest[vip]; lookup_dest=dest; if (lookup_dest=="") lookup_dest=configured[vip]; ip=destination_ip(lookup_dest); resolved=""; if (ip!="") { if (ip in dns) resolved=dns[ip]; else resolved="NR" } pool=vip_pool[vip]; print vip,configured[vip],dest,resolved,avail[vip],enabled[vip],reason[vip],extra[vip],bitsin[vip],bitsout[vip],cur[vip],max[vip],tot[vip],pool,pool_monitor[pool],pool_ips[pool],pool_ports[pool],pool_states[pool],pool_resolved[pool],client_profiles[vip],server_profiles[vip],client_certs[vip],server_certs[vip],rules[vip] } }
+FILENAME==basefile { vips[$1]=1; vip_pool[$1]=$2; next }
+END { for (vip in vips) { ip=destination_ip(raw_dest[vip]); port=destination_port(raw_dest[vip]); resolved=""; if (ip!="") { if (ip in dns) resolved=dns[ip]; else resolved="NR" } pool=vip_pool[vip]; print vip,ip,port,resolved,avail[vip],enabled[vip],reason[vip],extra[vip],bitsin[vip],bitsout[vip],cur[vip],max[vip],tot[vip],pool,pool_monitor[pool],pool_avail[pool],pool_enabled[pool],pool_reason[pool],pool_extra[pool],pool_ips[pool],pool_ports[pool],pool_admin[pool],pool_mavail[pool],pool_menabled[pool],pool_mreason[pool],pool_resolved[pool],client_profiles[vip],server_profiles[vip],client_certs[vip],server_certs[vip],rules[vip] } }
 AWK
 
 ###############################################################################
 # Output headers
 ###############################################################################
 
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     'export_date' 'host' 'cert_name' 'used_by_profile' 'profile_used_by' \
     'expiration_date' 'security_type' 'serial_number' 'CU_username' \
     'Organization' 'CN' 'Issuer_CN' 'subject_alternative_name' \
-    'vip_destination' 'vip_destination_resolved' 'clientside_bits_in' \
-    'clientside_bits_out' 'clientside_cur_conns' 'clientside_max_conns' \
-    'clientside_tot_conns' 'availability_state' 'enabled_state' \
-    'status_reason' 'status_extra' > "$OUT_FILE" || exit 1
+    'vip_destination' 'vip_port' 'vip_destination_resolved' \
+    'clientside_bits_in' 'clientside_bits_out' 'clientside_cur_conns' \
+    'clientside_max_conns' 'clientside_tot_conns' 'availability_state' \
+    'enabled_state' 'status_reason' 'status_extra' > "$OUT_FILE" || exit 1
 
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    'export_date' 'host' 'vip_name' 'configured_destination' 'destination' \
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    'export_date' 'host' 'vip_name' 'destination' 'vip_port' \
     'destination_resolved' 'availability_state' 'enabled_state' \
     'status_reason' 'status_extra' 'clientside_bits_in' 'clientside_bits_out' \
     'clientside_cur_conns' 'clientside_max_conns' 'clientside_tot_conns' \
-    'pool_name' 'pool_monitor' 'pool_member_ips' 'pool_member_ports' \
-    'pool_member_admin_states' 'pool_member_resolved' 'client_ssl_profiles' \
-    'server_ssl_profiles' 'client_certificates' 'server_certificates' \
-    'irules' > "$VIP_OUT_FILE" || exit 1
+    'pool_name' 'pool_monitor' 'pool_availability_state' 'pool_enabled_state' \
+    'pool_status_reason' 'pool_status_extra' 'pool_member_ips' \
+    'pool_member_ports' 'pool_member_admin_states' \
+    'pool_member_availability_states' 'pool_member_enabled_states' \
+    'pool_member_status_reasons' 'pool_member_resolved' \
+    'client_ssl_profiles' 'server_ssl_profiles' 'client_certificates' \
+    'server_certificates' 'irules' > "$VIP_OUT_FILE" || exit 1
 
 ###############################################################################
 # SSH execution and signal-aware command control
@@ -503,10 +511,10 @@ do
     run_host_command "$host" 'cd /Common; list sys file ssl-key all-properties' "$hostdir/keys.raw"
     run_host_command "$host" 'cd /Common; list ltm profile client-ssl all-properties' "$hostdir/clientssl.raw"
     run_host_command "$host" 'cd /Common; list ltm profile server-ssl all-properties' "$hostdir/serverssl.raw"
-    run_host_command "$host" 'cd /Common; list ltm virtual { profiles pool destination rules }' "$hostdir/virtual_config.raw"
+    run_host_command "$host" 'cd /Common; list ltm virtual { profiles pool rules }' "$hostdir/virtual_config.raw"
     run_host_command "$host" 'cd /Common; show ltm virtual raw field-fmt' "$hostdir/virtual_stats.raw"
     run_host_command "$host" 'cd /Common; list ltm monitor https all-properties' "$hostdir/monitors.raw"
-    run_host_command "$host" 'cd /Common; list ltm pool' "$hostdir/pools.raw"
+    run_host_command "$host" 'cd /Common; show ltm pool raw field-fmt members' "$hostdir/pools.raw"
 
     if [ "$HOST_INTERRUPTED" -eq 1 ]; then
         echo "[$host] Host skipped because the current SSH command was interrupted with Ctrl+C." >&2
@@ -566,7 +574,7 @@ do
         continue
     fi
 
-    awk -v statsfile="$hostdir/virtual_stats.tsv" -v basefile="$hostdir/virtual_base.tsv" -v membersfile="$hostdir/pool_members.tsv" -f "$TMPROOT/collect_dns_ips.awk" "$hostdir/virtual_stats.tsv" "$hostdir/virtual_base.tsv" "$hostdir/pool_members.tsv" > "$hostdir/dns_ips.unsorted" || LOCAL_FAILED=1
+    awk -v statsfile="$hostdir/virtual_stats.tsv" -v membersfile="$hostdir/pool_members.tsv" -f "$TMPROOT/collect_dns_ips.awk" "$hostdir/virtual_stats.tsv" "$hostdir/pool_members.tsv" > "$hostdir/dns_ips.unsorted" || LOCAL_FAILED=1
     [ "$LOCAL_FAILED" -eq 0 ] && LC_ALL=C sort -u "$hostdir/dns_ips.unsorted" > "$hostdir/dns_ips" || LOCAL_FAILED=1
     [ "$LOCAL_FAILED" -eq 0 ] && resolve_dns_file "$hostdir/dns_ips" "$hostdir/dns.tsv" || LOCAL_FAILED=1
 
@@ -576,7 +584,7 @@ do
         continue
     fi
 
-    awk -v certfile="$hostdir/certs.tsv" -v keyfile="$hostdir/keys.tsv" -v profilefile="$hostdir/profiles.tsv" -v basefile="$hostdir/virtual_base.tsv" -v reffile="$hostdir/virtual_refs.tsv" -v monitorfile="$hostdir/monitors.tsv" -v statsfile="$hostdir/virtual_stats.tsv" -v dnsfile="$hostdir/dns.tsv" -f "$TMPROOT/join_cert_report.awk" "$hostdir/certs.tsv" "$hostdir/keys.tsv" "$hostdir/profiles.tsv" "$hostdir/virtual_base.tsv" "$hostdir/virtual_refs.tsv" "$hostdir/monitors.tsv" "$hostdir/virtual_stats.tsv" "$hostdir/dns.tsv" > "$hostdir/cert_result.unsorted.tsv" || LOCAL_FAILED=1
+    awk -v certfile="$hostdir/certs.tsv" -v keyfile="$hostdir/keys.tsv" -v profilefile="$hostdir/profiles.tsv" -v reffile="$hostdir/virtual_refs.tsv" -v monitorfile="$hostdir/monitors.tsv" -v statsfile="$hostdir/virtual_stats.tsv" -v dnsfile="$hostdir/dns.tsv" -f "$TMPROOT/join_cert_report.awk" "$hostdir/certs.tsv" "$hostdir/keys.tsv" "$hostdir/profiles.tsv" "$hostdir/virtual_refs.tsv" "$hostdir/monitors.tsv" "$hostdir/virtual_stats.tsv" "$hostdir/dns.tsv" > "$hostdir/cert_result.unsorted.tsv" || LOCAL_FAILED=1
     [ "$LOCAL_FAILED" -eq 0 ] && LC_ALL=C sort -u "$hostdir/cert_result.unsorted.tsv" > "$hostdir/cert_result.tsv" || LOCAL_FAILED=1
 
     awk -v profilefile="$hostdir/profiles.tsv" -v dnsfile="$hostdir/dns.tsv" -v statsfile="$hostdir/virtual_stats.tsv" -v poolbasefile="$hostdir/pool_base.tsv" -v poolmembersfile="$hostdir/pool_members.tsv" -v reffile="$hostdir/virtual_refs.tsv" -v rulesfile="$hostdir/virtual_rules.tsv" -v basefile="$hostdir/virtual_base.tsv" -f "$TMPROOT/join_flat_report.awk" "$hostdir/profiles.tsv" "$hostdir/dns.tsv" "$hostdir/virtual_stats.tsv" "$hostdir/pool_base.tsv" "$hostdir/pool_members.tsv" "$hostdir/virtual_refs.tsv" "$hostdir/virtual_rules.tsv" "$hostdir/virtual_base.tsv" > "$hostdir/vip_result.unsorted.tsv" || LOCAL_FAILED=1
