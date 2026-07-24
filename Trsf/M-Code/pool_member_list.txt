@@ -1,0 +1,114 @@
+let
+    Source = Excel.CurrentWorkbook(){[Name="f5_virtual_pool_mapping"]}[Content],
+
+    KeepRequiredColumns = Table.SelectColumns(
+        Source,
+        {
+            "host",
+            "vip_name",
+            "pool_member_ips",
+            "pool_member_resolved"
+        }
+    ),
+
+    AddMemberRows = Table.AddColumn(
+        KeepRequiredColumns,
+        "MemberRows",
+        each
+            let
+                PoolMemberIPs =
+                    if [pool_member_ips] = null
+                        or Text.Trim(Text.From([pool_member_ips])) = ""
+                    then
+                        {}
+                    else
+                        List.Transform(
+                            Text.Split(Text.From([pool_member_ips]), ","),
+                            each Text.Trim(_)
+                        ),
+
+                ResolvedPoolMemberIPs =
+                    if [pool_member_resolved] = null
+                        or Text.Trim(Text.From([pool_member_resolved])) = ""
+                    then
+                        {}
+                    else
+                        List.Transform(
+                            Text.Split(Text.From([pool_member_resolved]), ","),
+                            each Text.Trim(_)
+                        ),
+
+                Rows =
+                    List.Transform(
+                        List.Positions(PoolMemberIPs),
+                        (Index) =>
+                            [
+                                Pool_member_IP = PoolMemberIPs{Index},
+                                Resolved_Pool_member_IP =
+                                    try ResolvedPoolMemberIPs{Index}
+                                    otherwise null
+                            ]
+                    )
+            in
+                Rows,
+        type list
+    ),
+
+    ExpandMemberRows = Table.ExpandListColumn(
+        AddMemberRows,
+        "MemberRows"
+    ),
+
+    ExpandMemberColumns = Table.ExpandRecordColumn(
+        ExpandMemberRows,
+        "MemberRows",
+        {
+            "Pool_member_IP",
+            "Resolved_Pool_member_IP"
+        },
+        {
+            "Pool_member_IP",
+            "Resolved_Pool_member_IP"
+        }
+    ),
+
+    SelectOutputColumns = Table.SelectColumns(
+        ExpandMemberColumns,
+        {
+            "host",
+            "vip_name",
+            "Pool_member_IP",
+            "Resolved_Pool_member_IP"
+        }
+    ),
+
+    RenameColumns = Table.RenameColumns(
+        SelectOutputColumns,
+        {
+            {"host", "Host"},
+            {"vip_name", "VIP"}
+        }
+    ),
+
+    FilterBlankMembers = Table.SelectRows(
+        RenameColumns,
+        each [Pool_member_IP] <> null
+            and Text.Trim([Pool_member_IP]) <> ""
+    ),
+
+    SetColumnTypes = Table.TransformColumnTypes(
+        FilterBlankMembers,
+        {
+            {"Host", type text},
+            {"VIP", type text},
+            {"Pool_member_IP", type text},
+            {"Resolved_Pool_member_IP", type text}
+        }
+    ),
+
+    RemoveDuplicateIPs = Table.Distinct(
+        Table.Buffer(SetColumnTypes),
+        {"Pool_member_IP"}
+    )
+in
+    RemoveDuplicateIPs
