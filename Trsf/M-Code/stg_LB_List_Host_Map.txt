@@ -1,0 +1,108 @@
+let
+    Source =
+        Excel.CurrentWorkbook(){[Name = "LB_List"]}[Content],
+
+    #"Selected Columns" =
+        Table.SelectColumns(
+            Source,
+            {
+                "Hostname",
+                "Target Tenant Hostname",
+                "Migration Package",
+                "Migration Date"
+            },
+            MissingField.UseNull
+        ),
+
+    #"Changed Types" =
+        Table.TransformColumnTypes(
+            #"Selected Columns",
+            {
+                {"Hostname", type text},
+                {"Target Tenant Hostname", type text},
+                {"Migration Package", type text},
+                {"Migration Date", type date}
+            }
+        ),
+
+    #"Source Hosts" =
+        Table.RenameColumns(
+            Table.SelectColumns(
+                #"Changed Types",
+                {
+                    "Hostname",
+                    "Migration Package",
+                    "Migration Date"
+                }
+            ),
+            {
+                {"Hostname", "Host Key"}
+            }
+        ),
+
+    #"Added Source Role" =
+        Table.AddColumn(
+            #"Source Hosts",
+            "Migration Role",
+            each "SOURCE",
+            type text
+        ),
+
+    #"Target Hosts" =
+        Table.RenameColumns(
+            Table.SelectColumns(
+                #"Changed Types",
+                {
+                    "Target Tenant Hostname",
+                    "Migration Package",
+                    "Migration Date"
+                }
+            ),
+            {
+                {"Target Tenant Hostname", "Host Key"}
+            }
+        ),
+
+    #"Added Target Role" =
+        Table.AddColumn(
+            #"Target Hosts",
+            "Migration Role",
+            each "TARGET",
+            type text
+        ),
+
+    #"Combined Host Mapping" =
+        Table.Combine(
+            {
+                #"Added Source Role",
+                #"Added Target Role"
+            }
+        ),
+
+    #"Normalized Hostnames" =
+        Table.TransformColumns(
+            #"Combined Host Mapping",
+            {
+                {
+                    "Host Key",
+                    each
+                        if _ = null then
+                            null
+                        else
+                            Text.Upper(
+                                Text.Trim(
+                                    Text.From(_)
+                                )
+                            ),
+                    type nullable text
+                }
+            }
+        ),
+
+    #"Filtered Blank Hosts" =
+        Table.SelectRows(
+            #"Normalized Hostnames",
+            each [Host Key] <> null and [Host Key] <> ""
+        )
+in
+    #"Filtered Blank Hosts"

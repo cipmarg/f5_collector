@@ -1,0 +1,101 @@
+let
+    CertNowFields =
+        {
+            "Managed DN",
+            "Description",
+            "Subject Alt Name (DNS)",
+            "Common Name",
+            "Valid To",
+            "C1. ITSI Correlation ID",
+            "D4. Navigator ID/OrderBook",
+            "B4. Change Number",
+            "E1. Early Additional Notification (120 Days)",
+            "A2. ServiceFirst Group",
+            "Z6. Service Owner Email",
+            "E4. Authoriser/Escalation Notification",
+            "C3. IT Service Instance",
+            "A3. ServiceFirst Group Email",
+            "E2. First Additional Notification (60 Days)",
+            "A1. Requester Email",
+            "D2. Project Name",
+            "D3. Project Manager"
+        },
+
+    Source =
+        CertNow,
+
+    #"Selected Columns" =
+        Table.SelectColumns(
+            Source,
+            {"Serial", "export_date"} & CertNowFields,
+            MissingField.UseNull
+        ),
+
+    #"Prepared Keys and Dates" =
+        Table.TransformColumns(
+            #"Selected Columns",
+            {
+                {
+                    "Serial",
+                    each
+                        if _ = null then
+                            null
+                        else
+                            Text.Upper(
+                                Text.Trim(
+                                    Text.From(_)
+                                )
+                            ),
+                    type nullable text
+                },
+                {
+                    "export_date",
+                    each
+                        try DateTime.From(_)
+                        otherwise null,
+                    type nullable datetime
+                }
+            }
+        ),
+
+    #"Filtered Blank Serials" =
+        Table.SelectRows(
+            #"Prepared Keys and Dates",
+            each [Serial] <> null and [Serial] <> ""
+        ),
+
+    // Retain the newest CertNow row for each original Serial value
+    #"Grouped by Serial" =
+        Table.Group(
+            #"Filtered Blank Serials",
+            {"Serial"},
+            {
+                {
+                    "Latest",
+                    each
+                        Table.FirstN(
+                            Table.Sort(
+                                _,
+                                {
+                                    {"export_date", Order.Descending}
+                                }
+                            ),
+                            1
+                        ),
+                    type table
+                }
+            }
+        ),
+
+    #"Expanded Latest Record" =
+        Table.ExpandTableColumn(
+            #"Grouped by Serial",
+            "Latest",
+            CertNowFields,
+            List.Transform(
+                CertNowFields,
+                each "CertNow_" & _
+            )
+        )
+in
+    #"Expanded Latest Record"

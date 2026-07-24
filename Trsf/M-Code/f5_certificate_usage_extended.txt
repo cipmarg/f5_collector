@@ -1,0 +1,387 @@
+let
+    // Converts the F5 colon-separated serial into the same format as
+    // the original CertNow[Serial] field.
+    NormalizeUsageSerial = (Value as any) as nullable text =>
+        let
+            Original =
+                if Value = null then
+                    ""
+                else
+                    Text.Trim(
+                        Text.From(Value)
+                    ),
+
+            HexOnly =
+                Text.Upper(
+                    Text.Select(
+                        Original,
+                        {
+                            "0".."9",
+                            "A".."F",
+                            "a".."f"
+                        }
+                    )
+                ),
+
+            Padded =
+                if HexOnly = "" then
+                    null
+                else if Number.Mod(Text.Length(HexOnly), 2) = 1 then
+                    "0" & HexOnly
+                else
+                    HexOnly
+        in
+            Padded,
+
+    // Inserts a list of columns immediately after a specified column.
+    InsertAfter = (
+        Columns as list,
+        Anchor as text,
+        ColumnsToInsert as list
+    ) as list =>
+        let
+            BaseColumns =
+                List.RemoveItems(
+                    Columns,
+                    ColumnsToInsert
+                ),
+
+            AnchorPosition =
+                List.PositionOf(
+                    BaseColumns,
+                    Anchor
+                )
+        in
+            if AnchorPosition < 0 then
+                BaseColumns & ColumnsToInsert
+            else
+                List.InsertRange(
+                    BaseColumns,
+                    AnchorPosition + 1,
+                    ColumnsToInsert
+                ),
+
+    // Assigns cluster letters independently within each
+    // Migration Package + Migration Role group.
+    AssignClusterMembers = (InputTable as table) as table =>
+        let
+            DistinctHosts =
+                Table.Sort(
+                    Table.Distinct(
+                        Table.SelectColumns(
+                            InputTable,
+                            {"_HostKey"}
+                        )
+                    ),
+                    {
+                        {"_HostKey", Order.Ascending}
+                    }
+                ),
+
+            #"Detected Existing Suffix" =
+                Table.AddColumn(
+                    DistinctHosts,
+                    "_ExistingSuffix",
+                    each
+                        let
+                            Hostname = [_HostKey],
+
+                            LastCharacter =
+                                if Hostname = null or Hostname = "" then
+                                    null
+                                else
+                                    Text.End(Hostname, 1)
+                        in
+                            if List.Contains(
+                                {"A", "B", "C", "D"},
+                                LastCharacter
+                            ) then
+                                LastCharacter
+                            else
+                                null,
+                    type nullable text
+                ),
+
+            UsedLetters =
+                List.Distinct(
+                    List.RemoveNulls(
+                        Table.Column(
+                            #"Detected Existing Suffix",
+                            "_ExistingSuffix"
+                        )
+                    )
+                ),
+
+            AvailableLetters =
+                List.Difference(
+                    {"A", "B", "C", "D"},
+                    UsedLetters
+                ),
+
+            HostsWithExistingSuffix =
+                Table.AddColumn(
+                    Table.SelectRows(
+                        #"Detected Existing Suffix",
+                        each [_ExistingSuffix] <> null
+                    ),
+                    "Cluster Member",
+                    each [_ExistingSuffix],
+                    type nullable text
+                ),
+
+            HostsWithoutExistingSuffix =
+                Table.AddIndexColumn(
+                    Table.SelectRows(
+                        #"Detected Existing Suffix",
+                        each [_ExistingSuffix] = null
+                    ),
+                    "_AssignmentIndex",
+                    0,
+                    1,
+                    Int64.Type
+                ),
+
+            AssignedHosts =
+                Table.AddColumn(
+                    HostsWithoutExistingSuffix,
+                    "Cluster Member",
+                    each
+                        try
+                            AvailableLetters{[_AssignmentIndex]}
+                        otherwise
+                            null,
+                    type nullable text
+                ),
+
+            CombinedAssignments =
+                Table.Combine(
+                    {
+                        Table.SelectColumns(
+                            HostsWithExistingSuffix,
+                            {
+                                "_HostKey",
+                                "Cluster Member"
+                            }
+                        ),
+                        Table.SelectColumns(
+                            AssignedHosts,
+                            {
+                                "_HostKey",
+                                "Cluster Member"
+                            }
+                        )
+                    }
+                )
+        in
+            CombinedAssignments,
+
+    CertNowColumns =
+        List.RemoveItems(
+            Table.ColumnNames(stg_CertNow_Latest),
+            {"Serial"}
+        ),
+
+    ClusterColumns =
+        {
+            "Cluster Member",
+            "Cluster Representative",
+            "Migration Role",
+            "Migration Package",
+            "Migration Date"
+        },
+
+    Source =
+        f5_certificate_usage,
+
+    // Temporary serial key used only for the CertNow merge
+    #"Added Normalized Serial" =
+        Table.AddColumn(
+            Source,
+            "_NormalizedSerial",
+            each NormalizeUsageSerial([serial_number]),
+            type nullable text
+        ),
+
+    // Temporary normalized hostname used for the migration-plan merge
+    #"Added Host Match Key" =
+        Table.AddColumn(
+            #"Added Normalized Serial",
+            "_HostKey",
+            each
+                if [host] = null then
+                    null
+                else
+                    Text.Upper(
+                        Text.Trim(
+                            Text.From([host])
+                        )
+                    ),
+            type nullable text
+        ),
+
+    // Match normalized F5 serial_number against the original CertNow Serial
+    #"Merged CertNow" =
+        Table.NestedJoin(
+            #"Added Host Match Key",
+            {"_NormalizedSerial"},
+            stg_CertNow_Latest,
+            {"Serial"},
+            "CertNow Match",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded CertNow" =
+        Table.ExpandTableColumn(
+            #"Merged CertNow",
+            "CertNow Match",
+            CertNowColumns,
+            CertNowColumns
+        ),
+
+    // Match the host against either source or target host in LB_List
+    #"Merged Migration Mapping" =
+        Table.NestedJoin(
+            #"Expanded CertNow",
+            {"_HostKey"},
+            stg_LB_List_Host_Map,
+            {"Host Key"},
+            "Migration Match",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Migration Mapping" =
+        Table.ExpandTableColumn(
+            #"Merged Migration Mapping",
+            "Migration Match",
+            {
+                "Migration Package",
+                "Migration Date",
+                "Migration Role"
+            },
+            {
+                "Migration Package",
+                "Migration Date",
+                "Migration Role"
+            }
+        ),
+
+    // Build one row per distinct host for the cluster calculation
+    #"Distinct Cluster Hosts" =
+        Table.Distinct(
+            Table.SelectColumns(
+                Table.SelectRows(
+                    #"Expanded Migration Mapping",
+                    each
+                        [_HostKey] <> null
+                            and [Migration Package] <> null
+                            and [Migration Role] <> null
+                ),
+                {
+                    "_HostKey",
+                    "Migration Package",
+                    "Migration Role"
+                }
+            )
+        ),
+
+    // Cluster letters are calculated independently for SOURCE and TARGET
+    #"Grouped Cluster Hosts" =
+        Table.Group(
+            #"Distinct Cluster Hosts",
+            {
+                "Migration Package",
+                "Migration Role"
+            },
+            {
+                {
+                    "Cluster Map",
+                    each AssignClusterMembers(_),
+                    type table
+                }
+            }
+        ),
+
+    #"Expanded Cluster Map" =
+        Table.ExpandTableColumn(
+            #"Grouped Cluster Hosts",
+            "Cluster Map",
+            {
+                "_HostKey",
+                "Cluster Member"
+            },
+            {
+                "_HostKey",
+                "Cluster Member"
+            }
+        ),
+
+    #"Merged Cluster Mapping" =
+        Table.NestedJoin(
+            #"Expanded Migration Mapping",
+            {
+                "_HostKey",
+                "Migration Package",
+                "Migration Role"
+            },
+            #"Expanded Cluster Map",
+            {
+                "_HostKey",
+                "Migration Package",
+                "Migration Role"
+            },
+            "Cluster Match",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Cluster Member" =
+        Table.ExpandTableColumn(
+            #"Merged Cluster Mapping",
+            "Cluster Match",
+            {"Cluster Member"},
+            {"Cluster Member"}
+        ),
+
+    #"Added Cluster Representative" =
+        Table.AddColumn(
+            #"Expanded Cluster Member",
+            "Cluster Representative",
+            each [Cluster Member] = "A",
+            type logical
+        ),
+
+    // Remove the two technical merge keys
+    #"Removed Technical Columns" =
+        Table.RemoveColumns(
+            #"Added Cluster Representative",
+            {
+                "_NormalizedSerial",
+                "_HostKey"
+            }
+        ),
+
+    // Put cluster and migration fields immediately after host
+    ColumnOrderWithCluster =
+        InsertAfter(
+            Table.ColumnNames(
+                #"Removed Technical Columns"
+            ),
+            "host",
+            ClusterColumns
+        ),
+
+    // Put all CertNow fields immediately after serial_number
+    FinalColumnOrder =
+        InsertAfter(
+            ColumnOrderWithCluster,
+            "serial_number",
+            CertNowColumns
+        ),
+
+    #"Reordered Columns" =
+        Table.ReorderColumns(
+            #"Removed Technical Columns",
+            FinalColumnOrder,
+            MissingField.Ignore
+        )
+in
+    #"Reordered Columns"
