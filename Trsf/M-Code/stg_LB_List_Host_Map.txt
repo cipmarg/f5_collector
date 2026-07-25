@@ -1,10 +1,39 @@
 let
+    Workbook =
+        Excel.Workbook(
+            File.Contents(
+                "C:\Users\*.xlsx"
+            ),
+            null,
+            true
+        ),
+
     Source =
-        Excel.CurrentWorkbook(){[Name = "LB_List"]}[Content],
+        Workbook{
+            [
+                Item = "LB_List",
+                Kind = "Table"
+            ]
+        }[Data],
+
+    #"Cleaned Column Names" =
+        Table.TransformColumnNames(
+            Source,
+            each
+                Text.Combine(
+                    List.Select(
+                        Splitter.SplitTextByWhitespace()(
+                            Text.Trim(_)
+                        ),
+                        each _ <> ""
+                    ),
+                    " "
+                )
+        ),
 
     #"Selected Columns" =
         Table.SelectColumns(
-            Source,
+            #"Cleaned Column Names",
             {
                 "Hostname",
                 "Target Tenant Hostname",
@@ -14,21 +43,51 @@ let
             MissingField.UseNull
         ),
 
-    #"Changed Types" =
-        Table.TransformColumnTypes(
+    #"Safely Converted Values" =
+        Table.TransformColumns(
             #"Selected Columns",
             {
-                {"Hostname", type text},
-                {"Target Tenant Hostname", type text},
-                {"Migration Package", type text},
-                {"Migration Date", type date}
+                {
+                    "Hostname",
+                    each
+                        if _ = null then
+                            null
+                        else
+                            Text.From(_),
+                    type nullable text
+                },
+                {
+                    "Target Tenant Hostname",
+                    each
+                        if _ = null then
+                            null
+                        else
+                            Text.From(_),
+                    type nullable text
+                },
+                {
+                    "Migration Package",
+                    each
+                        if _ = null then
+                            null
+                        else
+                            Text.From(_),
+                    type nullable text
+                },
+                {
+                    "Migration Date",
+                    each
+                        try Date.From(_)
+                        otherwise null,
+                    type nullable date
+                }
             }
         ),
 
     #"Source Hosts" =
         Table.RenameColumns(
             Table.SelectColumns(
-                #"Changed Types",
+                #"Safely Converted Values",
                 {
                     "Hostname",
                     "Migration Package",
@@ -36,7 +95,10 @@ let
                 }
             ),
             {
-                {"Hostname", "Host Key"}
+                {
+                    "Hostname",
+                    "Host Key"
+                }
             }
         ),
 
@@ -51,7 +113,7 @@ let
     #"Target Hosts" =
         Table.RenameColumns(
             Table.SelectColumns(
-                #"Changed Types",
+                #"Safely Converted Values",
                 {
                     "Target Tenant Hostname",
                     "Migration Package",
@@ -59,7 +121,10 @@ let
                 }
             ),
             {
-                {"Target Tenant Hostname", "Host Key"}
+                {
+                    "Target Tenant Hostname",
+                    "Host Key"
+                }
             }
         ),
 
@@ -79,7 +144,7 @@ let
             }
         ),
 
-    #"Normalized Hostnames" =
+    #"Normalized Mapping Values" =
         Table.TransformColumns(
             #"Combined Host Mapping",
             {
@@ -95,14 +160,33 @@ let
                                 )
                             ),
                     type nullable text
+                },
+                {
+                    "Migration Package",
+                    each
+                        if _ = null then
+                            null
+                        else
+                            Text.Trim(
+                                Text.From(_)
+                            ),
+                    type nullable text
                 }
             }
         ),
 
-    #"Filtered Blank Hosts" =
+    #"Filtered Invalid Hosts" =
         Table.SelectRows(
-            #"Normalized Hostnames",
-            each [Host Key] <> null and [Host Key] <> ""
+            #"Normalized Mapping Values",
+            each
+                [Host Key] <> null
+                    and [Host Key] <> ""
+                    and [Host Key] <> "NO DATA"
+        ),
+
+    #"Removed Exact Duplicates" =
+        Table.Distinct(
+            #"Filtered Invalid Hosts"
         )
 in
-    #"Filtered Blank Hosts"
+    #"Removed Exact Duplicates"

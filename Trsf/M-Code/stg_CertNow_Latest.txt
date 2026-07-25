@@ -27,11 +27,16 @@ let
     #"Selected Columns" =
         Table.SelectColumns(
             Source,
-            {"Serial", "export_date"} & CertNowFields,
+            {
+                "Serial",
+                "export_date",
+                "Source File"
+            }
+                & CertNowFields,
             MissingField.UseNull
         ),
 
-    #"Prepared Keys and Dates" =
+    #"Prepared Merge Key and Date" =
         Table.TransformColumns(
             #"Selected Columns",
             {
@@ -54,48 +59,71 @@ let
                         try DateTime.From(_)
                         otherwise null,
                     type nullable datetime
+                },
+                {
+                    "Source File",
+                    each
+                        if _ = null then
+                            null
+                        else
+                            Text.From(_),
+                    type nullable text
                 }
             }
         ),
 
     #"Filtered Blank Serials" =
         Table.SelectRows(
-            #"Prepared Keys and Dates",
-            each [Serial] <> null and [Serial] <> ""
+            #"Prepared Merge Key and Date",
+            each
+                [Serial] <> null
+                    and [Serial] <> ""
         ),
 
-    // Retain the newest CertNow row for each original Serial value
-    #"Grouped by Serial" =
-        Table.Group(
+    // A single global sort is considerably faster than sorting each group.
+    #"Sorted CertNow Rows" =
+        Table.Sort(
             #"Filtered Blank Serials",
-            {"Serial"},
             {
-                {
-                    "Latest",
-                    each
-                        Table.FirstN(
-                            Table.Sort(
-                                _,
-                                {
-                                    {"export_date", Order.Descending}
-                                }
-                            ),
-                            1
-                        ),
-                    type table
-                }
+                {"Serial", Order.Ascending},
+                {"export_date", Order.Descending},
+                {"Source File", Order.Descending}
             }
         ),
 
-    #"Expanded Latest Record" =
-        Table.ExpandTableColumn(
-            #"Grouped by Serial",
-            "Latest",
+    #"Buffered Sorted CertNow" =
+        Table.Buffer(
+            #"Sorted CertNow Rows"
+        ),
+
+    #"Kept Latest Serial" =
+        Table.Distinct(
+            #"Buffered Sorted CertNow",
+            {"Serial"}
+        ),
+
+    #"Selected Final Fields" =
+        Table.SelectColumns(
+            #"Kept Latest Serial",
+            {"Serial"} & CertNowFields,
+            MissingField.UseNull
+        ),
+
+    PrefixRenames =
+        List.Transform(
             CertNowFields,
-            List.Transform(
-                CertNowFields,
-                each "CertNow_" & _
-            )
+            each
+                {
+                    _,
+                    "CertNow_" & _
+                }
+        ),
+
+    #"Prefixed CertNow Fields" =
+        Table.RenameColumns(
+            #"Selected Final Fields",
+            PrefixRenames,
+            MissingField.Ignore
         )
 in
-    #"Expanded Latest Record"
+    #"Prefixed CertNow Fields"

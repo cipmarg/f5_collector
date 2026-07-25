@@ -1,0 +1,299 @@
+let
+    AssignClusterMembers = (InputTable as table) as table =>
+        let
+            DistinctHosts =
+                Table.Sort(
+                    Table.Distinct(
+                        Table.SelectColumns(
+                            InputTable,
+                            {"_HostKey"}
+                        )
+                    ),
+                    {
+                        {"_HostKey", Order.Ascending}
+                    }
+                ),
+
+            #"Detected Existing Suffix" =
+                Table.AddColumn(
+                    DistinctHosts,
+                    "_ExistingSuffix",
+                    each
+                        let
+                            Hostname =
+                                [_HostKey],
+
+                            LastCharacter =
+                                if Hostname = null
+                                    or Hostname = ""
+                                then
+                                    null
+                                else
+                                    Text.End(
+                                        Hostname,
+                                        1
+                                    )
+                        in
+                            if List.Contains(
+                                {
+                                    "A",
+                                    "B",
+                                    "C",
+                                    "D"
+                                },
+                                LastCharacter
+                            ) then
+                                LastCharacter
+                            else
+                                null,
+                    type nullable text
+                ),
+
+            UsedLetters =
+                List.Distinct(
+                    List.RemoveNulls(
+                        Table.Column(
+                            #"Detected Existing Suffix",
+                            "_ExistingSuffix"
+                        )
+                    )
+                ),
+
+            AvailableLetters =
+                List.Difference(
+                    {
+                        "A",
+                        "B",
+                        "C",
+                        "D"
+                    },
+                    UsedLetters
+                ),
+
+            HostsWithExistingSuffix =
+                Table.AddColumn(
+                    Table.SelectRows(
+                        #"Detected Existing Suffix",
+                        each [_ExistingSuffix] <> null
+                    ),
+                    "Cluster Member",
+                    each [_ExistingSuffix],
+                    type nullable text
+                ),
+
+            HostsWithoutExistingSuffix =
+                Table.AddIndexColumn(
+                    Table.SelectRows(
+                        #"Detected Existing Suffix",
+                        each [_ExistingSuffix] = null
+                    ),
+                    "_AssignmentIndex",
+                    0,
+                    1,
+                    Int64.Type
+                ),
+
+            AssignedHosts =
+                Table.AddColumn(
+                    HostsWithoutExistingSuffix,
+                    "Cluster Member",
+                    each
+                        try
+                            AvailableLetters{
+                                [_AssignmentIndex]
+                            }
+                        otherwise
+                            null,
+                    type nullable text
+                ),
+
+            Result =
+                Table.Combine(
+                    {
+                        Table.SelectColumns(
+                            HostsWithExistingSuffix,
+                            {
+                                "_HostKey",
+                                "Cluster Member"
+                            }
+                        ),
+                        Table.SelectColumns(
+                            AssignedHosts,
+                            {
+                                "_HostKey",
+                                "Cluster Member"
+                            }
+                        )
+                    }
+                )
+        in
+            Result,
+
+    SourceHosts =
+        Table.Distinct(
+            Table.SelectRows(
+                Table.SelectColumns(
+                    stg_F5_Certificate_Usage_Core,
+                    {"_HostKey"}
+                ),
+                each
+                    [_HostKey] <> null
+                        and [_HostKey] <> ""
+            )
+        ),
+
+    HostMapping =
+        Table.Buffer(
+            stg_LB_List_Host_Map
+        ),
+
+    #"Merged Migration Mapping" =
+        Table.NestedJoin(
+            SourceHosts,
+            {"_HostKey"},
+            HostMapping,
+            {"Host Key"},
+            "Migration Match",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Migration Mapping" =
+        Table.ExpandTableColumn(
+            #"Merged Migration Mapping",
+            "Migration Match",
+            {
+                "Migration Package",
+                "Migration Date",
+                "Migration Role"
+            },
+            {
+                "Migration Package",
+                "Migration Date",
+                "Migration Role"
+            }
+        ),
+
+    #"Matched Hosts" =
+        Table.SelectRows(
+            #"Expanded Migration Mapping",
+            each
+                [Migration Package] <> null
+                    and [Migration Role] <> null
+        ),
+
+    #"Grouped Cluster Hosts" =
+        Table.Group(
+            #"Matched Hosts",
+            {
+                "Migration Package",
+                "Migration Role"
+            },
+            {
+                {
+                    "Cluster Assignment",
+                    each AssignClusterMembers(_),
+                    type table
+                }
+            }
+        ),
+
+    #"Expanded Cluster Assignments" =
+        Table.ExpandTableColumn(
+            #"Grouped Cluster Hosts",
+            "Cluster Assignment",
+            {
+                "_HostKey",
+                "Cluster Member"
+            },
+            {
+                "_HostKey",
+                "Cluster Member"
+            }
+        ),
+
+    #"Merged Assigned Members" =
+        Table.NestedJoin(
+            #"Matched Hosts",
+            {
+                "_HostKey",
+                "Migration Package",
+                "Migration Role"
+            },
+            #"Expanded Cluster Assignments",
+            {
+                "_HostKey",
+                "Migration Package",
+                "Migration Role"
+            },
+            "Cluster Match",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Assigned Members" =
+        Table.ExpandTableColumn(
+            #"Merged Assigned Members",
+            "Cluster Match",
+            {"Cluster Member"},
+            {"Cluster Member"}
+        ),
+
+    #"Added Cluster Representative" =
+        Table.AddColumn(
+            #"Expanded Assigned Members",
+            "Cluster Representative",
+            each [Cluster Member] = "A",
+            type logical
+        ),
+
+    #"Unmatched Hosts" =
+        Table.SelectRows(
+            #"Expanded Migration Mapping",
+            each
+                [Migration Package] = null
+                    or [Migration Role] = null
+        ),
+
+    #"Added Blank Cluster Member" =
+        Table.AddColumn(
+            #"Unmatched Hosts",
+            "Cluster Member",
+            each null,
+            type nullable text
+        ),
+
+    #"Added Unmatched Representative Flag" =
+        Table.AddColumn(
+            #"Added Blank Cluster Member",
+            "Cluster Representative",
+            each false,
+            type logical
+        ),
+
+    #"Combined Host Results" =
+        Table.Combine(
+            {
+                #"Added Cluster Representative",
+                #"Added Unmatched Representative Flag"
+            }
+        ),
+
+    #"Selected Final Columns" =
+        Table.SelectColumns(
+            #"Combined Host Results",
+            {
+                "_HostKey",
+                "Migration Package",
+                "Migration Date",
+                "Migration Role",
+                "Cluster Member",
+                "Cluster Representative"
+            }
+        ),
+
+    #"Removed Duplicate Hosts" =
+        Table.Distinct(
+            #"Selected Final Columns",
+            {"_HostKey"}
+        )
+in
+    #"Removed Duplicate Hosts"

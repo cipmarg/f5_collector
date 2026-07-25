@@ -1,0 +1,126 @@
+let
+    NormalizeKeyText = (Value as any) as text =>
+        if Value = null then
+            ""
+        else
+            Text.Upper(
+                Text.Trim(
+                    Text.From(Value)
+                )
+            ),
+
+    MakeKey = (Values as list) as text =>
+        Text.Combine(
+            List.Transform(
+                Values,
+                each
+                    let
+                        Normalized =
+                            NormalizeKeyText(_)
+                    in
+                        Text.From(
+                            Text.Length(Normalized)
+                        )
+                            & ":"
+                            & Normalized
+            ),
+            "|"
+        ),
+
+    NormalizeUsageSerial = (Value as any) as nullable text =>
+        let
+            Original =
+                if Value = null then
+                    ""
+                else
+                    Text.Trim(
+                        Text.From(Value)
+                    ),
+
+            UpperOriginal =
+                Text.Upper(Original),
+
+            IsPlaceholder =
+                List.Contains(
+                    {
+                        "",
+                        "N/A",
+                        "NA",
+                        "NONE",
+                        "NULL",
+                        "-"
+                    },
+                    UpperOriginal
+                ),
+
+            HexOnly =
+                if IsPlaceholder then
+                    ""
+                else
+                    Text.Upper(
+                        Text.Select(
+                            Original,
+                            {
+                                "0".."9",
+                                "A".."F",
+                                "a".."f"
+                            }
+                        )
+                    ),
+
+            Padded =
+                if HexOnly = "" then
+                    null
+                else if Number.Mod(
+                    Text.Length(HexOnly),
+                    2
+                ) = 1 then
+                    "0" & HexOnly
+                else
+                    HexOnly
+        in
+            Padded,
+
+    Source =
+        f5_certificate_usage,
+
+    #"Added Host Key" =
+        Table.AddColumn(
+            Source,
+            "_HostKey",
+            each
+                if [host] = null then
+                    null
+                else
+                    NormalizeKeyText([host]),
+            type nullable text
+        ),
+
+    #"Added Normalized Serial" =
+        Table.AddColumn(
+            #"Added Host Key",
+            "_NormalizedSerial",
+            each
+                NormalizeUsageSerial(
+                    [serial_number]
+                ),
+            type nullable text
+        ),
+
+    #"Added Usage Key" =
+        Table.AddColumn(
+            #"Added Normalized Serial",
+            "_UsageKey",
+            each
+                MakeKey(
+                    {
+                        [host],
+                        [cert_name],
+                        [used_by_profile],
+                        [profile_used_by]
+                    }
+                ),
+            type text
+        )
+in
+    #"Added Usage Key"

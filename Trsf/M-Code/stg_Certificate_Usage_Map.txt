@@ -1,0 +1,339 @@
+let
+    NormalizeKeyText = (Value as any) as text =>
+        if Value = null then
+            ""
+        else
+            Text.Upper(
+                Text.Trim(
+                    Text.From(Value)
+                )
+            ),
+
+    MakeKey = (Values as list) as text =>
+        Text.Combine(
+            List.Transform(
+                Values,
+                each
+                    let
+                        Normalized =
+                            NormalizeKeyText(_)
+                    in
+                        Text.From(
+                            Text.Length(Normalized)
+                        )
+                            & ":"
+                            & Normalized
+            ),
+            "|"
+        ),
+
+    Source =
+        Table.SelectColumns(
+            stg_F5_Certificate_Usage_Core,
+            {
+                "_UsageKey",
+                "_HostKey",
+                "_NormalizedSerial",
+                "cert_name",
+                "used_by_profile",
+                "profile_used_by"
+            },
+            MissingField.UseNull
+        ),
+
+    ClusterLookup =
+        Table.Buffer(
+            Table.SelectColumns(
+                stg_Cluster_Host_Map,
+                {
+                    "_HostKey",
+                    "Migration Package",
+                    "Migration Role",
+                    "Cluster Member"
+                }
+            )
+        ),
+
+    #"Merged Cluster Scope" =
+        Table.NestedJoin(
+            Source,
+            {"_HostKey"},
+            ClusterLookup,
+            {"_HostKey"},
+            "Cluster Scope",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Cluster Scope" =
+        Table.ExpandTableColumn(
+            #"Merged Cluster Scope",
+            "Cluster Scope",
+            {
+                "Migration Package",
+                "Migration Role",
+                "Cluster Member"
+            },
+            {
+                "Migration Package",
+                "Migration Role",
+                "Cluster Member"
+            }
+        ),
+
+    #"Added Certificate Key" =
+        Table.AddColumn(
+            #"Expanded Cluster Scope",
+            "_CertificateKey",
+            each
+                if [_NormalizedSerial] <> null
+                    and [_NormalizedSerial] <> ""
+                then
+                    "SERIAL|"
+                        & [_NormalizedSerial]
+
+                else if [cert_name] <> null
+                    and Text.Trim(
+                        Text.From([cert_name])
+                    ) <> ""
+                then
+                    "NAME|"
+                        & NormalizeKeyText(
+                            [cert_name]
+                        )
+
+                else
+                    "USAGE|"
+                        & [_UsageKey],
+            type text
+        ),
+
+    #"Added Certificate Scope" =
+        Table.AddColumn(
+            #"Added Certificate Key",
+            "_CertificateScope",
+            each
+                if [Migration Package] <> null
+                    and [Migration Role] <> null
+                    and [Cluster Member] <> null
+                then
+                    "MIGRATION|"
+                        & MakeKey(
+                            {
+                                [Migration Package],
+                                [Migration Role],
+                                [Cluster Member]
+                            }
+                        )
+
+                else if [_HostKey] <> null
+                    and [_HostKey] <> ""
+                then
+                    "HOST|"
+                        & [_HostKey]
+
+                else
+                    "USAGE|"
+                        & [_UsageKey],
+            type text
+        ),
+
+    #"Added Usage Priority" =
+        Table.AddColumn(
+            #"Added Certificate Scope",
+            "_UsagePriority",
+            each
+                let
+                    Usage =
+                        NormalizeKeyText(
+                            [profile_used_by]
+                        )
+                in
+                    if Text.StartsWith(
+                        Usage,
+                        "VIP_"
+                    ) then
+                        0
+                    else if Text.StartsWith(
+                        Usage,
+                        "HTTPS_MON_"
+                    ) then
+                        1
+                    else
+                        2,
+            Int64.Type
+        ),
+
+    // Sort once for all certificate groups.
+    #"Sorted Certificate Usages" =
+        Table.Sort(
+            #"Added Usage Priority",
+            {
+                {
+                    "_CertificateScope",
+                    Order.Ascending
+                },
+                {
+                    "_CertificateKey",
+                    Order.Ascending
+                },
+                {
+                    "_UsagePriority",
+                    Order.Ascending
+                },
+                {
+                    "profile_used_by",
+                    Order.Ascending
+                },
+                {
+                    "used_by_profile",
+                    Order.Ascending
+                },
+                {
+                    "cert_name",
+                    Order.Ascending
+                },
+                {
+                    "_UsageKey",
+                    Order.Ascending
+                }
+            }
+        ),
+
+    #"Grouped Certificate Usages" =
+        Table.Group(
+            #"Sorted Certificate Usages",
+            {
+                "_CertificateScope",
+                "_CertificateKey"
+            },
+            {
+                {
+                    "_RepresentativeUsageKey",
+                    each
+                        List.First(
+                            [_UsageKey]
+                        ),
+                    type text
+                },
+                {
+                    "_CertificateUsageCount",
+                    each
+                        Table.RowCount(_),
+                    Int64.Type
+                },
+                {
+                    "_CertificateUsedBy",
+                    each
+                        let
+                            Values =
+                                List.Sort(
+                                    List.Distinct(
+                                        List.Select(
+                                            List.Transform(
+                                                [profile_used_by],
+                                                each
+                                                    if _ = null then
+                                                        null
+                                                    else
+                                                        Text.Trim(
+                                                            Text.From(_)
+                                                        )
+                                            ),
+                                            each
+                                                _ <> null
+                                                    and _ <> ""
+                                        )
+                                    )
+                                )
+                        in
+                            if List.IsEmpty(Values) then
+                                null
+                            else
+                                Text.Combine(
+                                    Values,
+                                    ", "
+                                ),
+                    type nullable text
+                }
+            },
+            GroupKind.Local
+        ),
+
+    #"Merged Certificate Summary" =
+        Table.NestedJoin(
+            #"Added Usage Priority",
+            {
+                "_CertificateScope",
+                "_CertificateKey"
+            },
+            #"Grouped Certificate Usages",
+            {
+                "_CertificateScope",
+                "_CertificateKey"
+            },
+            "Certificate Summary",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Certificate Summary" =
+        Table.ExpandTableColumn(
+            #"Merged Certificate Summary",
+            "Certificate Summary",
+            {
+                "_RepresentativeUsageKey",
+                "_CertificateUsageCount",
+                "_CertificateUsedBy"
+            },
+            {
+                "_RepresentativeUsageKey",
+                "_CertificateUsageCount",
+                "_CertificateUsedBy"
+            }
+        ),
+
+    #"Added Certificate Representative" =
+        Table.AddColumn(
+            #"Expanded Certificate Summary",
+            "Certificate Representative",
+            each
+                [_UsageKey]
+                    = [_RepresentativeUsageKey],
+            type logical
+        ),
+
+    #"Added Certificate Usage Count" =
+        Table.AddColumn(
+            #"Added Certificate Representative",
+            "Certificate Usage Count",
+            each
+                if [Certificate Representative] then
+                    [_CertificateUsageCount]
+                else
+                    null,
+            Int64.Type
+        ),
+
+    #"Added Certificate Used By" =
+        Table.AddColumn(
+            #"Added Certificate Usage Count",
+            "Certificate Used By",
+            each
+                if [Certificate Representative] then
+                    [_CertificateUsedBy]
+                else
+                    null,
+            type nullable text
+        ),
+
+    #"Selected Final Mapping" =
+        Table.SelectColumns(
+            #"Added Certificate Used By",
+            {
+                "_UsageKey",
+                "Certificate Representative",
+                "Certificate Usage Count",
+                "Certificate Used By"
+            }
+        )
+in
+    #"Selected Final Mapping"

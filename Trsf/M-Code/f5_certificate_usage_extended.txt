@@ -1,54 +1,4 @@
 let
-    NormalizeUsageSerial = (Value as any) as nullable text =>
-        let
-            Original =
-                if Value = null then
-                    ""
-                else
-                    Text.Trim(Text.From(Value)),
-
-            UpperOriginal =
-                Text.Upper(Original),
-
-            IsPlaceholder =
-                List.Contains(
-                    {
-                        "",
-                        "N/A",
-                        "NA",
-                        "NONE",
-                        "NULL",
-                        "-"
-                    },
-                    UpperOriginal
-                ),
-
-            HexOnly =
-                if IsPlaceholder then
-                    ""
-                else
-                    Text.Upper(
-                        Text.Select(
-                            Original,
-                            {
-                                "0".."9",
-                                "A".."F",
-                                "a".."f"
-                            }
-                        )
-                    ),
-
-            Padded =
-                if HexOnly = "" then
-                    null
-                else if Number.Mod(Text.Length(HexOnly), 2) = 1 then
-                    "0" & HexOnly
-                else
-                    HexOnly
-        in
-            Padded,
-
-
     InsertAfter = (
         Columns as list,
         Anchor as text,
@@ -76,226 +26,28 @@ let
                     ColumnsToInsert
                 ),
 
+    Source =
+        stg_F5_Certificate_Usage_Core,
 
-    AssignClusterMembers = (InputTable as table) as table =>
-        let
-            DistinctHosts =
-                Table.Sort(
-                    Table.Distinct(
-                        Table.SelectColumns(
-                            InputTable,
-                            {"_HostKey"}
-                        )
-                    ),
-                    {
-                        {"_HostKey", Order.Ascending}
-                    }
-                ),
+    ClusterLookup =
+        Table.Buffer(
+            stg_Cluster_Host_Map
+        ),
 
-            #"Detected Existing Suffix" =
-                Table.AddColumn(
-                    DistinctHosts,
-                    "_ExistingSuffix",
-                    each
-                        let
-                            Hostname = [_HostKey],
+    CertificateUsageLookup =
+        Table.Buffer(
+            stg_Certificate_Usage_Map
+        ),
 
-                            LastCharacter =
-                                if Hostname = null or Hostname = "" then
-                                    null
-                                else
-                                    Text.End(Hostname, 1)
-                        in
-                            if List.Contains(
-                                {"A", "B", "C", "D"},
-                                LastCharacter
-                            ) then
-                                LastCharacter
-                            else
-                                null,
-                    type nullable text
-                ),
-
-            UsedLetters =
-                List.Distinct(
-                    List.RemoveNulls(
-                        Table.Column(
-                            #"Detected Existing Suffix",
-                            "_ExistingSuffix"
-                        )
-                    )
-                ),
-
-            AvailableLetters =
-                List.Difference(
-                    {"A", "B", "C", "D"},
-                    UsedLetters
-                ),
-
-            HostsWithExistingSuffix =
-                Table.AddColumn(
-                    Table.SelectRows(
-                        #"Detected Existing Suffix",
-                        each [_ExistingSuffix] <> null
-                    ),
-                    "Cluster Member",
-                    each [_ExistingSuffix],
-                    type nullable text
-                ),
-
-            HostsWithoutExistingSuffix =
-                Table.AddIndexColumn(
-                    Table.SelectRows(
-                        #"Detected Existing Suffix",
-                        each [_ExistingSuffix] = null
-                    ),
-                    "_AssignmentIndex",
-                    0,
-                    1,
-                    Int64.Type
-                ),
-
-            AssignedHosts =
-                Table.AddColumn(
-                    HostsWithoutExistingSuffix,
-                    "Cluster Member",
-                    each
-                        try
-                            AvailableLetters{[_AssignmentIndex]}
-                        otherwise
-                            null,
-                    type nullable text
-                ),
-
-            CombinedAssignments =
-                Table.Combine(
-                    {
-                        Table.SelectColumns(
-                            HostsWithExistingSuffix,
-                            {
-                                "_HostKey",
-                                "Cluster Member"
-                            }
-                        ),
-
-                        Table.SelectColumns(
-                            AssignedHosts,
-                            {
-                                "_HostKey",
-                                "Cluster Member"
-                            }
-                        )
-                    }
-                )
-        in
-            CombinedAssignments,
-
-
-    AddCertificateSummary = (InputTable as table) as table =>
-        let
-            SortedRows =
-                Table.Sort(
-                    InputTable,
-                    {
-                        {"_UsagePriority", Order.Ascending},
-                        {"profile_used_by", Order.Ascending},
-                        {"used_by_profile", Order.Ascending},
-                        {"cert_name", Order.Ascending},
-                        {"_RowID", Order.Ascending}
-                    }
-                ),
-
-            UsageCount =
-                Table.RowCount(SortedRows),
-
-            UsageValues =
-                List.Sort(
-                    List.Distinct(
-                        List.Select(
-                            List.Transform(
-                                Table.Column(
-                                    SortedRows,
-                                    "profile_used_by"
-                                ),
-                                each
-                                    if _ = null then
-                                        null
-                                    else
-                                        Text.Trim(Text.From(_))
-                            ),
-                            each _ <> null and _ <> ""
-                        )
-                    )
-                ),
-
-            UsageText =
-                if List.IsEmpty(UsageValues) then
-                    null
-                else
-                    Text.Combine(
-                        UsageValues,
-                        ", "
-                    ),
-
-            #"Added Certificate Rank" =
-                Table.AddIndexColumn(
-                    SortedRows,
-                    "_CertificateRank",
-                    0,
-                    1,
-                    Int64.Type
-                ),
-
-            #"Added Representative Flag" =
-                Table.AddColumn(
-                    #"Added Certificate Rank",
-                    "Certificate Representative",
-                    each [_CertificateRank] = 0,
-                    type logical
-                ),
-
-            #"Added Usage Count" =
-                Table.AddColumn(
-                    #"Added Representative Flag",
-                    "Certificate Usage Count",
-                    each
-                        if [_CertificateRank] = 0 then
-                            UsageCount
-                        else
-                            null,
-                    Int64.Type
-                ),
-
-            #"Added Used By Summary" =
-                Table.AddColumn(
-                    #"Added Usage Count",
-                    "Certificate Used By",
-                    each
-                        if [_CertificateRank] = 0 then
-                            UsageText
-                        else
-                            null,
-                    type nullable text
-                ),
-
-            Result =
-                Table.SelectColumns(
-                    #"Added Used By Summary",
-                    {
-                        "_RowID",
-                        "Certificate Representative",
-                        "Certificate Usage Count",
-                        "Certificate Used By"
-                    }
-                )
-        in
-            Result,
-
+    CertNowLookup =
+        Table.Buffer(
+            stg_CertNow_Latest
+        ),
 
     CertNowColumns =
         List.RemoveItems(
             Table.ColumnNames(
-                stg_CertNow_Latest
+                CertNowLookup
             ),
             {"Serial"}
         ),
@@ -316,42 +68,67 @@ let
             "Certificate Used By"
         },
 
-
-    Source =
-        f5_certificate_usage,
-
-
-    #"Added Normalized Serial" =
-        Table.AddColumn(
+    #"Merged Cluster Information" =
+        Table.NestedJoin(
             Source,
-            "_NormalizedSerial",
-            each NormalizeUsageSerial([serial_number]),
-            type nullable text
+            {"_HostKey"},
+            ClusterLookup,
+            {"_HostKey"},
+            "Cluster Information",
+            JoinKind.LeftOuter
         ),
 
-
-    #"Added Host Match Key" =
-        Table.AddColumn(
-            #"Added Normalized Serial",
-            "_HostKey",
-            each
-                if [host] = null then
-                    null
-                else
-                    Text.Upper(
-                        Text.Trim(
-                            Text.From([host])
-                        )
-                    ),
-            type nullable text
+    #"Expanded Cluster Information" =
+        Table.ExpandTableColumn(
+            #"Merged Cluster Information",
+            "Cluster Information",
+            {
+                "Cluster Member",
+                "Cluster Representative",
+                "Migration Role",
+                "Migration Package",
+                "Migration Date"
+            },
+            {
+                "Cluster Member",
+                "Cluster Representative",
+                "Migration Role",
+                "Migration Package",
+                "Migration Date"
+            }
         ),
 
+    #"Merged Certificate Usage Summary" =
+        Table.NestedJoin(
+            #"Expanded Cluster Information",
+            {"_UsageKey"},
+            CertificateUsageLookup,
+            {"_UsageKey"},
+            "Certificate Usage Summary",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Certificate Usage Summary" =
+        Table.ExpandTableColumn(
+            #"Merged Certificate Usage Summary",
+            "Certificate Usage Summary",
+            {
+                "Certificate Representative",
+                "Certificate Usage Count",
+                "Certificate Used By"
+            },
+            {
+                "Certificate Representative",
+                "Certificate Usage Count",
+                "Certificate Used By"
+            }
+        ),
 
     #"Merged CertNow" =
         Table.NestedJoin(
-            #"Added Host Match Key",
+            #"Expanded Certificate Usage Summary",
             {"_NormalizedSerial"},
-            stg_CertNow_Latest,
+            CertNowLookup,
             {"Serial"},
             "CertNow Match",
             JoinKind.LeftOuter
@@ -365,291 +142,15 @@ let
             CertNowColumns
         ),
 
-
-    #"Merged Migration Mapping" =
-        Table.NestedJoin(
-            #"Expanded CertNow",
-            {"_HostKey"},
-            stg_LB_List_Host_Map,
-            {"Host Key"},
-            "Migration Match",
-            JoinKind.LeftOuter
-        ),
-
-    #"Expanded Migration Mapping" =
-        Table.ExpandTableColumn(
-            #"Merged Migration Mapping",
-            "Migration Match",
-            {
-                "Migration Package",
-                "Migration Date",
-                "Migration Role"
-            },
-            {
-                "Migration Package",
-                "Migration Date",
-                "Migration Role"
-            }
-        ),
-
-
-    #"Distinct Cluster Hosts" =
-        Table.Distinct(
-            Table.SelectColumns(
-                Table.SelectRows(
-                    #"Expanded Migration Mapping",
-                    each
-                        [_HostKey] <> null
-                            and [Migration Package] <> null
-                            and [Migration Role] <> null
-                ),
-                {
-                    "_HostKey",
-                    "Migration Package",
-                    "Migration Role"
-                }
-            )
-        ),
-
-    #"Grouped Cluster Hosts" =
-        Table.Group(
-            #"Distinct Cluster Hosts",
-            {
-                "Migration Package",
-                "Migration Role"
-            },
-            {
-                {
-                    "Cluster Map",
-                    each AssignClusterMembers(_),
-                    type table
-                }
-            }
-        ),
-
-    #"Expanded Cluster Map" =
-        Table.ExpandTableColumn(
-            #"Grouped Cluster Hosts",
-            "Cluster Map",
-            {
-                "_HostKey",
-                "Cluster Member"
-            },
-            {
-                "_HostKey",
-                "Cluster Member"
-            }
-        ),
-
-    #"Merged Cluster Mapping" =
-        Table.NestedJoin(
-            #"Expanded Migration Mapping",
-            {
-                "_HostKey",
-                "Migration Package",
-                "Migration Role"
-            },
-            #"Expanded Cluster Map",
-            {
-                "_HostKey",
-                "Migration Package",
-                "Migration Role"
-            },
-            "Cluster Match",
-            JoinKind.LeftOuter
-        ),
-
-    #"Expanded Cluster Member" =
-        Table.ExpandTableColumn(
-            #"Merged Cluster Mapping",
-            "Cluster Match",
-            {"Cluster Member"},
-            {"Cluster Member"}
-        ),
-
-    #"Added Cluster Representative" =
-        Table.AddColumn(
-            #"Expanded Cluster Member",
-            "Cluster Representative",
-            each [Cluster Member] = "A",
-            type logical
-        ),
-
-
-    #"Added Row ID" =
-        Table.AddIndexColumn(
-            #"Added Cluster Representative",
-            "_RowID",
-            0,
-            1,
-            Int64.Type
-        ),
-
-
-    #"Added Certificate Key" =
-        Table.AddColumn(
-            #"Added Row ID",
-            "_CertificateKey",
-            each
-                if [_NormalizedSerial] <> null
-                    and [_NormalizedSerial] <> ""
-                then
-                    "SERIAL|" & [_NormalizedSerial]
-
-                else if [cert_name] <> null
-                    and Text.Trim(Text.From([cert_name])) <> ""
-                then
-                    "NAME|"
-                        & Text.Upper(
-                            Text.Trim(
-                                Text.From([cert_name])
-                            )
-                        )
-
-                else
-                    "ROW|" & Text.From([_RowID]),
-            type text
-        ),
-
-
-    #"Added Certificate Scope" =
-        Table.AddColumn(
-            #"Added Certificate Key",
-            "_CertificateScope",
-            each
-                if [Migration Package] <> null
-                    and [Migration Role] <> null
-                    and [Cluster Member] <> null
-                then
-                    "MIGRATION|"
-                        & Text.From([Migration Package])
-                        & "|"
-                        & Text.From([Migration Role])
-                        & "|"
-                        & Text.From([Cluster Member])
-
-                else if [_HostKey] <> null
-                    and [_HostKey] <> ""
-                then
-                    "HOST|" & [_HostKey]
-
-                else
-                    "ROW|" & Text.From([_RowID]),
-            type text
-        ),
-
-
-    #"Added Usage Priority" =
-        Table.AddColumn(
-            #"Added Certificate Scope",
-            "_UsagePriority",
-            each
-                let
-                    Usage =
-                        if [profile_used_by] = null then
-                            ""
-                        else
-                            Text.Upper(
-                                Text.Trim(
-                                    Text.From([profile_used_by])
-                                )
-                            )
-                in
-                    if Text.StartsWith(Usage, "VIP_") then
-                        0
-                    else if Text.StartsWith(Usage, "HTTPS_MON_") then
-                        1
-                    else
-                        2,
-            Int64.Type
-        ),
-
-
-    #"Grouped Certificate Usages" =
-        Table.Group(
-            #"Added Usage Priority",
-            {
-                "_CertificateScope",
-                "_CertificateKey"
-            },
-            {
-                {
-                    "Certificate Summary",
-                    each AddCertificateSummary(_),
-                    type table
-                }
-            }
-        ),
-
-    #"Expanded Certificate Summaries" =
-        Table.ExpandTableColumn(
-            #"Grouped Certificate Usages",
-            "Certificate Summary",
-            {
-                "_RowID",
-                "Certificate Representative",
-                "Certificate Usage Count",
-                "Certificate Used By"
-            },
-            {
-                "_RowID",
-                "Certificate Representative",
-                "Certificate Usage Count",
-                "Certificate Used By"
-            }
-        ),
-
-    #"Certificate Summary Map" =
-        Table.SelectColumns(
-            #"Expanded Certificate Summaries",
-            {
-                "_RowID",
-                "Certificate Representative",
-                "Certificate Usage Count",
-                "Certificate Used By"
-            }
-        ),
-
-    #"Merged Certificate Summary" =
-        Table.NestedJoin(
-            #"Added Usage Priority",
-            {"_RowID"},
-            #"Certificate Summary Map",
-            {"_RowID"},
-            "Certificate Summary Match",
-            JoinKind.LeftOuter
-        ),
-
-    #"Expanded Certificate Summary" =
-        Table.ExpandTableColumn(
-            #"Merged Certificate Summary",
-            "Certificate Summary Match",
-            {
-                "Certificate Representative",
-                "Certificate Usage Count",
-                "Certificate Used By"
-            },
-            {
-                "Certificate Representative",
-                "Certificate Usage Count",
-                "Certificate Used By"
-            }
-        ),
-
-
     #"Removed Technical Columns" =
         Table.RemoveColumns(
-            #"Expanded Certificate Summary",
+            #"Expanded CertNow",
             {
-                "_NormalizedSerial",
                 "_HostKey",
-                "_RowID",
-                "_CertificateKey",
-                "_CertificateScope",
-                "_UsagePriority"
+                "_NormalizedSerial",
+                "_UsageKey"
             }
         ),
-
 
     ColumnOrderWithCluster =
         InsertAfter(
