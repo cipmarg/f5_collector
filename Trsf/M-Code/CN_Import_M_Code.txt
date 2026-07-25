@@ -120,5 +120,75 @@ let
             #"Combined Files",
             ExistingTypeMap
         )
-in
-    #"Changed Types"
+        // Normalize the original CertNow serial:
+        // uppercase hexadecimal without spaces or separators
+        #"Normalized Serial" =
+            Table.TransformColumns(
+                #"Changed Types",
+                {
+                    {
+                        "Serial",
+                        each
+                            let
+                                Value =
+                                    if _ = null then
+                                        ""
+                                    else
+                                        Text.From(_),
+
+                                HexOnly =
+                                    Text.Upper(
+                                        Text.Select(
+                                            Value,
+                                            {
+                                                "0".."9",
+                                                "A".."F",
+                                                "a".."f"
+                                            }
+                                        )
+                                    )
+                            in
+                                if HexOnly = "" then
+                                    null
+                                else
+                                    HexOnly,
+                        type nullable text
+                    }
+                }
+            ),
+
+        // Blank serials cannot be matched and would otherwise all be treated
+        // as duplicates of each other.
+        #"Filtered Blank Serials" =
+            Table.SelectRows(
+                #"Normalized Serial",
+                each
+                    [Serial] <> null
+                        and [Serial] <> ""
+            ),
+
+        // Sort once so the newest row for every serial appears first.
+        #"Sorted for Deduplication" =
+            Table.Sort(
+                #"Filtered Blank Serials",
+                {
+                    {"Serial", Order.Ascending},
+                    {"export_date", Order.Descending},
+                    {"Source File", Order.Descending}
+                }
+            ),
+
+        // Buffer ensures Table.Distinct retains the first row from the sort.
+        #"Buffered Sorted Data" =
+            Table.Buffer(
+                #"Sorted for Deduplication"
+            ),
+
+        // Keep only the newest record for each original certificate serial.
+        #"Kept Latest Serial" =
+            Table.Distinct(
+                #"Buffered Sorted Data",
+                {"Serial"}
+            )
+    in
+        #"Kept Latest Serial"

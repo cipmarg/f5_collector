@@ -27,84 +27,6 @@ let
     #"Selected Columns" =
         Table.SelectColumns(
             Source,
-            {
-                "Serial",
-                "export_date",
-                "Source File"
-            }
-                & CertNowFields,
-            MissingField.UseNull
-        ),
-
-    #"Prepared Merge Key and Date" =
-        Table.TransformColumns(
-            #"Selected Columns",
-            {
-                {
-                    "Serial",
-                    each
-                        if _ = null then
-                            null
-                        else
-                            Text.Upper(
-                                Text.Trim(
-                                    Text.From(_)
-                                )
-                            ),
-                    type nullable text
-                },
-                {
-                    "export_date",
-                    each
-                        try DateTime.From(_)
-                        otherwise null,
-                    type nullable datetime
-                },
-                {
-                    "Source File",
-                    each
-                        if _ = null then
-                            null
-                        else
-                            Text.From(_),
-                    type nullable text
-                }
-            }
-        ),
-
-    #"Filtered Blank Serials" =
-        Table.SelectRows(
-            #"Prepared Merge Key and Date",
-            each
-                [Serial] <> null
-                    and [Serial] <> ""
-        ),
-
-    // A single global sort is considerably faster than sorting each group.
-    #"Sorted CertNow Rows" =
-        Table.Sort(
-            #"Filtered Blank Serials",
-            {
-                {"Serial", Order.Ascending},
-                {"export_date", Order.Descending},
-                {"Source File", Order.Descending}
-            }
-        ),
-
-    #"Buffered Sorted CertNow" =
-        Table.Buffer(
-            #"Sorted CertNow Rows"
-        ),
-
-    #"Kept Latest Serial" =
-        Table.Distinct(
-            #"Buffered Sorted CertNow",
-            {"Serial"}
-        ),
-
-    #"Selected Final Fields" =
-        Table.SelectColumns(
-            #"Kept Latest Serial",
             {"Serial"} & CertNowFields,
             MissingField.UseNull
         ),
@@ -121,7 +43,7 @@ let
 
     #"Prefixed CertNow Fields" =
         Table.RenameColumns(
-            #"Selected Final Fields",
+            #"Selected Columns",
             PrefixRenames,
             MissingField.Ignore
         )
