@@ -1,27 +1,42 @@
 let
-    // Converts the F5 colon-separated serial into the same format as
-    // the original CertNow[Serial] field.
     NormalizeUsageSerial = (Value as any) as nullable text =>
         let
             Original =
                 if Value = null then
                     ""
                 else
-                    Text.Trim(
-                        Text.From(Value)
-                    ),
+                    Text.Trim(Text.From(Value)),
+
+            UpperOriginal =
+                Text.Upper(Original),
+
+            IsPlaceholder =
+                List.Contains(
+                    {
+                        "",
+                        "N/A",
+                        "NA",
+                        "NONE",
+                        "NULL",
+                        "-"
+                    },
+                    UpperOriginal
+                ),
 
             HexOnly =
-                Text.Upper(
-                    Text.Select(
-                        Original,
-                        {
-                            "0".."9",
-                            "A".."F",
-                            "a".."f"
-                        }
-                    )
-                ),
+                if IsPlaceholder then
+                    ""
+                else
+                    Text.Upper(
+                        Text.Select(
+                            Original,
+                            {
+                                "0".."9",
+                                "A".."F",
+                                "a".."f"
+                            }
+                        )
+                    ),
 
             Padded =
                 if HexOnly = "" then
@@ -33,7 +48,7 @@ let
         in
             Padded,
 
-    // Inserts a list of columns immediately after a specified column.
+
     InsertAfter = (
         Columns as list,
         Anchor as text,
@@ -61,8 +76,7 @@ let
                     ColumnsToInsert
                 ),
 
-    // Assigns cluster letters independently within each
-    // Migration Package + Migration Role group.
+
     AssignClusterMembers = (InputTable as table) as table =>
         let
             DistinctHosts =
@@ -163,6 +177,7 @@ let
                                 "Cluster Member"
                             }
                         ),
+
                         Table.SelectColumns(
                             AssignedHosts,
                             {
@@ -175,9 +190,113 @@ let
         in
             CombinedAssignments,
 
+
+    AddCertificateSummary = (InputTable as table) as table =>
+        let
+            SortedRows =
+                Table.Sort(
+                    InputTable,
+                    {
+                        {"_UsagePriority", Order.Ascending},
+                        {"profile_used_by", Order.Ascending},
+                        {"used_by_profile", Order.Ascending},
+                        {"cert_name", Order.Ascending},
+                        {"_RowID", Order.Ascending}
+                    }
+                ),
+
+            UsageCount =
+                Table.RowCount(SortedRows),
+
+            UsageValues =
+                List.Sort(
+                    List.Distinct(
+                        List.Select(
+                            List.Transform(
+                                Table.Column(
+                                    SortedRows,
+                                    "profile_used_by"
+                                ),
+                                each
+                                    if _ = null then
+                                        null
+                                    else
+                                        Text.Trim(Text.From(_))
+                            ),
+                            each _ <> null and _ <> ""
+                        )
+                    )
+                ),
+
+            UsageText =
+                if List.IsEmpty(UsageValues) then
+                    null
+                else
+                    Text.Combine(
+                        UsageValues,
+                        ", "
+                    ),
+
+            #"Added Certificate Rank" =
+                Table.AddIndexColumn(
+                    SortedRows,
+                    "_CertificateRank",
+                    0,
+                    1,
+                    Int64.Type
+                ),
+
+            #"Added Representative Flag" =
+                Table.AddColumn(
+                    #"Added Certificate Rank",
+                    "Certificate Representative",
+                    each [_CertificateRank] = 0,
+                    type logical
+                ),
+
+            #"Added Usage Count" =
+                Table.AddColumn(
+                    #"Added Representative Flag",
+                    "Certificate Usage Count",
+                    each
+                        if [_CertificateRank] = 0 then
+                            UsageCount
+                        else
+                            null,
+                    Int64.Type
+                ),
+
+            #"Added Used By Summary" =
+                Table.AddColumn(
+                    #"Added Usage Count",
+                    "Certificate Used By",
+                    each
+                        if [_CertificateRank] = 0 then
+                            UsageText
+                        else
+                            null,
+                    type nullable text
+                ),
+
+            Result =
+                Table.SelectColumns(
+                    #"Added Used By Summary",
+                    {
+                        "_RowID",
+                        "Certificate Representative",
+                        "Certificate Usage Count",
+                        "Certificate Used By"
+                    }
+                )
+        in
+            Result,
+
+
     CertNowColumns =
         List.RemoveItems(
-            Table.ColumnNames(stg_CertNow_Latest),
+            Table.ColumnNames(
+                stg_CertNow_Latest
+            ),
             {"Serial"}
         ),
 
@@ -190,10 +309,18 @@ let
             "Migration Date"
         },
 
+    CertificateSummaryColumns =
+        {
+            "Certificate Representative",
+            "Certificate Usage Count",
+            "Certificate Used By"
+        },
+
+
     Source =
         f5_certificate_usage,
 
-    // Temporary serial key used only for the CertNow merge
+
     #"Added Normalized Serial" =
         Table.AddColumn(
             Source,
@@ -202,7 +329,7 @@ let
             type nullable text
         ),
 
-    // Temporary normalized hostname used for the migration-plan merge
+
     #"Added Host Match Key" =
         Table.AddColumn(
             #"Added Normalized Serial",
@@ -219,7 +346,7 @@ let
             type nullable text
         ),
 
-    // Match normalized F5 serial_number against the original CertNow Serial
+
     #"Merged CertNow" =
         Table.NestedJoin(
             #"Added Host Match Key",
@@ -238,7 +365,7 @@ let
             CertNowColumns
         ),
 
-    // Match the host against either source or target host in LB_List
+
     #"Merged Migration Mapping" =
         Table.NestedJoin(
             #"Expanded CertNow",
@@ -265,7 +392,7 @@ let
             }
         ),
 
-    // Build one row per distinct host for the cluster calculation
+
     #"Distinct Cluster Hosts" =
         Table.Distinct(
             Table.SelectColumns(
@@ -284,7 +411,6 @@ let
             )
         ),
 
-    // Cluster letters are calculated independently for SOURCE and TARGET
     #"Grouped Cluster Hosts" =
         Table.Group(
             #"Distinct Cluster Hosts",
@@ -349,17 +475,182 @@ let
             type logical
         ),
 
-    // Remove the two technical merge keys
-    #"Removed Technical Columns" =
-        Table.RemoveColumns(
+
+    #"Added Row ID" =
+        Table.AddIndexColumn(
             #"Added Cluster Representative",
+            "_RowID",
+            0,
+            1,
+            Int64.Type
+        ),
+
+
+    #"Added Certificate Key" =
+        Table.AddColumn(
+            #"Added Row ID",
+            "_CertificateKey",
+            each
+                if [_NormalizedSerial] <> null
+                    and [_NormalizedSerial] <> ""
+                then
+                    "SERIAL|" & [_NormalizedSerial]
+
+                else if [cert_name] <> null
+                    and Text.Trim(Text.From([cert_name])) <> ""
+                then
+                    "NAME|"
+                        & Text.Upper(
+                            Text.Trim(
+                                Text.From([cert_name])
+                            )
+                        )
+
+                else
+                    "ROW|" & Text.From([_RowID]),
+            type text
+        ),
+
+
+    #"Added Certificate Scope" =
+        Table.AddColumn(
+            #"Added Certificate Key",
+            "_CertificateScope",
+            each
+                if [Migration Package] <> null
+                    and [Migration Role] <> null
+                    and [Cluster Member] <> null
+                then
+                    "MIGRATION|"
+                        & Text.From([Migration Package])
+                        & "|"
+                        & Text.From([Migration Role])
+                        & "|"
+                        & Text.From([Cluster Member])
+
+                else if [_HostKey] <> null
+                    and [_HostKey] <> ""
+                then
+                    "HOST|" & [_HostKey]
+
+                else
+                    "ROW|" & Text.From([_RowID]),
+            type text
+        ),
+
+
+    #"Added Usage Priority" =
+        Table.AddColumn(
+            #"Added Certificate Scope",
+            "_UsagePriority",
+            each
+                let
+                    Usage =
+                        if [profile_used_by] = null then
+                            ""
+                        else
+                            Text.Upper(
+                                Text.Trim(
+                                    Text.From([profile_used_by])
+                                )
+                            )
+                in
+                    if Text.StartsWith(Usage, "VIP_") then
+                        0
+                    else if Text.StartsWith(Usage, "HTTPS_MON_") then
+                        1
+                    else
+                        2,
+            Int64.Type
+        ),
+
+
+    #"Grouped Certificate Usages" =
+        Table.Group(
+            #"Added Usage Priority",
             {
-                "_NormalizedSerial",
-                "_HostKey"
+                "_CertificateScope",
+                "_CertificateKey"
+            },
+            {
+                {
+                    "Certificate Summary",
+                    each AddCertificateSummary(_),
+                    type table
+                }
             }
         ),
 
-    // Put cluster and migration fields immediately after host
+    #"Expanded Certificate Summaries" =
+        Table.ExpandTableColumn(
+            #"Grouped Certificate Usages",
+            "Certificate Summary",
+            {
+                "_RowID",
+                "Certificate Representative",
+                "Certificate Usage Count",
+                "Certificate Used By"
+            },
+            {
+                "_RowID",
+                "Certificate Representative",
+                "Certificate Usage Count",
+                "Certificate Used By"
+            }
+        ),
+
+    #"Certificate Summary Map" =
+        Table.SelectColumns(
+            #"Expanded Certificate Summaries",
+            {
+                "_RowID",
+                "Certificate Representative",
+                "Certificate Usage Count",
+                "Certificate Used By"
+            }
+        ),
+
+    #"Merged Certificate Summary" =
+        Table.NestedJoin(
+            #"Added Usage Priority",
+            {"_RowID"},
+            #"Certificate Summary Map",
+            {"_RowID"},
+            "Certificate Summary Match",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Certificate Summary" =
+        Table.ExpandTableColumn(
+            #"Merged Certificate Summary",
+            "Certificate Summary Match",
+            {
+                "Certificate Representative",
+                "Certificate Usage Count",
+                "Certificate Used By"
+            },
+            {
+                "Certificate Representative",
+                "Certificate Usage Count",
+                "Certificate Used By"
+            }
+        ),
+
+
+    #"Removed Technical Columns" =
+        Table.RemoveColumns(
+            #"Expanded Certificate Summary",
+            {
+                "_NormalizedSerial",
+                "_HostKey",
+                "_RowID",
+                "_CertificateKey",
+                "_CertificateScope",
+                "_UsagePriority"
+            }
+        ),
+
+
     ColumnOrderWithCluster =
         InsertAfter(
             Table.ColumnNames(
@@ -369,10 +660,16 @@ let
             ClusterColumns
         ),
 
-    // Put all CertNow fields immediately after serial_number
-    FinalColumnOrder =
+    ColumnOrderWithCertificateSummary =
         InsertAfter(
             ColumnOrderWithCluster,
+            "cert_name",
+            CertificateSummaryColumns
+        ),
+
+    FinalColumnOrder =
+        InsertAfter(
+            ColumnOrderWithCertificateSummary,
             "serial_number",
             CertNowColumns
         ),
