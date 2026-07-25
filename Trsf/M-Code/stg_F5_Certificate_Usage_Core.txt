@@ -27,6 +27,120 @@ let
             "|"
         ),
 
+    // Converts an arbitrarily long decimal number stored as text
+    // into hexadecimal without relying on Int64 precision.
+    DecimalTextToHex = (DecimalText as text) as text =>
+        let
+            HexDigits =
+                {
+                    "0", "1", "2", "3",
+                    "4", "5", "6", "7",
+                    "8", "9", "A", "B",
+                    "C", "D", "E", "F"
+                },
+
+            Trimmed =
+                Text.Trim(DecimalText),
+
+            WithoutLeadingZeros =
+                Text.TrimStart(
+                    Trimmed,
+                    {"0"}
+                ),
+
+            StartingValue =
+                if WithoutLeadingZeros = "" then
+                    "0"
+                else
+                    WithoutLeadingZeros,
+
+            DivideBy16 = (NumberText as text) as record =>
+                let
+                    Division =
+                        List.Accumulate(
+                            Text.ToList(NumberText),
+                            [
+                                Quotient = "",
+                                Remainder = 0
+                            ],
+                            (State, DigitText) =>
+                                let
+                                    CurrentValue =
+                                        State[Remainder] * 10
+                                            + Number.FromText(DigitText),
+
+                                    QuotientDigit =
+                                        Number.IntegerDivide(
+                                            CurrentValue,
+                                            16
+                                        ),
+
+                                    NewQuotient =
+                                        if
+                                            State[Quotient] = ""
+                                                and QuotientDigit = 0
+                                        then
+                                            ""
+                                        else
+                                            State[Quotient]
+                                                & Text.From(
+                                                    QuotientDigit
+                                                ),
+
+                                    NewRemainder =
+                                        Number.Mod(
+                                            CurrentValue,
+                                            16
+                                        )
+                                in
+                                    [
+                                        Quotient = NewQuotient,
+                                        Remainder = NewRemainder
+                                    ]
+                        ),
+
+                    FinalQuotient =
+                        if Division[Quotient] = "" then
+                            "0"
+                        else
+                            Division[Quotient]
+                in
+                    [
+                        Quotient = FinalQuotient,
+                        Remainder = Division[Remainder]
+                    ],
+
+            ConvertToHex =
+                (NumberText as text, Accumulator as text) as text =>
+                    if NumberText = "0" then
+                        if Accumulator = "" then
+                            "0"
+                        else
+                            Accumulator
+                    else
+                        let
+                            DivisionStep =
+                                DivideBy16(NumberText),
+
+                            NextAccumulator =
+                                HexDigits{
+                                    DivisionStep[Remainder]
+                                }
+                                    & Accumulator
+                        in
+                            @ConvertToHex(
+                                DivisionStep[Quotient],
+                                NextAccumulator
+                            ),
+
+            Result =
+                ConvertToHex(
+                    StartingValue,
+                    ""
+                )
+        in
+            Result,
+
     NormalizeUsageSerial = (Value as any) as nullable text =>
         let
             Original =
@@ -53,9 +167,44 @@ let
                     UpperOriginal
                 ),
 
-            HexOnly =
+            ContainsColon =
+                Text.Contains(
+                    Original,
+                    ":"
+                ),
+
+            IsDigitsOnly =
+                Original <> ""
+                    and Text.Select(
+                        Original,
+                        {"0".."9"}
+                    ) = Original,
+
+            ConvertedSerial =
                 if IsPlaceholder then
-                    ""
+                    null
+
+                // Colon-separated value returned by F5:
+                // treat it as hexadecimal.
+                else if ContainsColon then
+                    Text.Upper(
+                        Text.Select(
+                            Original,
+                            {
+                                "0".."9",
+                                "A".."F",
+                                "a".."f"
+                            }
+                        )
+                    )
+
+                // Plain digits without colons:
+                // treat the value as decimal and convert it to hex.
+                else if IsDigitsOnly then
+                    DecimalTextToHex(Original)
+
+                // Unseparated value containing A-F:
+                // it is already hexadecimal.
                 else
                     Text.Upper(
                         Text.Select(
@@ -69,15 +218,18 @@ let
                     ),
 
             Padded =
-                if HexOnly = "" then
+                if ConvertedSerial = null
+                    or ConvertedSerial = ""
+                then
                     null
                 else if Number.Mod(
-                    Text.Length(HexOnly),
+                    Text.Length(ConvertedSerial),
                     2
-                ) = 1 then
-                    "0" & HexOnly
+                ) = 1
+                then
+                    "0" & ConvertedSerial
                 else
-                    HexOnly
+                    ConvertedSerial
         in
             Padded,
 
