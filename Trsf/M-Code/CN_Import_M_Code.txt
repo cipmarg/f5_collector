@@ -1,7 +1,7 @@
 let
     Source =
         Folder.Files(
-            "C:\Users\"
+            "C:\Users\\Downloads"
         ),
 
     #"Filtered Export CSV Files" =
@@ -11,7 +11,7 @@ let
                 Text.Lower([Extension]) = ".csv"
                     and Text.StartsWith(
                         [Name],
-                        "Export",
+                        "Export_",
                         Comparer.OrdinalIgnoreCase
                     )
                     and Record.FieldOrDefault(
@@ -35,6 +35,25 @@ let
             "Imported Data",
             (CurrentFile as record) as table =>
                 let
+                    // Extract yyyy-MM-dd from:
+                    // Export_2026-07-23_....csv
+                    ExportDate =
+                        try
+                            Date.FromText(
+                                Text.Middle(
+                                    CurrentFile[Name],
+                                    7,
+                                    10
+                                ),
+                                [
+                                    Format = "yyyy-MM-dd",
+                                    Culture = "en-US"
+                                ]
+                            )
+                        otherwise
+                            try Date.From(CurrentFile[Date modified])
+                            otherwise null,
+
                     CsvData =
                         Csv.Document(
                             CurrentFile[Content],
@@ -57,9 +76,17 @@ let
                             "Source File",
                             each CurrentFile[Name],
                             type text
+                        ),
+
+                    AddedExportDate =
+                        Table.AddColumn(
+                            AddedSourceFile,
+                            "export_date",
+                            each ExportDate,
+                            type nullable date
                         )
                 in
-                    AddedSourceFile,
+                    AddedExportDate,
             type table
         ),
 
@@ -74,7 +101,7 @@ let
     TypeMap =
         {
             {"Serial", type text},
-            {"export_date", type datetime},
+            {"export_date", type date},
             {"Source File", type text},
             {"Managed DN", type text},
             {"Description", type text},
@@ -119,76 +146,74 @@ let
         Table.TransformColumnTypes(
             #"Combined Files",
             ExistingTypeMap
-        )
-        // Normalize the original CertNow serial:
-        // uppercase hexadecimal without spaces or separators
-        #"Normalized Serial" =
-            Table.TransformColumns(
-                #"Changed Types",
-                {
-                    {
-                        "Serial",
-                        each
-                            let
-                                Value =
-                                    if _ = null then
-                                        ""
-                                    else
-                                        Text.From(_),
+        ),
 
-                                HexOnly =
-                                    Text.Upper(
-                                        Text.Select(
-                                            Value,
-                                            {
-                                                "0".."9",
-                                                "A".."F",
-                                                "a".."f"
-                                            }
-                                        )
-                                    )
-                            in
-                                if HexOnly = "" then
-                                    null
+    // Normalize the original CertNow serial into uppercase hexadecimal.
+    #"Normalized Serial" =
+        Table.TransformColumns(
+            #"Changed Types",
+            {
+                {
+                    "Serial",
+                    each
+                        let
+                            SerialText =
+                                if _ = null then
+                                    ""
                                 else
-                                    HexOnly,
-                        type nullable text
-                    }
+                                    Text.From(_),
+
+                            HexOnly =
+                                Text.Upper(
+                                    Text.Select(
+                                        SerialText,
+                                        {
+                                            "0".."9",
+                                            "A".."F",
+                                            "a".."f"
+                                        }
+                                    )
+                                )
+                        in
+                            if HexOnly = "" then
+                                null
+                            else
+                                HexOnly,
+                    type nullable text
                 }
-            ),
+            }
+        ),
 
-        // Blank serials cannot be matched and would otherwise all be treated
-        // as duplicates of each other.
-        #"Filtered Blank Serials" =
-            Table.SelectRows(
-                #"Normalized Serial",
-                each
-                    [Serial] <> null
-                        and [Serial] <> ""
-            ),
+    #"Filtered Blank Serials" =
+        Table.SelectRows(
+            #"Normalized Serial",
+            each
+                [Serial] <> null
+                    and [Serial] <> ""
+        ),
 
-        // Sort once so the newest row for every serial appears first.
-        #"Sorted for Deduplication" =
-            Table.Sort(
-                #"Filtered Blank Serials",
-                {
-                    {"Serial", Order.Ascending},
-                    {"export_date", Order.Descending},
-                    {"Source File", Order.Descending}
-                }
-            ),
+    // Newest export first for each serial.
+    #"Sorted for Deduplication" =
+        Table.Sort(
+            #"Filtered Blank Serials",
+            {
+                {"Serial", Order.Ascending},
+                {"export_date", Order.Descending},
+                {"Source File", Order.Descending}
+            }
+        ),
 
-        // Buffer ensures Table.Distinct retains the first row from the sort.
-        #"Buffered Sorted Data" =
-            Table.Buffer(
-                #"Sorted for Deduplication"
-            ),
+    // Ensures Table.Distinct keeps the first row from the sorted table.
+    #"Buffered Sorted Data" =
+        Table.Buffer(
+            #"Sorted for Deduplication"
+        ),
 
-        // Keep only the newest record for each original certificate serial.
-        #"Kept Latest Serial" =
-            Table.Distinct(
-                #"Buffered Sorted Data",
-                {"Serial"}
-            )
-    in
-        #"Kept Latest Serial"
+    // Retain only the newest occurrence of each certificate.
+    #"Kept Latest Serial" =
+        Table.Distinct(
+            #"Buffered Sorted Data",
+            {"Serial"}
+        )
+in
+    #"Kept Latest Serial"
