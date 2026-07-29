@@ -1,0 +1,710 @@
+#requires -Version 5.1
+<#
+.SYNOPSIS
+    Submits Cert-Now/Venafi custom:ResetCert requests for DNs read from a CSV.
+
+.DESCRIPTION
+    Reads container names from a CSV column (default: New_container_name), prepends
+    the configured VED policy path when required, and submits one form-encoded POST
+    per DN.
+
+    The script is SAFE BY DEFAULT: without -Execute it only performs a dry run.
+
+.AUTHENTICATION
+    Windows:
+        Tries Windows Integrated Authentication using the current Windows account.
+
+    Cookies:
+        Loads a raw Cookie request header copied from an authenticated Edge session.
+        The cookie file can contain either:
+
+            Cookie: name1=value1; name2=value2; csrf=...
+
+        or simply:
+
+            name1=value1; name2=value2; csrf=...
+
+        Cookies mode also supplies the current Windows credentials, matching the
+        behaviour normally expected on an internal intranet site.
+
+    Auto:
+        Uses Cookies mode when -CookieHeaderFile is supplied; otherwise Windows mode.
+
+.SECURITY
+    Browser cookies are credentials. Keep the cookie file local, restrict access to
+    it, delete it after use, and never save it in a shared folder or source control.
+
+.EXAMPLES
+    # Dry run; auto-detect comma/semicolon/tab delimiter
+    .\Invoke-CertNowResetCert_v1.0.ps1 -CsvPath .\containers.csv
+
+    # Submit only the first DN using Windows authentication
+    .\Invoke-CertNowResetCert_v1.0.ps1 -CsvPath .\containers.csv `
+        -AuthMode Windows -Limit 1 -Execute
+
+    # Submit using a raw Cookie header copied from Edge Developer Tools
+    .\Invoke-CertNowResetCert_v1.0.ps1 -CsvPath .\containers.csv `
+        -AuthMode Cookies -CookieHeaderFile .\cert-now-cookie.txt `
+        -DelayMs 500 -Execute
+
+    # Resume, skipping DNs already marked SUCCESS in an earlier TSV log
+    .\Invoke-CertNowResetCert_v1.0.ps1 -CsvPath .\containers.csv `
+        -CookieHeaderFile .\cert-now-cookie.txt -ResumeFile .\old-results.tsv `
+        -Execute
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$CsvPath,
+
+    [ValidateNotNullOrEmpty()]
+    [string]$ColumnName = 'New_container_name',
+
+    [ValidateSet('Auto', 'Comma', 'Semicolon', 'Tab')]
+    [string]$Delimiter = 'Auto',
+
+    [ValidateNotNullOrEmpty()]
+    [string]$BaseDn = '\VED\Policy\CORE-GLBL-L2\2 Approvers (New)',
+
+    [ValidateNotNullOrEmpty()]
+    [string]$ServerBaseUrl = 'https://',
+
+    [ValidateSet('Auto', 'Windows', 'Cookies')]
+    [string]$AuthMode = 'Auto',
+
+    [string]$CookieHeaderFile,
+
+    [ValidateRange(0, 3600000)]
+    [int]$DelayMs = 500,
+
+    # 0 means all valid unique entries.
+    [ValidateRange(0, 2147483647)]
+    [int]$Limit = 0,
+
+    [string]$LogPath,
+
+    [string]$ResumeFile,
+
+    # Without this switch, no POST is sent.
+    [switch]$Execute,
+
+    # Suppresses the final typed YES confirmation.
+    [switch]$Force
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+# Ensure modern TLS is available on older Windows PowerShell installations.
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor
+        [Net.SecurityProtocolType]::Tls12
+}
+catch {
+    # Continue; the host may already enforce an appropriate protocol.
+}
+
+function Get-CsvDelimiterCharacter {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Mode
+    )
+
+    switch ($Mode) {
+        'Comma'     { return ',' }
+        'Semicolon' { return ';' }
+        'Tab'       { return "`t" }
+    }
+
+    $firstLine = Get-Content -LiteralPath $Path -TotalCount 1
+    if ([string]::IsNullOrWhiteSpace($firstLine)) {
+        throw "CSV file is empty: $Path"
+    }
+
+    $candidates = @(
+        [pscustomobject]@{ Character = "`t"; Count = ([regex]::Matches($firstLine, "`t")).Count },
+        [pscustomobject]@{ Character = ';';   Count = ([regex]::Matches($firstLine, ';')).Count },
+        [pscustomobject]@{ Character = ',';   Count = ([regex]::Matches($firstLine, ',')).Count }
+    )
+
+    $best = $candidates | Sort-Object Count -Descending | Select-Object -First 1
+    if ($best.Count -eq 0) {
+        throw 'Could not detect the CSV delimiter. Use -Delimiter Comma, Semicolon, or Tab.'
+    }
+
+    return [string]$best.Character
+}
+
+function ConvertTo-FullDn {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Value,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Prefix
+    )
+
+    $item = $Value.Trim()
+    if ([string]::IsNullOrWhiteSpace($item)) {
+        return $null
+    }
+
+    # Accept a complete VED DN without prepending the policy path again.
+    if ($item -match '^[\\/]VED[\\/]') {
+        return ($item -replace '/', '\')
+    }
+
+    $cleanPrefix = ($Prefix.Trim() -replace '/', '\').TrimEnd('\')
+    $cleanItem   = ($item -replace '/', '\').TrimStart('\')
+    return "$cleanPrefix\$cleanItem"
+}
+
+function Get-RefererUri {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BaseUrl,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Dn
+    )
+
+    $encodedDn = [Uri]::EscapeDataString($Dn)
+    $pluginPath = '/vedadmin/~/App_Plugins/Venafi.Admin.Plugin.Web.Summary.aspx'
+
+    return (
+        $BaseUrl.TrimEnd('/') + $pluginPath +
+        '?act=Edit&view=Object' +
+        '&dn=' + $encodedDn +
+        '&val=Venafi.Admin.Plugin.Web.Summary' +
+        '&sel=Config%3AX509%20Server%20Certificate' +
+        '&objType=X509%20Server%20Certificate' +
+        '&certificatetype=Certificate' +
+        '&popup_id='
+    )
+}
+
+function Add-CookiesFromRawHeader {
+    param(
+        [Parameter(Mandatory = $true)]
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+
+        [Parameter(Mandatory = $true)]
+        [Uri]$TargetUri,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Cookie header file not found: $Path"
+    }
+
+    $raw = ((Get-Content -LiteralPath $Path -Raw) -replace "[`r`n]+", ' ').Trim()
+    $raw = $raw -replace '^\s*Cookie\s*:\s*', ''
+
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        throw "Cookie header file is empty: $Path"
+    }
+
+    $added = 0
+    foreach ($part in ($raw -split ';')) {
+        $pair = $part.Trim()
+        if ([string]::IsNullOrWhiteSpace($pair)) {
+            continue
+        }
+
+        $separator = $pair.IndexOf('=')
+        if ($separator -lt 1) {
+            Write-Warning "Ignoring malformed cookie entry: $pair"
+            continue
+        }
+
+        $name  = $pair.Substring(0, $separator).Trim()
+        $value = $pair.Substring($separator + 1).Trim().Trim('"')
+
+        try {
+            $cookie = New-Object System.Net.Cookie($name, $value, '/', $TargetUri.Host)
+            $Session.Cookies.Add($cookie)
+            $added++
+        }
+        catch {
+            throw "Could not load cookie '$name': $($_.Exception.Message)"
+        }
+    }
+
+    if ($added -eq 0) {
+        throw 'No valid cookies were found in the cookie header file.'
+    }
+
+    Write-Host "Loaded $added cookie(s) from $Path"
+}
+
+function Get-SessionCookieValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+
+        [Parameter(Mandatory = $true)]
+        [Uri]$TargetUri,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $cookie = $Session.Cookies.GetCookies($TargetUri) |
+        Where-Object { $_.Name -eq $Name } |
+        Select-Object -Last 1
+
+    if ($null -eq $cookie) {
+        return $null
+    }
+
+    return [string]$cookie.Value
+}
+
+function Test-AuthenticationPage {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Response,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedHost
+    )
+
+    $finalUri = $null
+    try {
+        $finalUri = $Response.BaseResponse.ResponseUri
+    }
+    catch {
+        # Some PowerShell versions expose response metadata differently.
+    }
+
+    if ($null -ne $finalUri) {
+        if ($finalUri.Host -ne $ExpectedHost) {
+            return $false
+        }
+
+        if ($finalUri.AbsoluteUri -match '(?i)(login|signin|saml|adfs|oauth)') {
+            return $false
+        }
+    }
+
+    $content = [string]$Response.Content
+    if ($content -match '(?is)(SAMLRequest|<title>\s*(Sign in|Login)|name=["'']?password["'']?)') {
+        return $false
+    }
+
+    return $true
+}
+
+function Get-ResponseExcerpt {
+    param(
+        [AllowNull()]
+        [string]$Content,
+
+        [int]$MaximumLength = 500
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Content)) {
+        return ''
+    }
+
+    $singleLine = ($Content -replace '[\r\n\t]+', ' ' -replace '\s{2,}', ' ').Trim()
+    if ($singleLine.Length -gt $MaximumLength) {
+        return $singleLine.Substring(0, $MaximumLength)
+    }
+
+    return $singleLine
+}
+
+function Write-ResultLog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [psobject]$Record
+    )
+
+    $parent = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    if (Test-Path -LiteralPath $Path) {
+        $Record | Export-Csv -LiteralPath $Path -Delimiter "`t" -NoTypeInformation -Append -Encoding UTF8
+    }
+    else {
+        $Record | Export-Csv -LiteralPath $Path -Delimiter "`t" -NoTypeInformation -Encoding UTF8
+    }
+}
+
+function Get-HttpStatusFromError {
+    param(
+        [Parameter(Mandatory = $true)]
+        $ErrorRecord
+    )
+
+    try {
+        if ($null -ne $ErrorRecord.Exception.Response.StatusCode) {
+            return [int]$ErrorRecord.Exception.Response.StatusCode
+        }
+    }
+    catch {
+    }
+
+    return 0
+}
+
+if (-not (Test-Path -LiteralPath $CsvPath -PathType Leaf)) {
+    throw "CSV file not found: $CsvPath"
+}
+
+$resolvedCsvPath = (Resolve-Path -LiteralPath $CsvPath).Path
+$delimiterCharacter = Get-CsvDelimiterCharacter -Path $resolvedCsvPath -Mode $Delimiter
+$rows = @(Import-Csv -LiteralPath $resolvedCsvPath -Delimiter $delimiterCharacter)
+
+if ($rows.Count -eq 0) {
+    throw "CSV contains no data rows: $resolvedCsvPath"
+}
+
+$availableColumns = @($rows[0].PSObject.Properties.Name)
+$matchedColumn = $availableColumns | Where-Object { $_ -ieq $ColumnName } | Select-Object -First 1
+if ([string]::IsNullOrWhiteSpace($matchedColumn)) {
+    throw "Column '$ColumnName' was not found. Available columns: $($availableColumns -join ', ')"
+}
+
+$targets = New-Object System.Collections.ArrayList
+$seen = @{}
+$blankCount = 0
+$duplicateCount = 0
+
+foreach ($row in $rows) {
+    $sourceValue = [string]$row.$matchedColumn
+    $fullDn = ConvertTo-FullDn -Value $sourceValue -Prefix $BaseDn
+
+    if ([string]::IsNullOrWhiteSpace($fullDn)) {
+        $blankCount++
+        continue
+    }
+
+    $key = $fullDn.ToLowerInvariant()
+    if ($seen.ContainsKey($key)) {
+        $duplicateCount++
+        continue
+    }
+
+    $seen[$key] = $true
+    [void]$targets.Add([pscustomobject]@{
+        SourceValue = $sourceValue.Trim()
+        FullDn      = $fullDn
+    })
+}
+
+if ($targets.Count -eq 0) {
+    throw "No valid DNs were found in column '$matchedColumn'."
+}
+
+$resumeSuccess = @{}
+if (-not [string]::IsNullOrWhiteSpace($ResumeFile)) {
+    if (-not (Test-Path -LiteralPath $ResumeFile -PathType Leaf)) {
+        throw "Resume log not found: $ResumeFile"
+    }
+
+    foreach ($oldRecord in @(Import-Csv -LiteralPath $ResumeFile -Delimiter "`t")) {
+        if (($oldRecord.result -eq 'SUCCESS') -and -not [string]::IsNullOrWhiteSpace($oldRecord.full_dn)) {
+            $resumeSuccess[$oldRecord.full_dn.ToLowerInvariant()] = $true
+        }
+    }
+
+    $targets = @($targets | Where-Object {
+        -not $resumeSuccess.ContainsKey($_.FullDn.ToLowerInvariant())
+    })
+}
+
+if ($Limit -gt 0) {
+    $targets = @($targets | Select-Object -First $Limit)
+}
+else {
+    $targets = @($targets)
+}
+
+Write-Host ''
+Write-Host "CSV:              $resolvedCsvPath"
+Write-Host "Column:           $matchedColumn"
+Write-Host "Rows read:        $($rows.Count)"
+Write-Host "Blank rows:       $blankCount"
+Write-Host "Duplicates:       $duplicateCount"
+Write-Host "Targets selected: $($targets.Count)"
+Write-Host "Base DN:          $BaseDn"
+Write-Host ''
+
+if ($targets.Count -eq 0) {
+    Write-Host 'Nothing remains to process.'
+    exit 0
+}
+
+if (-not $Execute) {
+    Write-Host 'DRY RUN: no POST requests will be sent.' -ForegroundColor Yellow
+    Write-Host ''
+
+    $counter = 0
+    foreach ($target in $targets) {
+        $counter++
+        Write-Output ("[{0}/{1}] {2}" -f $counter, $targets.Count, $target.FullDn)
+    }
+
+    Write-Host ''
+    Write-Host 'Re-run with -Execute after reviewing the generated DNs.' -ForegroundColor Yellow
+    exit 0
+}
+
+if (-not $Force) {
+    Write-Host "This will submit custom:ResetCert for $($targets.Count) DN(s)." -ForegroundColor Yellow
+    $confirmation = Read-Host 'Type YES to continue'
+    if ($confirmation -cne 'YES') {
+        Write-Host 'Cancelled. No POST requests were sent.'
+        exit 1
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($LogPath)) {
+    $LogPath = Join-Path -Path (Get-Location) -ChildPath (
+        'cert-now-reset-results_{0}.tsv' -f (Get-Date -Format 'yyyyMMdd_HHmmss')
+    )
+}
+
+$effectiveAuthMode = $AuthMode
+if ($effectiveAuthMode -eq 'Auto') {
+    if (-not [string]::IsNullOrWhiteSpace($CookieHeaderFile)) {
+        $effectiveAuthMode = 'Cookies'
+    }
+    else {
+        $effectiveAuthMode = 'Windows'
+    }
+}
+
+if (($effectiveAuthMode -eq 'Cookies') -and [string]::IsNullOrWhiteSpace($CookieHeaderFile)) {
+    throw 'Cookies authentication requires -CookieHeaderFile.'
+}
+
+$baseUri = [Uri]($ServerBaseUrl.TrimEnd('/') + '/')
+$postUri = $ServerBaseUrl.TrimEnd('/') + '/vedadmin/~/App_Plugins/Venafi.Admin.Plugin.Web.Summary.aspx'
+$session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+$session.UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0'
+
+if ($effectiveAuthMode -eq 'Cookies') {
+    Add-CookiesFromRawHeader -Session $session -TargetUri $baseUri -Path $CookieHeaderFile
+}
+
+# Validate/establish the session against the first target and allow the server to
+# create or refresh its csrf cookie before the first POST.
+$initialReferer = Get-RefererUri -BaseUrl $ServerBaseUrl -Dn $targets[0].FullDn
+Write-Host "Authenticating using mode: $effectiveAuthMode"
+
+$authParameters = @{
+    Uri                   = $initialReferer
+    Method                = 'GET'
+    WebSession            = $session
+    UseDefaultCredentials = $true
+    UseBasicParsing       = $true
+    ErrorAction           = 'Stop'
+    Headers               = @{
+        'Accept'          = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        'Accept-Language' = 'en-GB,en;q=0.9,en-US;q=0.8'
+    }
+}
+
+try {
+    $authResponse = Invoke-WebRequest @authParameters
+}
+catch {
+    $status = Get-HttpStatusFromError -ErrorRecord $_
+    throw "Authentication/session validation failed (HTTP $status): $($_.Exception.Message)"
+}
+
+if (-not (Test-AuthenticationPage -Response $authResponse -ExpectedHost $baseUri.Host)) {
+    throw (
+        'The request appears to have been redirected to a login/SAML page. ' +
+        'Log in with Edge, copy the raw Cookie request header into a local file, ' +
+        'then run with -AuthMode Cookies -CookieHeaderFile <file>.'
+    )
+}
+
+$csrfToken = Get-SessionCookieValue -Session $session -TargetUri $baseUri -Name 'csrf'
+if ([string]::IsNullOrWhiteSpace($csrfToken)) {
+    throw (
+        "No 'csrf' cookie was available after authentication. " +
+        'Windows authentication alone is probably insufficient; use a fresh Edge session cookie header.'
+    )
+}
+
+Write-Host 'Authenticated session validated; csrf cookie found.'
+Write-Host "Log: $LogPath"
+Write-Host ''
+
+$successCount = 0
+$failureCount = 0
+$stoppedForAuthentication = $false
+
+try {
+    for ($index = 0; $index -lt $targets.Count; $index++) {
+        $target = $targets[$index]
+        $number = $index + 1
+        $percent = [int](($number / [double]$targets.Count) * 100)
+
+        Write-Progress -Activity 'Submitting Cert-Now ResetCert requests' `
+            -Status ("DN {0} of {1}" -f $number, $targets.Count) `
+            -PercentComplete $percent
+
+        Write-Host ("[{0}/{1}] {2}" -f $number, $targets.Count, $target.FullDn)
+
+        # Refresh the token from the session in case the application rotated it.
+        $csrfToken = Get-SessionCookieValue -Session $session -TargetUri $baseUri -Name 'csrf'
+        if ([string]::IsNullOrWhiteSpace($csrfToken)) {
+            $failureCount++
+            $stoppedForAuthentication = $true
+
+            Write-ResultLog -Path $LogPath -Record ([pscustomobject]@{
+                timestamp        = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+                index            = $number
+                total            = $targets.Count
+                source_value     = $target.SourceValue
+                full_dn          = $target.FullDn
+                http_status      = 0
+                result           = 'AUTH_ERROR'
+                message          = 'csrf cookie disappeared from the session'
+                response_excerpt = ''
+            })
+
+            Write-Host 'csrf cookie disappeared from the session. Processing stopped.' -ForegroundColor Red
+            break
+        }
+
+        $referer = Get-RefererUri -BaseUrl $ServerBaseUrl -Dn $target.FullDn
+        $headers = @{
+            'Accept'           = '*/*'
+            'Accept-Encoding'  = 'gzip, deflate'
+            'Accept-Language'  = 'en-GB,en;q=0.9,en-US;q=0.8'
+            'DNT'              = '1'
+            'Origin'           = $ServerBaseUrl.TrimEnd('/')
+            'Referer'          = $referer
+            'X-Requested-With' = 'XMLHttpRequest'
+        }
+
+        $body = @{
+            cmd   = 'custom:ResetCert'
+            el    = 'myGrid'
+            dn    = $target.FullDn
+            recid = '-1'
+            csrf  = $csrfToken
+        }
+
+        $requestParameters = @{
+            Uri                   = $postUri
+            Method                = 'POST'
+            WebSession            = $session
+            UseDefaultCredentials = $true
+            UseBasicParsing       = $true
+            MaximumRedirection    = 0
+            Headers               = $headers
+            ContentType           = 'application/x-www-form-urlencoded; charset=UTF-8'
+            Body                  = $body
+            ErrorAction           = 'Stop'
+        }
+
+        $statusCode = 0
+        $result = 'FAILED'
+        $message = ''
+        $responseContent = ''
+
+        try {
+            $response = Invoke-WebRequest @requestParameters
+            $statusCode = [int]$response.StatusCode
+            $responseContent = [string]$response.Content
+
+            $looksLikeAuthPage = -not (Test-AuthenticationPage -Response $response -ExpectedHost $baseUri.Host)
+            $looksLikeSecurityFailure = $responseContent -match '(?is)(invalid\s+csrf|csrf.{0,80}(failed|expired|invalid)|session\s+expired|access\s+denied|not\s+authorized|unauthorized|forbidden|"success"\s*:\s*false|"status"\s*:\s*"error")'
+
+            if ($looksLikeAuthPage -or $looksLikeSecurityFailure) {
+                $result = 'AUTH_ERROR'
+                $message = 'Authentication/session/CSRF failure detected in the response'
+                $failureCount++
+                $stoppedForAuthentication = $true
+            }
+            elseif (($statusCode -ge 200) -and ($statusCode -lt 300)) {
+                $result = 'SUCCESS'
+                $message = "HTTP $statusCode"
+                $successCount++
+            }
+            else {
+                $result = 'FAILED'
+                $message = "Unexpected HTTP status $statusCode"
+                $failureCount++
+            }
+        }
+        catch {
+            $statusCode = Get-HttpStatusFromError -ErrorRecord $_
+            $responseContent = [string]$_.ErrorDetails.Message
+            $message = $_.Exception.Message
+            $failureCount++
+
+            if (($statusCode -eq 401) -or ($statusCode -eq 403) -or
+                ($statusCode -ge 300 -and $statusCode -lt 400) -or
+                ($responseContent -match '(?is)(csrf|session\s+expired|access\s+denied|unauthorized|forbidden|saml|login|signin)')) {
+                $result = 'AUTH_ERROR'
+                $stoppedForAuthentication = $true
+            }
+            else {
+                $result = 'FAILED'
+            }
+        }
+
+        Write-ResultLog -Path $LogPath -Record ([pscustomobject]@{
+            timestamp        = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            index            = $number
+            total            = $targets.Count
+            source_value     = $target.SourceValue
+            full_dn          = $target.FullDn
+            http_status      = $statusCode
+            result           = $result
+            message          = $message
+            response_excerpt = (Get-ResponseExcerpt -Content $responseContent)
+        })
+
+        if ($result -eq 'SUCCESS') {
+            Write-Host "  SUCCESS - HTTP $statusCode" -ForegroundColor Green
+        }
+        elseif ($result -eq 'AUTH_ERROR') {
+            Write-Host "  AUTH_ERROR - $message" -ForegroundColor Red
+            Write-Warning 'Processing stopped to avoid repeating requests with an invalid session.'
+            break
+        }
+        else {
+            Write-Host "  FAILED - HTTP $statusCode - $message" -ForegroundColor Red
+        }
+
+        if (($DelayMs -gt 0) -and ($number -lt $targets.Count)) {
+            Start-Sleep -Milliseconds $DelayMs
+        }
+    }
+}
+catch [System.Management.Automation.PipelineStoppedException] {
+    Write-Warning 'Stopped by the user.'
+}
+finally {
+    Write-Progress -Activity 'Submitting Cert-Now ResetCert requests' -Completed
+    Write-Host ''
+    Write-Host "Completed. Success: $successCount; Failed: $failureCount"
+    Write-Host "Log: $LogPath"
+
+    if ($stoppedForAuthentication) {
+        Write-Warning 'The run stopped because the session, authentication, or CSRF token was no longer valid.'
+    }
+}
