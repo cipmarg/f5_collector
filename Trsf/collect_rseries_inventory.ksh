@@ -5,7 +5,7 @@
 # Written for legacy/POSIX awk implementations.
 #
 # Usage:
-#   ./collect_rseries_inventory_v7_single_session.ksh [hosts_file] [output_file]
+#   ./collect_rseries_inventory_v8_prompt_sync.ksh [hosts_file] [output_file]
 #
 # Defaults:
 #   hosts_file  = hosts.inv
@@ -18,7 +18,8 @@
 # Optional debugging:
 #   DEBUG=1         Save combined and split command output for every host.
 #   SSH_VERBOSE=1   Save ssh -vv diagnostics.
-#   DEBUG_DIR=path  Override the generated debug-directory name.
+#   DEBUG_DIR=path     Override the generated debug-directory name.
+#   PROMPT_TIMEOUT=20  Seconds to wait for the management-CLI prompt.
 #
 # Controls:
 #   Ctrl+C   Stop the current host SSH session and continue with the next host.
@@ -30,6 +31,7 @@ EXPORT_DATE=$(date '+%Y-%m-%d')
 DEBUG=${DEBUG:-0}
 SSH_VERBOSE=${SSH_VERBOSE:-0}
 DEBUG_DIR=${DEBUG_DIR:-rseries_inventory_debug_$(date '+%Y%m%d_%H%M%S')}
+PROMPT_TIMEOUT=${PROMPT_TIMEOUT:-20}
 
 if [ -z "$USER" ]; then
     echo "ERROR: USER is not set." >&2
@@ -66,6 +68,18 @@ case "$SSH_VERBOSE" in
     *) SSH_VERBOSE=0 ;;
 esac
 
+case "$PROMPT_TIMEOUT" in
+    ''|*[!0-9]*)
+        echo "ERROR: PROMPT_TIMEOUT must be a positive integer." >&2
+        exit 1
+        ;;
+esac
+
+if [ "$PROMPT_TIMEOUT" -lt 1 ]; then
+    echo "ERROR: PROMPT_TIMEOUT must be at least 1 second." >&2
+    exit 1
+fi
+
 TMP_BASE=${TMPDIR:-/tmp}/rseries_inventory.$$
 HOSTS_TMP=${TMP_BASE}.hosts
 SESSION_RAW_TMP=${TMP_BASE}.session.raw
@@ -75,6 +89,7 @@ TENANTS_TMP=${TMP_BASE}.tenants
 FIPS_TMP=${TMP_BASE}.fips
 SSH_ERR_TMP=${TMP_BASE}.ssherr
 COMMAND_TMP=${TMP_BASE}.commands
+INPUT_FIFO=${TMP_BASE}.input.fifo
 ROWS_TMP=${TMP_BASE}.rows
 COUNT_TMP=${TMP_BASE}.count
 
@@ -82,16 +97,53 @@ cleanup()
 {
     rm -f "$HOSTS_TMP" "$SESSION_RAW_TMP" "$SESSION_CLEAN_TMP" \
         "$VERSION_TMP" "$TENANTS_TMP" "$FIPS_TMP" "$SSH_ERR_TMP" \
-        "$COMMAND_TMP" "$ROWS_TMP" "$COUNT_TMP"
+        "$COMMAND_TMP" "$ROWS_TMP" "$COUNT_TMP" "$INPUT_FIFO"
 }
 
 CURRENT_HOST=""
 INTERRUPTED=0
 INDEX=0
+SSH_PID=""
+INPUT_OPEN=0
+SESSION_ERROR=""
+
+handle_interrupt()
+{
+    INTERRUPTED=1
+
+    if [ "$INPUT_OPEN" -eq 1 ]; then
+        exec 3>&-
+        INPUT_OPEN=0
+    fi
+
+    if [ -n "$SSH_PID" ]; then
+        kill "$SSH_PID" 2>/dev/null
+    fi
+
+    printf "\nCtrl+C: stopped SSH session on %s; continuing.\n" \
+        "$CURRENT_HOST" >&2
+}
+
+handle_quit()
+{
+    if [ "$INPUT_OPEN" -eq 1 ]; then
+        exec 3>&-
+        INPUT_OPEN=0
+    fi
+
+    if [ -n "$SSH_PID" ]; then
+        kill "$SSH_PID" 2>/dev/null
+    fi
+
+    printf "\nCtrl+\\: terminating script.\n" >&2
+    trap - 0
+    cleanup
+    exit 131
+}
 
 trap 'cleanup' 0
-trap 'INTERRUPTED=1; printf "\nCtrl+C: stopped SSH session on %s; continuing.\n" "$CURRENT_HOST" >&2' INT
-trap 'printf "\nCtrl+\\: terminating script.\n" >&2; trap - 0; cleanup; exit 131' QUIT
+trap 'handle_interrupt' INT
+trap 'handle_quit' QUIT
 
 # Remove CR characters, blank lines, comments and surrounding whitespace.
 sed 's/\r$//; s/^[[:space:]]*//; s/[[:space:]]*$//; /^[[:space:]]*$/d; /^[[:space:]]*#/d' \
@@ -136,6 +188,10 @@ run_host_session()
 {
     SSH_HOST=$1
 
+    SESSION_ERROR=""
+    SSH_PID=""
+    INPUT_OPEN=0
+
     : > "$SESSION_RAW_TMP"
     : > "$SESSION_CLEAN_TMP"
     : > "$VERSION_TMP"
@@ -152,6 +208,17 @@ run_host_session()
         echo 'exit'
     } > "$COMMAND_TMP"
 
+    rm -f "$INPUT_FIFO"
+
+    if ! mkfifo "$INPUT_FIFO"; then
+        SESSION_ERROR="INPUT_FIFO_CREATE_FAILED"
+        return 1
+    fi
+
+    # Start SSH with its stdin connected to a FIFO. This lets the script wait
+    # until the F5OS management prompt is actually visible before sending any
+    # commands. Some slower hosts discard commands piped during login/banner
+    # processing and then remain idle until the CLI timeout expires.
     if [ "$SSH_VERBOSE" -eq 1 ]; then
         SSHPASS="$SSHPASS" sshpass -e ssh -vv -tt \
             -o StrictHostKeyChecking=no \
@@ -159,8 +226,8 @@ run_host_session()
             -o ConnectTimeout=10 \
             -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=2 \
-            "$USER@$SSH_HOST" < "$COMMAND_TMP" \
-            > "$SESSION_RAW_TMP" 2> "$SSH_ERR_TMP"
+            "$USER@$SSH_HOST" < "$INPUT_FIFO" \
+            > "$SESSION_RAW_TMP" 2> "$SSH_ERR_TMP" &
     else
         SSHPASS="$SSHPASS" sshpass -e ssh -tt \
             -o StrictHostKeyChecking=no \
@@ -169,14 +236,68 @@ run_host_session()
             -o ConnectTimeout=10 \
             -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=2 \
-            "$USER@$SSH_HOST" < "$COMMAND_TMP" \
-            > "$SESSION_RAW_TMP" 2> "$SSH_ERR_TMP"
+            "$USER@$SSH_HOST" < "$INPUT_FIFO" \
+            > "$SESSION_RAW_TMP" 2> "$SSH_ERR_TMP" &
     fi
 
+    SSH_PID=$!
+
+    # Opening the writer releases the SSH process from its FIFO-open wait.
+    exec 3>"$INPUT_FIFO"
+    INPUT_OPEN=1
+
+    PROMPT_READY=0
+    PROMPT_WAITED=0
+
+    while [ "$PROMPT_WAITED" -lt "$PROMPT_TIMEOUT" ]
+    do
+        tr -d '\r' < "$SESSION_RAW_TMP" > "$SESSION_CLEAN_TMP"
+
+        # Typical prompt: GBGLO-DC0-ECPHF-003#
+        if grep -q '^[A-Za-z0-9._-][A-Za-z0-9._-]*#[[:space:]]*$' \
+            "$SESSION_CLEAN_TMP" >/dev/null 2>&1
+        then
+            PROMPT_READY=1
+            break
+        fi
+
+        if [ "$INTERRUPTED" -eq 1 ]; then
+            break
+        fi
+
+        if ! kill -0 "$SSH_PID" 2>/dev/null; then
+            break
+        fi
+
+        sleep 1
+        PROMPT_WAITED=$((PROMPT_WAITED + 1))
+    done
+
+    if [ "$PROMPT_READY" -eq 1 ] && [ "$INTERRUPTED" -eq 0 ]; then
+        cat "$COMMAND_TMP" >&3
+    else
+        if [ "$INTERRUPTED" -eq 0 ]; then
+            SESSION_ERROR="CLI_PROMPT_TIMEOUT"
+            printf '  CLI prompt not detected within %s seconds.\n' \
+                "$PROMPT_TIMEOUT" >&2
+        fi
+
+        kill "$SSH_PID" 2>/dev/null
+    fi
+
+    if [ "$INPUT_OPEN" -eq 1 ]; then
+        exec 3>&-
+        INPUT_OPEN=0
+    fi
+
+    wait "$SSH_PID" 2>/dev/null
     SSH_RC=$?
+    SSH_PID=""
+
+    rm -f "$INPUT_FIFO"
 
     # A forced pseudo-terminal adds carriage returns. Removing them here is
-    # essential: otherwise values such as "deployed\r" fail exact comparisons.
+    # essential: otherwise values such as "deployed\r" fail comparisons.
     tr -d '\r' < "$SESSION_RAW_TMP" > "$SESSION_CLEAN_TMP"
 
     # Split the combined session by the command lines echoed by the remote CLI.
@@ -198,6 +319,11 @@ run_host_session()
         ' "$SESSION_CLEAN_TMP"
 
     save_debug_files
+
+    if [ -n "$SESSION_ERROR" ]; then
+        return 124
+    fi
+
     return "$SSH_RC"
 }
 
@@ -255,7 +381,11 @@ do
     PRODUCT=$(awk '$1=="system" && $2=="version" && $3=="product" { print $4; exit }' "$VERSION_TMP")
 
     if [ "$SESSION_RC" -ne 0 ]; then
-        add_status "SSH_SESSION_FAILED"
+        if [ -n "$SESSION_ERROR" ]; then
+            add_status "$SESSION_ERROR"
+        else
+            add_status "SSH_SESSION_FAILED"
+        fi
     fi
 
     if [ -z "$OS_VERSION" ] && [ -z "$SERVICE_VERSION" ] && [ -z "$PRODUCT" ]; then
