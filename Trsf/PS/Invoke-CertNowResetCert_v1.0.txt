@@ -10,10 +10,11 @@
 
     The script is SAFE BY DEFAULT: without -Execute it only performs a dry run.
 
-    Version 1.2 allows normal application redirects during POST requests. Version
-    1.0 incorrectly used MaximumRedirection=0, which made any legitimate 302/303
-    response appear as a failed redirect-limit error. Genuine redirect loops still
-    stop the run and are logged as AUTH_ERROR.
+    Version 1.3 does not follow redirects for action POST requests. A redirect to the
+    Aperture home page can return HTTP 200 after it is followed even though ResetCert
+    was never executed. Success is now reported only for a direct, non-HTML 2xx
+    response from the Summary.aspx action endpoint. The script also checks for the
+    legacy WebAdmin session cookie required by the captured browser request.
 
 .AUTHENTICATION
     Windows:
@@ -41,19 +42,19 @@
 
 .EXAMPLES
     # Dry run; auto-detect comma/semicolon/tab delimiter
-    .\Invoke-CertNowResetCert_v1.2.ps1 -CsvPath .\containers.csv
+    .\Invoke-CertNowResetCert_v1.3.ps1 -CsvPath .\containers.csv
 
     # Submit only the first DN using Windows authentication
-    .\Invoke-CertNowResetCert_v1.2.ps1 -CsvPath .\containers.csv `
+    .\Invoke-CertNowResetCert_v1.3.ps1 -CsvPath .\containers.csv `
         -AuthMode Windows -Limit 1 -Execute
 
     # Submit using a raw Cookie header copied from Edge Developer Tools
-    .\Invoke-CertNowResetCert_v1.2.ps1 -CsvPath .\containers.csv `
+    .\Invoke-CertNowResetCert_v1.3.ps1 -CsvPath .\containers.csv `
         -AuthMode Cookies -CookieHeaderFile .\cert-now-cookie.txt `
         -DelayMs 500 -Execute
 
     # Resume, skipping DNs already marked SUCCESS in an earlier TSV log
-    .\Invoke-CertNowResetCert_v1.2.ps1 -CsvPath .\containers.csv `
+    .\Invoke-CertNowResetCert_v1.3.ps1 -CsvPath .\containers.csv `
         -CookieHeaderFile .\cert-now-cookie.txt -ResumeFile .\old-results.tsv `
         -Execute
 #>
@@ -74,7 +75,7 @@ param(
     [string]$BaseDn = '\VED\Policy\CORE-GLBL-L2\2 Approvers (New)',
 
     [ValidateNotNullOrEmpty()]
-    [string]$ServerBaseUrl = 'https://,
+    [string]$ServerBaseUrl = 'https://',
 
     [ValidateSet('Auto', 'Windows', 'Cookies')]
     [string]$AuthMode = 'Auto',
@@ -100,7 +101,10 @@ param(
     [switch]$Execute,
 
     # Suppresses the final typed YES confirmation.
-    [switch]$Force
+    [switch]$Force,
+
+    # Prints HTTP status, redirect location, content type and cookie names (never values).
+    [switch]$DebugHttp
 )
 
 Set-StrictMode -Version 2.0
@@ -434,6 +438,112 @@ function Get-ErrorResponseContent {
     return ''
 }
 
+
+function Get-SessionCookieNames {
+    param(
+        [Parameter(Mandatory = $true)]
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+
+        [Parameter(Mandatory = $true)]
+        [Uri]$TargetUri
+    )
+
+    return @(
+        $Session.Cookies.GetCookies($TargetUri) |
+            ForEach-Object { [string]$_.Name } |
+            Sort-Object -Unique
+    )
+}
+
+function Invoke-FormPostNoRedirect {
+    param(
+        [Parameter(Mandatory = $true)]
+        [Uri]$Uri,
+
+        [Parameter(Mandatory = $true)]
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+
+        [Parameter(Mandatory = $true)]
+        [string]$UserAgent,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Referer,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Origin,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Body
+    )
+
+    $request = [System.Net.HttpWebRequest]::Create($Uri)
+    $request.Method = 'POST'
+    $request.AllowAutoRedirect = $false
+    $request.CookieContainer = $Session.Cookies
+    $request.UseDefaultCredentials = $true
+    $request.UserAgent = $UserAgent
+    $request.Accept = '*/*'
+    $request.ContentType = 'application/x-www-form-urlencoded; charset=UTF-8'
+    $request.Referer = $Referer
+    $request.AutomaticDecompression =
+        [System.Net.DecompressionMethods]::GZip -bor
+        [System.Net.DecompressionMethods]::Deflate
+    $request.Headers['Accept-Language'] = 'en-GB,en;q=0.9,en-US;q=0.8'
+    $request.Headers['DNT'] = '1'
+    $request.Headers['Origin'] = $Origin
+    $request.Headers['X-Requested-With'] = 'XMLHttpRequest'
+
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+    $request.ContentLength = $bodyBytes.Length
+
+    $requestStream = $request.GetRequestStream()
+    try {
+        $requestStream.Write($bodyBytes, 0, $bodyBytes.Length)
+    }
+    finally {
+        $requestStream.Dispose()
+    }
+
+    $response = $null
+    try {
+        try {
+            $response = [System.Net.HttpWebResponse]$request.GetResponse()
+        }
+        catch [System.Net.WebException] {
+            if ($null -eq $_.Exception.Response) {
+                throw
+            }
+            $response = [System.Net.HttpWebResponse]$_.Exception.Response
+        }
+
+        $content = ''
+        $stream = $response.GetResponseStream()
+        if ($null -ne $stream) {
+            $reader = New-Object System.IO.StreamReader($stream)
+            try {
+                $content = $reader.ReadToEnd()
+            }
+            finally {
+                $reader.Dispose()
+            }
+        }
+
+        return [pscustomobject]@{
+            StatusCode       = [int]$response.StatusCode
+            StatusDescription = [string]$response.StatusDescription
+            ResponseUri      = [string]$response.ResponseUri.AbsoluteUri
+            RedirectLocation = [string]$response.Headers['Location']
+            ContentType      = [string]$response.ContentType
+            Content          = [string]$content
+        }
+    }
+    finally {
+        if ($null -ne $response) {
+            $response.Close()
+        }
+    }
+}
+
 if (-not (Test-Path -LiteralPath $CsvPath -PathType Leaf)) {
     throw "CSV file not found: $CsvPath"
 }
@@ -619,7 +729,21 @@ if ([string]::IsNullOrWhiteSpace($csrfToken)) {
     )
 }
 
-Write-Host 'Authenticated session validated; csrf cookie found.'
+$sessionCookieNames = @(Get-SessionCookieNames -Session $session -TargetUri $baseUri)
+if ($DebugHttp) {
+    Write-Host ("Session cookie names: {0}" -f ($sessionCookieNames -join ', ')) -ForegroundColor DarkGray
+}
+
+if ($sessionCookieNames -notcontains 'webadmin') {
+    throw (
+        "The session has a csrf cookie but no 'webadmin' cookie. " +
+        'That is normally a generic Aperture/Windows session, not the legacy WebAdmin session used by ResetCert. ' +
+        'Copy the Cookie request header from the working browser POST and run with ' +
+        '-AuthMode Cookies -CookieHeaderFile <file>.'
+    )
+}
+
+Write-Host "Authenticated WebAdmin session validated; csrf and webadmin cookies found."
 Write-Host "Log: $LogPath"
 Write-Host ''
 
@@ -654,8 +778,10 @@ try {
                 http_status      = 0
                 result           = 'AUTH_ERROR'
                 message          = 'csrf cookie disappeared from the session'
-                final_uri       = ''
-                response_excerpt = ''
+                final_uri        = ''
+                redirect_location = ''
+                content_type      = ''
+                response_excerpt  = ''
             })
 
             Write-Host 'csrf cookie disappeared from the session. Processing stopped.' -ForegroundColor Red
@@ -663,61 +789,92 @@ try {
         }
 
         $referer = Get-RefererUri -BaseUrl $ServerBaseUrl -Dn $target.FullDn
-        $headers = @{
-            'Accept'           = '*/*'
-            'Accept-Encoding'  = 'gzip, deflate'
-            'Accept-Language'  = 'en-GB,en;q=0.9,en-US;q=0.8'
-            'DNT'              = '1'
-            'Origin'           = $ServerBaseUrl.TrimEnd('/')
-            'Referer'          = $referer
-            'X-Requested-With' = 'XMLHttpRequest'
-        }
-
-        $body = @{
-            cmd   = 'custom:ResetCert'
-            el    = 'myGrid'
-            dn    = $target.FullDn
-            recid = '-1'
-            csrf  = $csrfToken
-        }
-
-        $requestParameters = @{
-            Uri                   = $postUri
-            Method                = 'POST'
-            WebSession            = $session
-            UseDefaultCredentials = $true
-            UseBasicParsing       = $true
-            MaximumRedirection    = $MaximumRedirection
-            Headers               = $headers
-            ContentType           = 'application/x-www-form-urlencoded; charset=UTF-8'
-            Body                  = $body
-            ErrorAction           = 'Stop'
-        }
+        # Build the body explicitly so it mirrors the browser's form-encoded POST.
+        $encodedBody =
+            'cmd=custom%3AResetCert' +
+            '&el=myGrid' +
+            '&dn=' + [Uri]::EscapeDataString($target.FullDn) +
+            '&recid=-1' +
+            '&csrf=' + [Uri]::EscapeDataString($csrfToken)
 
         $statusCode = 0
         $result = 'FAILED'
         $message = ''
         $responseContent = ''
         $finalUri = ''
+        $redirectLocation = ''
+        $contentType = ''
 
         try {
-            $response = Invoke-WebRequest @requestParameters
-            $statusCode = [int]$response.StatusCode
-            $responseContent = [string]$response.Content
-            $finalUri = Get-ResponseUri -Response $response
+            $postResponse = Invoke-FormPostNoRedirect `
+                -Uri ([Uri]$postUri) `
+                -Session $session `
+                -UserAgent $session.UserAgent `
+                -Referer $referer `
+                -Origin $ServerBaseUrl.TrimEnd('/') `
+                -Body $encodedBody
 
-            $looksLikeAuthPage = -not (Test-AuthenticationPage -Response $response -ExpectedHost $baseUri.Host)
-            $looksLikeSecurityFailure = $responseContent -match '(?is)(invalid\s+csrf|csrf.{0,80}(failed|expired|invalid)|session\s+expired|access\s+denied|not\s+authorized|unauthorized|forbidden|"success"\s*:\s*false|"status"\s*:\s*"error")'
+            $statusCode = [int]$postResponse.StatusCode
+            $responseContent = [string]$postResponse.Content
+            $finalUri = [string]$postResponse.ResponseUri
+            $redirectLocation = [string]$postResponse.RedirectLocation
+            $contentType = [string]$postResponse.ContentType
 
-            if ($looksLikeAuthPage -or $looksLikeSecurityFailure) {
+            if ($DebugHttp) {
+                Write-Host ("  HTTP status:      {0}" -f $statusCode) -ForegroundColor DarkGray
+                Write-Host ("  Response URI:     {0}" -f $finalUri) -ForegroundColor DarkGray
+                Write-Host ("  Redirect location:{0}" -f $redirectLocation) -ForegroundColor DarkGray
+                Write-Host ("  Content-Type:     {0}" -f $contentType) -ForegroundColor DarkGray
+                Write-Host ("  Response excerpt: {0}" -f (Get-ResponseExcerpt -Content $responseContent -MaximumLength 250)) -ForegroundColor DarkGray
+            }
+
+            $isRedirect = ($statusCode -ge 300) -and ($statusCode -lt 400)
+            $looksLikeAuthRedirect =
+                $redirectLocation -match '(?i)(/aperture/?|login|signin|saml|adfs|oauth)'
+            $looksLikeSecurityFailure =
+                $responseContent -match '(?is)(invalid\s+csrf|csrf.{0,80}(failed|expired|invalid)|session\s+expired|access\s+denied|not\s+authorized|unauthorized|forbidden|"success"\s*:\s*false|"status"\s*:\s*"error")'
+            $looksLikeFullHtmlPage =
+                $responseContent -match '(?is)^\s*(<!DOCTYPE\s+html|<html\b)'
+            $looksLikeApplicationError =
+                $responseContent -match '(?is)(operation\s+is\s+not\s+valid|exception|error\s*[:=])'
+
+            if ($isRedirect) {
+                $failureCount++
+                if ($looksLikeAuthRedirect) {
+                    $result = 'AUTH_ERROR'
+                    $message = "POST was redirected to '$redirectLocation'; ResetCert was not confirmed or executed. Use a fresh browser WebAdmin cookie session."
+                    $stoppedForAuthentication = $true
+                }
+                else {
+                    $result = 'REDIRECTED'
+                    $message = "POST returned HTTP $statusCode redirect to '$redirectLocation'; action not confirmed."
+                }
+            }
+            elseif (($statusCode -eq 401) -or ($statusCode -eq 403)) {
                 $result = 'AUTH_ERROR'
-                $message = 'Authentication/session/CSRF failure detected in the response'
+                $message = "HTTP $statusCode authentication/authorization failure"
                 $failureCount++
                 $stoppedForAuthentication = $true
             }
+            elseif ($looksLikeSecurityFailure) {
+                $result = 'AUTH_ERROR'
+                $message = 'Authentication/session/CSRF failure detected in the direct response'
+                $failureCount++
+                $stoppedForAuthentication = $true
+            }
+            elseif ($looksLikeFullHtmlPage) {
+                $result = 'NOT_CONFIRMED'
+                $message = 'The action endpoint returned a complete HTML page rather than an AJAX action response; ResetCert is not considered successful.'
+                $failureCount++
+            }
+            elseif ($looksLikeApplicationError) {
+                $result = 'FAILED'
+                $message = 'The direct response appears to contain an application error.'
+                $failureCount++
+            }
             elseif (($statusCode -ge 200) -and ($statusCode -lt 300)) {
                 $result = 'SUCCESS'
-                $message = "HTTP $statusCode"
+                $message = "Direct HTTP $statusCode response from action endpoint"
                 $successCount++
             }
             else {
@@ -727,32 +884,9 @@ try {
             }
         }
         catch {
-            $statusCode = Get-HttpStatusFromError -ErrorRecord $_
-            $responseContent = Get-ErrorResponseContent -ErrorRecord $_
             $message = $_.Exception.Message
             $failureCount++
-
-            try {
-                $finalUri = [string]$_.Exception.Response.ResponseUri.AbsoluteUri
-            }
-            catch {
-                $finalUri = ''
-            }
-
-            if ($message -match '(?i)maximum redirection count|too many redirects') {
-                $result = 'AUTH_ERROR'
-                $message = "Redirect loop or more than $MaximumRedirection redirects. The Windows session was probably redirected through login/SAML repeatedly."
-                $stoppedForAuthentication = $true
-            }
-            elseif (($statusCode -eq 401) -or ($statusCode -eq 403) -or
-                ($statusCode -ge 300 -and $statusCode -lt 400) -or
-                ($responseContent -match '(?is)(csrf|session\s+expired|access\s+denied|unauthorized|forbidden|saml|login|signin)')) {
-                $result = 'AUTH_ERROR'
-                $stoppedForAuthentication = $true
-            }
-            else {
-                $result = 'FAILED'
-            }
+            $result = 'FAILED'
         }
 
         Write-ResultLog -Path $LogPath -Record ([pscustomobject]@{
@@ -765,7 +899,9 @@ try {
             result           = $result
             message          = $message
             final_uri        = $finalUri
-            response_excerpt = (Get-ResponseExcerpt -Content $responseContent)
+            redirect_location = $redirectLocation
+            content_type      = $contentType
+            response_excerpt  = (Get-ResponseExcerpt -Content $responseContent)
         })
 
         if ($result -eq 'SUCCESS') {
