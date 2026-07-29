@@ -5,7 +5,7 @@
 # Written for legacy/POSIX awk implementations.
 #
 # Usage:
-#   ./collect_rseries_inventory_v8_prompt_sync.ksh [hosts_file] [output_file]
+#   ./collect_rseries_inventory_v9_ready_probe.ksh [hosts_file] [output_file]
 #
 # Defaults:
 #   hosts_file  = hosts.inv
@@ -19,7 +19,8 @@
 #   DEBUG=1         Save combined and split command output for every host.
 #   SSH_VERBOSE=1   Save ssh -vv diagnostics.
 #   DEBUG_DIR=path     Override the generated debug-directory name.
-#   PROMPT_TIMEOUT=20  Seconds to wait for the management-CLI prompt.
+#   CLI_READY_TIMEOUT=20  Seconds to wait for a successful CLI readiness probe.
+#   READY_PROBE_INTERVAL=1 Seconds between readiness probes.
 #
 # Controls:
 #   Ctrl+C   Stop the current host SSH session and continue with the next host.
@@ -31,7 +32,8 @@ EXPORT_DATE=$(date '+%Y-%m-%d')
 DEBUG=${DEBUG:-0}
 SSH_VERBOSE=${SSH_VERBOSE:-0}
 DEBUG_DIR=${DEBUG_DIR:-rseries_inventory_debug_$(date '+%Y%m%d_%H%M%S')}
-PROMPT_TIMEOUT=${PROMPT_TIMEOUT:-20}
+CLI_READY_TIMEOUT=${CLI_READY_TIMEOUT:-${PROMPT_TIMEOUT:-20}}
+READY_PROBE_INTERVAL=${READY_PROBE_INTERVAL:-1}
 
 if [ -z "$USER" ]; then
     echo "ERROR: USER is not set." >&2
@@ -68,15 +70,27 @@ case "$SSH_VERBOSE" in
     *) SSH_VERBOSE=0 ;;
 esac
 
-case "$PROMPT_TIMEOUT" in
+case "$CLI_READY_TIMEOUT" in
     ''|*[!0-9]*)
-        echo "ERROR: PROMPT_TIMEOUT must be a positive integer." >&2
+        echo "ERROR: CLI_READY_TIMEOUT must be a positive integer." >&2
         exit 1
         ;;
 esac
 
-if [ "$PROMPT_TIMEOUT" -lt 1 ]; then
-    echo "ERROR: PROMPT_TIMEOUT must be at least 1 second." >&2
+case "$READY_PROBE_INTERVAL" in
+    ''|*[!0-9]*)
+        echo "ERROR: READY_PROBE_INTERVAL must be a positive integer." >&2
+        exit 1
+        ;;
+esac
+
+if [ "$CLI_READY_TIMEOUT" -lt 1 ]; then
+    echo "ERROR: CLI_READY_TIMEOUT must be at least 1 second." >&2
+    exit 1
+fi
+
+if [ "$READY_PROBE_INTERVAL" -lt 1 ]; then
+    echo "ERROR: READY_PROBE_INTERVAL must be at least 1 second." >&2
     exit 1
 fi
 
@@ -199,8 +213,9 @@ run_host_session()
     : > "$FIPS_TMP"
     : > "$SSH_ERR_TMP"
 
-    # All commands run in the same management-CLI session. "nomore" prevents
-    # the CLI pager from blocking when a command returns many lines.
+    # All commands run in the same management-CLI session. The first command is
+    # also used as the readiness probe. "nomore" prevents the CLI pager from
+    # blocking when a command returns many lines.
     {
         echo 'show system version | nomore'
         echo 'show tenants | nomore'
@@ -216,8 +231,8 @@ run_host_session()
     fi
 
     # Start SSH with its stdin connected to a FIFO. This lets the script wait
-    # until the F5OS management prompt is actually visible before sending any
-    # commands. Some slower hosts discard commands piped during login/banner
+    # until the F5OS management CLI accepts a readiness probe before sending the
+    # remaining commands. Some slower hosts discard input during login/banner
     # processing and then remain idle until the CLI timeout expires.
     if [ "$SSH_VERBOSE" -eq 1 ]; then
         SSHPASS="$SSHPASS" sshpass -e ssh -vv -tt \
@@ -246,21 +261,18 @@ run_host_session()
     exec 3>"$INPUT_FIFO"
     INPUT_OPEN=1
 
-    PROMPT_READY=0
-    PROMPT_WAITED=0
+    # Do not try to parse the prompt itself. F5OS emits the prompt without a
+    # terminating newline and some releases add terminal-control bytes, which
+    # makes line-based prompt detection unreliable. Instead, repeatedly send a
+    # harmless version command until its actual output proves that the CLI is
+    # ready. Probes sent during login/banner processing may be discarded; the
+    # next probe succeeds once the management CLI is accepting commands.
+    CLI_READY=0
+    READY_WAITED=0
+    READY_PROBES=0
 
-    while [ "$PROMPT_WAITED" -lt "$PROMPT_TIMEOUT" ]
+    while [ "$READY_WAITED" -lt "$CLI_READY_TIMEOUT" ]
     do
-        tr -d '\r' < "$SESSION_RAW_TMP" > "$SESSION_CLEAN_TMP"
-
-        # Typical prompt: GBGLO-DC0-ECPHF-003#
-        if grep -q '^[A-Za-z0-9._-][A-Za-z0-9._-]*#[[:space:]]*$' \
-            "$SESSION_CLEAN_TMP" >/dev/null 2>&1
-        then
-            PROMPT_READY=1
-            break
-        fi
-
         if [ "$INTERRUPTED" -eq 1 ]; then
             break
         fi
@@ -269,17 +281,33 @@ run_host_session()
             break
         fi
 
-        sleep 1
-        PROMPT_WAITED=$((PROMPT_WAITED + 1))
+        printf '%s\n' 'show system version | nomore' >&3
+        READY_PROBES=$((READY_PROBES + 1))
+
+        sleep "$READY_PROBE_INTERVAL"
+        READY_WAITED=$((READY_WAITED + READY_PROBE_INTERVAL))
+
+        tr -d '\r' < "$SESSION_RAW_TMP" > "$SESSION_CLEAN_TMP"
+
+        if grep -q '^system[[:space:]][[:space:]]*version[[:space:]][[:space:]]*os-version[[:space:]]' \
+            "$SESSION_CLEAN_TMP" >/dev/null 2>&1
+        then
+            CLI_READY=1
+            break
+        fi
     done
 
-    if [ "$PROMPT_READY" -eq 1 ] && [ "$INTERRUPTED" -eq 0 ]; then
-        cat "$COMMAND_TMP" >&3
+    if [ "$CLI_READY" -eq 1 ] && [ "$INTERRUPTED" -eq 0 ]; then
+        # The successful probe already collected the version. Send only the
+        # remaining commands, still within this same SSH session.
+        printf '%s\n' 'show tenants | nomore' >&3
+        printf '%s\n' 'show fips | nomore' >&3
+        printf '%s\n' 'exit' >&3
     else
         if [ "$INTERRUPTED" -eq 0 ]; then
-            SESSION_ERROR="CLI_PROMPT_TIMEOUT"
-            printf '  CLI prompt not detected within %s seconds.\n' \
-                "$PROMPT_TIMEOUT" >&2
+            SESSION_ERROR="CLI_READY_TIMEOUT"
+            printf '  CLI readiness probe did not succeed within %s seconds.\n' \
+                "$CLI_READY_TIMEOUT" >&2
         fi
 
         kill "$SSH_PID" 2>/dev/null
