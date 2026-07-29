@@ -52,7 +52,7 @@ let
     Source =
         Csv.Document(
             File.Contents(
-                "C:\Users\B01638882\OneDrive - Barclays Bank PLC\HW EOL Refresh Project PRJ - Load Balancer - Edge Connect\Data Sources\rSeries\rseries_inventory.tsv"
+                "C:\Users\\Data Sources\rSeries\rseries_inventory.tsv"
             ),
             [
                 Delimiter = "#(tab)",
