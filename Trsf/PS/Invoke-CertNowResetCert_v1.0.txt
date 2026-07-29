@@ -36,19 +36,19 @@
 
 .EXAMPLES
     # Dry run; auto-detect comma/semicolon/tab delimiter
-    .\Invoke-CertNowResetCert_v1.0.ps1 -CsvPath .\containers.csv
+    .\Invoke-CertNowResetCert_v1.1.ps1 -CsvPath .\containers.csv
 
     # Submit only the first DN using Windows authentication
-    .\Invoke-CertNowResetCert_v1.0.ps1 -CsvPath .\containers.csv `
+    .\Invoke-CertNowResetCert_v1.1.ps1 -CsvPath .\containers.csv `
         -AuthMode Windows -Limit 1 -Execute
 
     # Submit using a raw Cookie header copied from Edge Developer Tools
-    .\Invoke-CertNowResetCert_v1.0.ps1 -CsvPath .\containers.csv `
+    .\Invoke-CertNowResetCert_v1.1.ps1 -CsvPath .\containers.csv `
         -AuthMode Cookies -CookieHeaderFile .\cert-now-cookie.txt `
         -DelayMs 500 -Execute
 
     # Resume, skipping DNs already marked SUCCESS in an earlier TSV log
-    .\Invoke-CertNowResetCert_v1.0.ps1 -CsvPath .\containers.csv `
+    .\Invoke-CertNowResetCert_v1.1.ps1 -CsvPath .\containers.csv `
         -CookieHeaderFile .\cert-now-cookie.txt -ResumeFile .\old-results.tsv `
         -Execute
 #>
@@ -144,16 +144,19 @@ function Get-CsvDelimiterCharacter {
 function ConvertTo-FullDn {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyString()]
         [string]$Value,
 
         [Parameter(Mandatory = $true)]
         [string]$Prefix
     )
 
-    $item = $Value.Trim()
-    if ([string]::IsNullOrWhiteSpace($item)) {
+    if ([string]::IsNullOrWhiteSpace($Value)) {
         return $null
     }
+
+    $item = $Value.Trim()
 
     # Accept a complete VED DN without prepending the policy path again.
     if ($item -match '^[\\/]VED[\\/]') {
