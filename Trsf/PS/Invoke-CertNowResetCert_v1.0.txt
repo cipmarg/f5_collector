@@ -10,11 +10,11 @@
 
     The script is SAFE BY DEFAULT: without -Execute it only performs a dry run.
 
-    Version 1.3 does not follow redirects for action POST requests. A redirect to the
-    Aperture home page can return HTTP 200 after it is followed even though ResetCert
-    was never executed. Success is now reported only for a direct, non-HTML 2xx
-    response from the Summary.aspx action endpoint. The script also checks for the
-    legacy WebAdmin session cookie required by the captured browser request.
+    Version 1.4 validates the application-level result returned by Summary.aspx. Cert-Now
+    can return HTTP 200 even when the action body says success:false. A DN is now marked
+    SUCCESS only when the direct action response explicitly contains success:true.
+    Responses containing success:false are logged as FAILED, including the returned
+    error/result fields when present. Redirect and WebAdmin-session checks remain in place.
 
 .AUTHENTICATION
     Windows:
@@ -42,19 +42,19 @@
 
 .EXAMPLES
     # Dry run; auto-detect comma/semicolon/tab delimiter
-    .\Invoke-CertNowResetCert_v1.3.ps1 -CsvPath .\containers.csv
+    .\Invoke-CertNowResetCert_v1.4.ps1 -CsvPath .\containers.csv
 
     # Submit only the first DN using Windows authentication
-    .\Invoke-CertNowResetCert_v1.3.ps1 -CsvPath .\containers.csv `
+    .\Invoke-CertNowResetCert_v1.4.ps1 -CsvPath .\containers.csv `
         -AuthMode Windows -Limit 1 -Execute
 
     # Submit using a raw Cookie header copied from Edge Developer Tools
-    .\Invoke-CertNowResetCert_v1.3.ps1 -CsvPath .\containers.csv `
+    .\Invoke-CertNowResetCert_v1.4.ps1 -CsvPath .\containers.csv `
         -AuthMode Cookies -CookieHeaderFile .\cert-now-cookie.txt `
         -DelayMs 500 -Execute
 
     # Resume, skipping DNs already marked SUCCESS in an earlier TSV log
-    .\Invoke-CertNowResetCert_v1.3.ps1 -CsvPath .\containers.csv `
+    .\Invoke-CertNowResetCert_v1.4.ps1 -CsvPath .\containers.csv `
         -CookieHeaderFile .\cert-now-cookie.txt -ResumeFile .\old-results.tsv `
         -Execute
 #>
@@ -75,7 +75,7 @@ param(
     [string]$BaseDn = '\VED\Policy\CORE-GLBL-L2\2 Approvers (New)',
 
     [ValidateNotNullOrEmpty()]
-    [string]$ServerBaseUrl = 'https://',
+    [string]$ServerBaseUrl = 'https://cert-now.barclays.intranet',
 
     [ValidateSet('Auto', 'Windows', 'Cookies')]
     [string]$AuthMode = 'Auto',
@@ -337,6 +337,79 @@ function Get-ResponseExcerpt {
     }
 
     return $singleLine
+}
+
+function Get-ActionResponseInfo {
+    param(
+        [AllowNull()]
+        [string]$Content
+    )
+
+    $info = [ordered]@{
+        HasExplicitSuccess = $false
+        Success            = $false
+        ErrorText          = ''
+        ResultValue        = ''
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Content)) {
+        return [pscustomobject]$info
+    }
+
+    # First try standards-compliant JSON.
+    try {
+        $parsed = $Content | ConvertFrom-Json -ErrorAction Stop
+
+        $successProperty = $parsed.PSObject.Properties['success']
+        if ($null -ne $successProperty) {
+            $info.HasExplicitSuccess = $true
+            $info.Success = [System.Convert]::ToBoolean($successProperty.Value)
+        }
+
+        $errorProperty = $parsed.PSObject.Properties['error']
+        if ($null -ne $errorProperty -and $null -ne $errorProperty.Value) {
+            $info.ErrorText = [string]$errorProperty.Value
+        }
+
+        $resultProperty = $parsed.PSObject.Properties['result']
+        if ($null -ne $resultProperty -and $null -ne $resultProperty.Value) {
+            $info.ResultValue = [string]$resultProperty.Value
+        }
+
+        return [pscustomobject]$info
+    }
+    catch {
+        # The legacy WebAdmin endpoint commonly returns a JavaScript-style object
+        # using single quotes, which ConvertFrom-Json cannot parse. Extract only
+        # the fields needed to validate the action result.
+    }
+
+    $successMatch = [regex]::Match(
+        $Content,
+        '(?is)(?:^|[\{,\s])[''"]?success[''"]?\s*:\s*(true|false)'
+    )
+    if ($successMatch.Success) {
+        $info.HasExplicitSuccess = $true
+        $info.Success = ($successMatch.Groups[1].Value -ieq 'true')
+    }
+
+    $errorMatch = [regex]::Match(
+        $Content,
+        '(?is)[''"]?error[''"]?\s*:\s*[''"](?<value>.*?)[''"]\s*[,\}]'
+    )
+    if ($errorMatch.Success) {
+        $info.ErrorText = $errorMatch.Groups['value'].Value
+    }
+
+    $resultMatch = [regex]::Match(
+        $Content,
+        '(?is)[''"]?result[''"]?\s*:\s*(?<value>-?\d+|null|true|false)'
+    )
+    if ($resultMatch.Success) {
+        $info.ResultValue = $resultMatch.Groups['value'].Value
+    }
+
+    return [pscustomobject]$info
 }
 
 function Write-ResultLog {
@@ -781,6 +854,9 @@ try {
                 final_uri        = ''
                 redirect_location = ''
                 content_type      = ''
+                server_success    = ''
+                server_error      = ''
+                server_result     = ''
                 response_excerpt  = ''
             })
 
@@ -804,6 +880,9 @@ try {
         $finalUri = ''
         $redirectLocation = ''
         $contentType = ''
+        $serverSuccess = ''
+        $serverError = ''
+        $serverResult = ''
 
         try {
             $postResponse = Invoke-FormPostNoRedirect `
@@ -820,11 +899,25 @@ try {
             $redirectLocation = [string]$postResponse.RedirectLocation
             $contentType = [string]$postResponse.ContentType
 
+            $actionInfo = Get-ActionResponseInfo -Content $responseContent
+            if ($actionInfo.HasExplicitSuccess) {
+                $serverSuccess = ([string]$actionInfo.Success).ToLowerInvariant()
+            }
+            $serverError = [string]$actionInfo.ErrorText
+            $serverResult = [string]$actionInfo.ResultValue
+
             if ($DebugHttp) {
                 Write-Host ("  HTTP status:      {0}" -f $statusCode) -ForegroundColor DarkGray
                 Write-Host ("  Response URI:     {0}" -f $finalUri) -ForegroundColor DarkGray
                 Write-Host ("  Redirect location:{0}" -f $redirectLocation) -ForegroundColor DarkGray
                 Write-Host ("  Content-Type:     {0}" -f $contentType) -ForegroundColor DarkGray
+                if ($actionInfo.HasExplicitSuccess) {
+                    Write-Host ("  Action success:   {0}" -f $serverSuccess) -ForegroundColor DarkGray
+                    Write-Host ("  Action result:    {0}" -f $serverResult) -ForegroundColor DarkGray
+                    if (-not [string]::IsNullOrWhiteSpace($serverError)) {
+                        Write-Host ("  Action error:     {0}" -f $serverError) -ForegroundColor DarkGray
+                    }
+                }
                 Write-Host ("  Response excerpt: {0}" -f (Get-ResponseExcerpt -Content $responseContent -MaximumLength 250)) -ForegroundColor DarkGray
             }
 
@@ -832,11 +925,13 @@ try {
             $looksLikeAuthRedirect =
                 $redirectLocation -match '(?i)(/aperture/?|login|signin|saml|adfs|oauth)'
             $looksLikeSecurityFailure =
-                $responseContent -match '(?is)(invalid\s+csrf|csrf.{0,80}(failed|expired|invalid)|session\s+expired|access\s+denied|not\s+authorized|unauthorized|forbidden|"success"\s*:\s*false|"status"\s*:\s*"error")'
+                $responseContent -match '(?is)(invalid\s+csrf|csrf.{0,80}(failed|expired|invalid)|session\s+expired|access\s+denied|not\s+authorized|unauthorized|forbidden|["'']status["'']\s*:\s*["'']error["''])'
             $looksLikeFullHtmlPage =
                 $responseContent -match '(?is)^\s*(<!DOCTYPE\s+html|<html\b)'
             $looksLikeApplicationError =
-                $responseContent -match '(?is)(operation\s+is\s+not\s+valid|exception|error\s*[:=])'
+                $responseContent -match '(?is)(operation\s+is\s+not\s+valid|exception)'
+            $serverErrorLooksLikeAuthenticationFailure =
+                $serverError -match '(?is)(csrf|session\s+expired|access\s+denied|not\s+authorized|unauthorized|forbidden|login|signin|saml)'
 
             if ($isRedirect) {
                 $failureCount++
@@ -856,16 +951,44 @@ try {
                 $failureCount++
                 $stoppedForAuthentication = $true
             }
+            elseif ($looksLikeFullHtmlPage) {
+                $result = 'NOT_CONFIRMED'
+                $message = 'The action endpoint returned a complete HTML page rather than an AJAX action response; ResetCert is not considered successful.'
+                $failureCount++
+            }
+            elseif ($actionInfo.HasExplicitSuccess) {
+                if ($actionInfo.Success) {
+                    $result = 'SUCCESS'
+                    $message = 'Cert-Now returned success:true'
+                    $successCount++
+                }
+                else {
+                    $failureCount++
+
+                    if ($serverErrorLooksLikeAuthenticationFailure) {
+                        $result = 'AUTH_ERROR'
+                        $message = "Cert-Now returned success:false: $serverError"
+                        $stoppedForAuthentication = $true
+                    }
+                    else {
+                        $result = 'FAILED'
+                        if (-not [string]::IsNullOrWhiteSpace($serverError)) {
+                            $message = "Cert-Now returned success:false: $serverError"
+                        }
+                        elseif (-not [string]::IsNullOrWhiteSpace($serverResult)) {
+                            $message = "Cert-Now returned success:false with result=$serverResult and no error text"
+                        }
+                        else {
+                            $message = 'Cert-Now returned success:false with no error text'
+                        }
+                    }
+                }
+            }
             elseif ($looksLikeSecurityFailure) {
                 $result = 'AUTH_ERROR'
                 $message = 'Authentication/session/CSRF failure detected in the direct response'
                 $failureCount++
                 $stoppedForAuthentication = $true
-            }
-            elseif ($looksLikeFullHtmlPage) {
-                $result = 'NOT_CONFIRMED'
-                $message = 'The action endpoint returned a complete HTML page rather than an AJAX action response; ResetCert is not considered successful.'
-                $failureCount++
             }
             elseif ($looksLikeApplicationError) {
                 $result = 'FAILED'
@@ -873,9 +996,9 @@ try {
                 $failureCount++
             }
             elseif (($statusCode -ge 200) -and ($statusCode -lt 300)) {
-                $result = 'SUCCESS'
-                $message = "Direct HTTP $statusCode response from action endpoint"
-                $successCount++
+                $result = 'NOT_CONFIRMED'
+                $message = "HTTP $statusCode was returned, but the action body did not explicitly contain success:true"
+                $failureCount++
             }
             else {
                 $result = 'FAILED'
@@ -901,11 +1024,14 @@ try {
             final_uri        = $finalUri
             redirect_location = $redirectLocation
             content_type      = $contentType
+            server_success    = $serverSuccess
+            server_error      = $serverError
+            server_result     = $serverResult
             response_excerpt  = (Get-ResponseExcerpt -Content $responseContent)
         })
 
         if ($result -eq 'SUCCESS') {
-            Write-Host "  SUCCESS - HTTP $statusCode" -ForegroundColor Green
+            Write-Host "  SUCCESS - HTTP $statusCode - server success:true" -ForegroundColor Green
         }
         elseif ($result -eq 'AUTH_ERROR') {
             Write-Host "  AUTH_ERROR - $message" -ForegroundColor Red
