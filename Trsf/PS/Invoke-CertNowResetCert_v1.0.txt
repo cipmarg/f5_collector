@@ -75,7 +75,7 @@ param(
     [string]$BaseDn = '\VED\Policy\CORE-GLBL-L2\2 Approvers (New)',
 
     [ValidateNotNullOrEmpty()]
-    [string]$ServerBaseUrl = 'https://cert-now.barclays.intranet',
+    [string]$ServerBaseUrl = 'https://',
 
     [ValidateSet('Auto', 'Windows', 'Cookies')]
     [string]$AuthMode = 'Auto',
