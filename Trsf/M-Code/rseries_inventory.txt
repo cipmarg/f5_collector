@@ -1,0 +1,440 @@
+let
+    // Normalises values used as lookup keys.
+    NormalizeText = (Value as any) as text =>
+        if Value = null then
+            ""
+        else
+            Text.Upper(
+                Text.Trim(
+                    Text.Clean(
+                        Text.From(Value)
+                    )
+                )
+            ),
+
+    // Allows column matching regardless of spaces, line feeds, underscores, etc.
+    NormalizeColumnName = (ColumnName as text) as text =>
+        Text.Upper(
+            Text.Remove(
+                Text.Clean(ColumnName),
+                {
+                    " ",
+                    "_",
+                    "-",
+                    "#(tab)",
+                    "#(cr)",
+                    "#(lf)"
+                }
+            )
+        ),
+
+    FindColumn = (InputTable as table, ExpectedName as text) as text =>
+        let
+            Matches =
+                List.Select(
+                    Table.ColumnNames(InputTable),
+                    each
+                        NormalizeColumnName(_) =
+                        NormalizeColumnName(ExpectedName)
+                )
+        in
+            if List.IsEmpty(Matches) then
+                error
+                    "Column not found: "
+                        & ExpectedName
+            else
+                Matches{0},
+
+    // -------------------------------------------------------------------------
+    // rSeries inventory
+    // -------------------------------------------------------------------------
+
+    Source =
+        Csv.Document(
+            File.Contents(
+                "C:\Users\B01638882\OneDrive - Barclays Bank PLC\HW EOL Refresh Project PRJ - Load Balancer - Edge Connect\Data Sources\rSeries\rseries_inventory.tsv"
+            ),
+            [
+                Delimiter = "#(tab)",
+                Columns = 34,
+                Encoding = 1252,
+                QuoteStyle = QuoteStyle.None
+            ]
+        ),
+
+    #"Promoted Headers" =
+        Table.PromoteHeaders(
+            Source,
+            [PromoteAllScalars = true]
+        ),
+
+    #"Changed Type" =
+        Table.TransformColumnTypes(
+            #"Promoted Headers",
+            {
+                {"export_date", type date},
+                {"host", type text},
+                {"f5os_os_version", type text},
+                {"f5os_service_version", type text},
+                {"f5os_product", type text},
+                {"tenant", type text},
+                {"mgmt_ip", type text},
+                {"prefix_length", Int64.Type},
+                {"vcpu_cores_per_node", Int64.Type},
+                {"qat_vf_count", Int64.Type},
+                {"running_state", type text},
+                {"status", type text},
+                {"image_version", type text},
+                {"fips_enabled", type text},
+                {"fips_occupied_acclr_dev", Int64.Type},
+                {"fips_occupied_contexts", Int64.Type},
+                {"fips_occupied_keys", Int64.Type},
+                {"fips_occupied_partitions", Int64.Type},
+                {"fips_total_acclr_dev", Int64.Type},
+                {"fips_total_contexts", Int64.Type},
+                {"fips_total_keys", Int64.Type},
+                {"fips_total_partitions", Int64.Type},
+                {"fips_status_state", Int64.Type},
+                {"fips_status_desc", type text},
+                {"fips_partition", type text},
+                {"fips_partition_keys", Int64.Type},
+                {"fips_partition_accel_devs", Int64.Type},
+                {"fips_partition_backup", type text},
+                {"fips_partition_state", Int64.Type},
+                {"fips_partition_occupied_session_keys", Int64.Type},
+                {"fips_partition_session_count", Int64.Type},
+                {"fips_partition_pci_address", type text},
+                {"fips_tenant_pci_device_id", type text},
+                {"collection_status", type text}
+            }
+        ),
+
+    #"Removed Columns" =
+        Table.RemoveColumns(
+            #"Changed Type",
+            {
+                "fips_partition_pci_address",
+                "fips_tenant_pci_device_id"
+            }
+        ),
+
+    #"Added Tenant Key" =
+        Table.AddColumn(
+            #"Removed Columns",
+            "_tenant_key",
+            each NormalizeText([tenant]),
+            type text
+        ),
+
+    // -------------------------------------------------------------------------
+    // LB_List lookup
+    // -------------------------------------------------------------------------
+
+    LB_Raw =
+        Excel.CurrentWorkbook(){[Name = "LB_List"]}[Content],
+
+    LB_TenantColumn =
+        FindColumn(
+            LB_Raw,
+            "Target Tenant Hostname"
+        ),
+
+    LB_TenantMgmtIpColumn =
+        FindColumn(
+            LB_Raw,
+            "Target Tenant MGMT IP"
+        ),
+
+    LB_MigrationPackageColumn =
+        FindColumn(
+            LB_Raw,
+            "Migration Package"
+        ),
+
+    LB_Selected =
+        Table.SelectColumns(
+            LB_Raw,
+            {
+                LB_TenantColumn,
+                LB_TenantMgmtIpColumn,
+                LB_MigrationPackageColumn
+            }
+        ),
+
+    LB_Renamed =
+        Table.RenameColumns(
+            LB_Selected,
+            {
+                {
+                    LB_TenantColumn,
+                    "_lb_target_tenant_hostname"
+                },
+                {
+                    LB_TenantMgmtIpColumn,
+                    "_lb_target_tenant_mgmt_ip"
+                },
+                {
+                    LB_MigrationPackageColumn,
+                    "migration_package"
+                }
+            }
+        ),
+
+    LB_Typed =
+        Table.TransformColumns(
+            LB_Renamed,
+            {
+                {
+                    "_lb_target_tenant_hostname",
+                    each
+                        if _ = null then
+                            null
+                        else
+                            Text.From(_),
+                    type text
+                },
+                {
+                    "_lb_target_tenant_mgmt_ip",
+                    each
+                        if _ = null then
+                            null
+                        else
+                            Text.From(_),
+                    type text
+                },
+                {
+                    "migration_package",
+                    each
+                        if _ = null then
+                            null
+                        else
+                            Text.From(_),
+                    type text
+                }
+            }
+        ),
+
+    LB_Keyed =
+        Table.AddColumn(
+            LB_Typed,
+            "_tenant_key",
+            each
+                NormalizeText(
+                    [_lb_target_tenant_hostname]
+                ),
+            type text
+        ),
+
+    LB_Filtered =
+        Table.SelectRows(
+            LB_Keyed,
+            each [_tenant_key] <> ""
+        ),
+
+    // Prevent duplicate lookup rows from multiplying inventory rows.
+    LB_Lookup =
+        Table.Distinct(
+            LB_Filtered,
+            {"_tenant_key"}
+        ),
+
+    #"Merged LB List" =
+        Table.NestedJoin(
+            #"Added Tenant Key",
+            {"_tenant_key"},
+            LB_Lookup,
+            {"_tenant_key"},
+            "LB_List_Data",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded LB List" =
+        Table.ExpandTableColumn(
+            #"Merged LB List",
+            "LB_List_Data",
+            {
+                "migration_package",
+                "_lb_target_tenant_mgmt_ip"
+            },
+            {
+                "migration_package",
+                "_lb_target_tenant_mgmt_ip"
+            }
+        ),
+
+    #"Added MGMT IP Match" =
+        Table.AddColumn(
+            #"Expanded LB List",
+            "mgmt_ip_matches_lb_list",
+            each
+                let
+                    InventoryIp =
+                        NormalizeText([mgmt_ip]),
+
+                    LBListIp =
+                        NormalizeText(
+                            [_lb_target_tenant_mgmt_ip]
+                        )
+                in
+                    InventoryIp <> ""
+                        and LBListIp <> ""
+                        and InventoryIp = LBListIp,
+            type logical
+        ),
+
+    #"Added Package Key" =
+        Table.AddColumn(
+            #"Added MGMT IP Match",
+            "_package_key",
+            each
+                NormalizeText(
+                    [migration_package]
+                ),
+            type text
+        ),
+
+    // -------------------------------------------------------------------------
+    // Pack_List lookup
+    // -------------------------------------------------------------------------
+
+    Pack_Raw =
+        Excel.CurrentWorkbook(){[Name = "Pack_List"]}[Content],
+
+    Pack_MigrationPackageColumn =
+        FindColumn(
+            Pack_Raw,
+            "Migration Package"
+        ),
+
+    Pack_MigrationDateColumn =
+        FindColumn(
+            Pack_Raw,
+            "Migration Date"
+        ),
+
+    Pack_MigrationEngineerColumn =
+        FindColumn(
+            Pack_Raw,
+            "Migration Engineer"
+        ),
+
+    Pack_Selected =
+        Table.SelectColumns(
+            Pack_Raw,
+            {
+                Pack_MigrationPackageColumn,
+                Pack_MigrationDateColumn,
+                Pack_MigrationEngineerColumn
+            }
+        ),
+
+    Pack_Renamed =
+        Table.RenameColumns(
+            Pack_Selected,
+            {
+                {
+                    Pack_MigrationPackageColumn,
+                    "_pack_migration_package"
+                },
+                {
+                    Pack_MigrationDateColumn,
+                    "migration_date"
+                },
+                {
+                    Pack_MigrationEngineerColumn,
+                    "migration_engineer"
+                }
+            }
+        ),
+
+    Pack_Typed =
+        Table.TransformColumns(
+            Pack_Renamed,
+            {
+                {
+                    "_pack_migration_package",
+                    each
+                        if _ = null then
+                            null
+                        else
+                            Text.From(_),
+                    type text
+                },
+                {
+                    "migration_date",
+                    each
+                        try Date.From(_)
+                        otherwise null,
+                    type date
+                },
+                {
+                    "migration_engineer",
+                    each
+                        if _ = null then
+                            null
+                        else
+                            Text.From(_),
+                    type text
+                }
+            }
+        ),
+
+    Pack_Keyed =
+        Table.AddColumn(
+            Pack_Typed,
+            "_package_key",
+            each
+                NormalizeText(
+                    [_pack_migration_package]
+                ),
+            type text
+        ),
+
+    Pack_Filtered =
+        Table.SelectRows(
+            Pack_Keyed,
+            each [_package_key] <> ""
+        ),
+
+    Pack_Lookup =
+        Table.Distinct(
+            Pack_Filtered,
+            {"_package_key"}
+        ),
+
+    #"Merged Pack List" =
+        Table.NestedJoin(
+            #"Added Package Key",
+            {"_package_key"},
+            Pack_Lookup,
+            {"_package_key"},
+            "Pack_List_Data",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Pack List" =
+        Table.ExpandTableColumn(
+            #"Merged Pack List",
+            "Pack_List_Data",
+            {
+                "migration_date",
+                "migration_engineer"
+            },
+            {
+                "migration_date",
+                "migration_engineer"
+            }
+        ),
+
+    #"Removed Helper Columns" =
+        Table.RemoveColumns(
+            #"Expanded Pack List",
+            {
+                "_tenant_key",
+                "_package_key",
+                "_lb_target_tenant_mgmt_ip"
+            }
+        )
+
+in
+    #"Removed Helper Columns"
