@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Submits Cert-Now/Venafi custom:ResetCert requests for DNs read from a CSV.
@@ -9,6 +9,11 @@
     per DN.
 
     The script is SAFE BY DEFAULT: without -Execute it only performs a dry run.
+
+    Version 1.2 allows normal application redirects during POST requests. Version
+    1.0 incorrectly used MaximumRedirection=0, which made any legitimate 302/303
+    response appear as a failed redirect-limit error. Genuine redirect loops still
+    stop the run and are logged as AUTH_ERROR.
 
 .AUTHENTICATION
     Windows:
@@ -36,19 +41,19 @@
 
 .EXAMPLES
     # Dry run; auto-detect comma/semicolon/tab delimiter
-    .\Invoke-CertNowResetCert_v1.1.ps1 -CsvPath .\containers.csv
+    .\Invoke-CertNowResetCert_v1.2.ps1 -CsvPath .\containers.csv
 
     # Submit only the first DN using Windows authentication
-    .\Invoke-CertNowResetCert_v1.1.ps1 -CsvPath .\containers.csv `
+    .\Invoke-CertNowResetCert_v1.2.ps1 -CsvPath .\containers.csv `
         -AuthMode Windows -Limit 1 -Execute
 
     # Submit using a raw Cookie header copied from Edge Developer Tools
-    .\Invoke-CertNowResetCert_v1.1.ps1 -CsvPath .\containers.csv `
+    .\Invoke-CertNowResetCert_v1.2.ps1 -CsvPath .\containers.csv `
         -AuthMode Cookies -CookieHeaderFile .\cert-now-cookie.txt `
         -DelayMs 500 -Execute
 
     # Resume, skipping DNs already marked SUCCESS in an earlier TSV log
-    .\Invoke-CertNowResetCert_v1.1.ps1 -CsvPath .\containers.csv `
+    .\Invoke-CertNowResetCert_v1.2.ps1 -CsvPath .\containers.csv `
         -CookieHeaderFile .\cert-now-cookie.txt -ResumeFile .\old-results.tsv `
         -Execute
 #>
@@ -69,7 +74,7 @@ param(
     [string]$BaseDn = '\VED\Policy\CORE-GLBL-L2\2 Approvers (New)',
 
     [ValidateNotNullOrEmpty()]
-    [string]$ServerBaseUrl = 'https://',
+    [string]$ServerBaseUrl = 'https://,
 
     [ValidateSet('Auto', 'Windows', 'Cookies')]
     [string]$AuthMode = 'Auto',
@@ -78,6 +83,10 @@ param(
 
     [ValidateRange(0, 3600000)]
     [int]$DelayMs = 500,
+
+    # Allow normal application redirects, while still stopping genuine redirect loops.
+    [ValidateRange(1, 50)]
+    [int]$MaximumRedirection = 10,
 
     # 0 means all valid unique entries.
     [ValidateRange(0, 2147483647)]
@@ -365,6 +374,66 @@ function Get-HttpStatusFromError {
     return 0
 }
 
+function Get-ResponseUri {
+    param(
+        [AllowNull()]
+        $Response
+    )
+
+    if ($null -eq $Response) {
+        return ''
+    }
+
+    try {
+        if ($null -ne $Response.BaseResponse.ResponseUri) {
+            return [string]$Response.BaseResponse.ResponseUri.AbsoluteUri
+        }
+    }
+    catch {
+    }
+
+    try {
+        if ($null -ne $Response.ResponseUri) {
+            return [string]$Response.ResponseUri.AbsoluteUri
+        }
+    }
+    catch {
+    }
+
+    return ''
+}
+
+function Get-ErrorResponseContent {
+    param(
+        [Parameter(Mandatory = $true)]
+        $ErrorRecord
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$ErrorRecord.ErrorDetails.Message)) {
+        return [string]$ErrorRecord.ErrorDetails.Message
+    }
+
+    try {
+        $response = $ErrorRecord.Exception.Response
+        if ($null -ne $response) {
+            $stream = $response.GetResponseStream()
+            if ($null -ne $stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                try {
+                    return $reader.ReadToEnd()
+                }
+                finally {
+                    $reader.Dispose()
+                }
+            }
+        }
+    }
+    catch {
+    }
+
+    return ''
+}
+
 if (-not (Test-Path -LiteralPath $CsvPath -PathType Leaf)) {
     throw "CSV file not found: $CsvPath"
 }
@@ -446,6 +515,7 @@ Write-Host "Blank rows:       $blankCount"
 Write-Host "Duplicates:       $duplicateCount"
 Write-Host "Targets selected: $($targets.Count)"
 Write-Host "Base DN:          $BaseDn"
+Write-Host "Max redirects:    $MaximumRedirection"
 Write-Host ''
 
 if ($targets.Count -eq 0) {
@@ -518,6 +588,7 @@ $authParameters = @{
     UseDefaultCredentials = $true
     UseBasicParsing       = $true
     ErrorAction           = 'Stop'
+    MaximumRedirection    = $MaximumRedirection
     Headers               = @{
         'Accept'          = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
         'Accept-Language' = 'en-GB,en;q=0.9,en-US;q=0.8'
@@ -583,6 +654,7 @@ try {
                 http_status      = 0
                 result           = 'AUTH_ERROR'
                 message          = 'csrf cookie disappeared from the session'
+                final_uri       = ''
                 response_excerpt = ''
             })
 
@@ -615,7 +687,7 @@ try {
             WebSession            = $session
             UseDefaultCredentials = $true
             UseBasicParsing       = $true
-            MaximumRedirection    = 0
+            MaximumRedirection    = $MaximumRedirection
             Headers               = $headers
             ContentType           = 'application/x-www-form-urlencoded; charset=UTF-8'
             Body                  = $body
@@ -626,11 +698,13 @@ try {
         $result = 'FAILED'
         $message = ''
         $responseContent = ''
+        $finalUri = ''
 
         try {
             $response = Invoke-WebRequest @requestParameters
             $statusCode = [int]$response.StatusCode
             $responseContent = [string]$response.Content
+            $finalUri = Get-ResponseUri -Response $response
 
             $looksLikeAuthPage = -not (Test-AuthenticationPage -Response $response -ExpectedHost $baseUri.Host)
             $looksLikeSecurityFailure = $responseContent -match '(?is)(invalid\s+csrf|csrf.{0,80}(failed|expired|invalid)|session\s+expired|access\s+denied|not\s+authorized|unauthorized|forbidden|"success"\s*:\s*false|"status"\s*:\s*"error")'
@@ -654,11 +728,23 @@ try {
         }
         catch {
             $statusCode = Get-HttpStatusFromError -ErrorRecord $_
-            $responseContent = [string]$_.ErrorDetails.Message
+            $responseContent = Get-ErrorResponseContent -ErrorRecord $_
             $message = $_.Exception.Message
             $failureCount++
 
-            if (($statusCode -eq 401) -or ($statusCode -eq 403) -or
+            try {
+                $finalUri = [string]$_.Exception.Response.ResponseUri.AbsoluteUri
+            }
+            catch {
+                $finalUri = ''
+            }
+
+            if ($message -match '(?i)maximum redirection count|too many redirects') {
+                $result = 'AUTH_ERROR'
+                $message = "Redirect loop or more than $MaximumRedirection redirects. The Windows session was probably redirected through login/SAML repeatedly."
+                $stoppedForAuthentication = $true
+            }
+            elseif (($statusCode -eq 401) -or ($statusCode -eq 403) -or
                 ($statusCode -ge 300 -and $statusCode -lt 400) -or
                 ($responseContent -match '(?is)(csrf|session\s+expired|access\s+denied|unauthorized|forbidden|saml|login|signin)')) {
                 $result = 'AUTH_ERROR'
@@ -678,6 +764,7 @@ try {
             http_status      = $statusCode
             result           = $result
             message          = $message
+            final_uri        = $finalUri
             response_excerpt = (Get-ResponseExcerpt -Content $responseContent)
         })
 
