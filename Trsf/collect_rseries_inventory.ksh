@@ -5,7 +5,7 @@
 # function calls or conditional expressions.
 #
 # Usage:
-#   ./collect_rseries_inventory_v5_legacy_awk.ksh [hosts_file] [output_file]
+#   ./collect_rseries_inventory_v6_nomore.ksh [hosts_file] [output_file]
 #
 # Defaults:
 #   hosts_file  = hosts.inv
@@ -21,7 +21,7 @@
 #   DEBUG_DIR=path  Override the generated debug-directory name.
 #
 # Example:
-#   DEBUG=1 SSH_VERBOSE=1 ./collect_rseries_inventory_v5_legacy_awk.ksh hosts.inv debug.tsv
+#   DEBUG=1 SSH_VERBOSE=1 ./collect_rseries_inventory_v6_nomore.ksh hosts.inv debug.tsv
 #
 # Controls:
 #   Ctrl+C   Stop the current SSH command and continue processing.
@@ -132,7 +132,8 @@ run_ssh()
 
     # The F5OS management CLI behaves as an interactive CLI on some releases.
     # Force a pseudo-terminal and feed the command through stdin, matching a
-    # normal interactive login. "exit" closes the CLI after the command runs.
+    # normal interactive login. Every show command uses "| nomore" to disable
+    # CLI pagination, and "exit" closes the CLI after the command runs.
     printf '%s\nexit\n' "$SSH_COMMAND" > "$COMMAND_TMP"
 
     if [ "$SSH_VERBOSE" -eq 1 ]; then
@@ -220,7 +221,7 @@ do
     SERVICE_VERSION=""
     PRODUCT=""
 
-    CURRENT_COMMAND="show system version"
+    CURRENT_COMMAND="show system version | nomore"
     CURRENT_TAG=version
     INTERRUPTED=0
     run_ssh "$CURRENT_HOST" "$CURRENT_COMMAND" "$VERSION_TMP"
@@ -237,14 +238,14 @@ do
         add_status "VERSION_PARSE_FAILED"
     fi
 
-    CURRENT_COMMAND="show tenants"
+    CURRENT_COMMAND="show tenants | nomore"
     CURRENT_TAG=tenants
     INTERRUPTED=0
     run_ssh "$CURRENT_HOST" "$CURRENT_COMMAND" "$TENANTS_TMP"
     TENANTS_RC=$?
     [ "$INTERRUPTED" -eq 1 ] && TENANTS_RC=130
 
-    CURRENT_COMMAND="show fips"
+    CURRENT_COMMAND="show fips | nomore"
     CURRENT_TAG=fips
     INTERRUPTED=0
     run_ssh "$CURRENT_HOST" "$CURRENT_COMMAND" "$FIPS_TMP"
