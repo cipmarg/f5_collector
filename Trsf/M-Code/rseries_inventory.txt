@@ -426,15 +426,104 @@ let
             }
         ),
 
-    #"Removed Helper Columns" =
-        Table.RemoveColumns(
-            #"Expanded Pack List",
-            {
-                "_tenant_key",
-                "_package_key",
-                "_lb_target_tenant_mgmt_ip"
-            }
-        )
+        #"Removed Helper Columns" =
+            Table.RemoveColumns(
+                #"Expanded Pack List",
+                {
+                    "_tenant_key",
+                    "_package_key",
+                    "_lb_target_tenant_mgmt_ip"
+                }
+            ),
 
-in
-    #"Removed Helper Columns"
+        #"Added Region" =
+            Table.AddColumn(
+                #"Removed Helper Columns",
+                "region",
+                each
+                    let
+                        Hostname = NormalizeText([host])
+                    in
+                        if Hostname = "" then
+                            null
+                        else
+                            Text.Start(Hostname, 2),
+                type text
+            ),
+
+        #"Added Host Model" =
+            Table.AddColumn(
+                #"Added Region",
+                "Host model",
+                each
+                    let
+                        FipsEnabled =
+                            NormalizeText([fips_enabled]),
+
+                        TotalKeys =
+                            [fips_total_keys]
+                    in
+                        if FipsEnabled = "NO" then
+                            "NON-DF"
+                        else if FipsEnabled = "YES" then
+                            if TotalKeys = 102235 then
+                                "R10920-DF"
+                            else if TotalKeys = 25475 then
+                                "R5920-DF"
+                            else
+                                null
+                        else
+                            null,
+                type text
+            ),
+
+        // Dynamically position region immediately before host
+        // and Host model immediately after host.
+        ExistingColumns =
+            List.RemoveItems(
+                Table.ColumnNames(#"Added Host Model"),
+                {
+                    "region",
+                    "Host model"
+                }
+            ),
+
+        HostPosition =
+            List.PositionOf(
+                ExistingColumns,
+                "host"
+            ),
+
+        ColumnsBeforeHost =
+            List.FirstN(
+                ExistingColumns,
+                HostPosition
+            ),
+
+        HostAndRemainingColumns =
+            List.Skip(
+                ExistingColumns,
+                HostPosition
+            ),
+
+        DesiredColumnOrder =
+            ColumnsBeforeHost
+                & {"region"}
+                & List.FirstN(
+                    HostAndRemainingColumns,
+                    1
+                )
+                & {"Host model"}
+                & List.Skip(
+                    HostAndRemainingColumns,
+                    1
+                ),
+
+        #"Reordered Columns" =
+            Table.ReorderColumns(
+                #"Added Host Model",
+                DesiredColumnOrder
+            )
+
+    in
+        #"Reordered Columns"
