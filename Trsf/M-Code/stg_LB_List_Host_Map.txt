@@ -1,9 +1,18 @@
 let
+    SharePointFile =
+        Binary.Buffer(
+            Web.Contents(
+                "https://,
+                [
+                    RelativePath =
+                        "teams/"
+                ]
+            )
+        ),
+
     Workbook =
         Excel.Workbook(
-            File.Contents(
-                "C:\Users\*.xlsx"
-            ),
+            SharePointFile,
             null,
             true
         ),
@@ -16,6 +25,7 @@ let
             ]
         }[Data],
 
+    // Clean line breaks, tabs and repeated spaces from the headers.
     #"Cleaned Column Names" =
         Table.TransformColumnNames(
             Source,
