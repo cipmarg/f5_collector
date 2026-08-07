@@ -1,6 +1,9 @@
 Option Explicit
-Option Private Module
 
+
+'===========================================================
+' CONFIGURATION
+'===========================================================
 
 Private Const DEPLOY_SHEET As String = "Tracker Deployment"
 Private Const DEPLOY_TABLE As String = "TrackerDeploy"
@@ -10,13 +13,14 @@ Private Const SUMMARY_SHEET As String = "Summary"
 Private Const MODE_TEMPLATE As String = "TEMPLATE"
 Private Const MODE_DEPLOYED As String = "DEPLOYED"
 
-Private Const AER_TEMPLATE As String = "Migration Pack"
-Private Const AER_DEPLOYED As String = "Migration Pack Locked"
-
 Private Const OUTPUT_PREFIX As String = "Tech_Tracker_"
 
 Private Const CALC_TIMEOUT_SECONDS As Long = 120
 
+
+'===========================================================
+' MAIN DEPLOYMENT PROCEDURE
+'===========================================================
 
 Public Sub DeployTrackers()
 
@@ -31,7 +35,6 @@ Public Sub DeployTrackers()
     Dim outcome As String
     Dim outputFile As String
 
-    Dim originalPackage As Variant
     Dim originalMode As Variant
     Dim originalDeployVisibility As XlSheetVisibility
 
@@ -61,63 +64,21 @@ Public Sub DeployTrackers()
     Dim fatalNumber As Long
     Dim fatalDescription As String
 
-    Dim restoreDetail As String
-    Dim restoreOK As Boolean
+    Dim setupComplete As Boolean
 
 
     On Error GoTo FatalError
 
 
-    Set wsDeploy = ThisWorkbook.Worksheets(DEPLOY_SHEET)
-    Set tbl = wsDeploy.ListObjects(DEPLOY_TABLE)
+    '-------------------------------------------------------
+    ' Locate deployment table
+    '-------------------------------------------------------
 
+    Set wsDeploy = _
+        ThisWorkbook.Worksheets(DEPLOY_SHEET)
 
-    '---------------------------------------------------------
-    ' Resolve table columns by name
-    '---------------------------------------------------------
-
-    colPackage = tbl.ListColumns("Migration Package").Index
-    colDeploy = tbl.ListColumns("Deploy Tracker").Index
-    colOverwrite = tbl.ListColumns("Overwrite Existing").Index
-    colStatus = tbl.ListColumns("Status").Index
-    colLastDeployed = tbl.ListColumns("Last Deployed").Index
-    colOutputFile = tbl.ListColumns("Output File").Index
-
-
-    '---------------------------------------------------------
-    ' Read configuration
-    '---------------------------------------------------------
-
-    basePath = Trim$(CStr( _
-        ThisWorkbook.Names("Tracker_Base_Path"). _
-        RefersToRange.Value2 _
-    ))
-
-    If Len(basePath) = 0 Then
-        Err.Raise _
-            vbObjectError + 2001, , _
-            "Tracker_Base_Path is empty."
-    End If
-
-
-    originalPackage = _
-        ThisWorkbook.Names("Migration_Package"). _
-        RefersToRange.Value2
-
-    originalMode = _
-        ThisWorkbook.Names("Tracker_Mode"). _
-        RefersToRange.Value2
-
-    originalDeployVisibility = wsDeploy.Visible
-
-
-    If UCase$(Trim$(CStr(originalMode))) <> MODE_TEMPLATE Then
-
-        Err.Raise _
-            vbObjectError + 2002, , _
-            "Tracker deployment can only be run from the template."
-
-    End If
+    Set tbl = _
+        wsDeploy.ListObjects(DEPLOY_TABLE)
 
 
     If tbl.DataBodyRange Is Nothing Then
@@ -132,9 +93,70 @@ Public Sub DeployTrackers()
     End If
 
 
-    '---------------------------------------------------------
-    ' Count selected packages
-    '---------------------------------------------------------
+    '-------------------------------------------------------
+    ' Resolve table columns by header
+    '-------------------------------------------------------
+
+    colPackage = _
+        tbl.ListColumns("Migration Package").Index
+
+    colDeploy = _
+        tbl.ListColumns("Deploy Tracker").Index
+
+    colOverwrite = _
+        tbl.ListColumns("Overwrite Existing").Index
+
+    colStatus = _
+        tbl.ListColumns("Status").Index
+
+    colLastDeployed = _
+        tbl.ListColumns("Last Deployed").Index
+
+    colOutputFile = _
+        tbl.ListColumns("Output File").Index
+
+
+    '-------------------------------------------------------
+    ' Read workbook configuration
+    '-------------------------------------------------------
+
+    basePath = Trim$(CStr( _
+        ThisWorkbook.Names("Tracker_Base_Path") _
+                    .RefersToRange.Value2 _
+    ))
+
+
+    If Len(basePath) = 0 Then
+
+        Err.Raise _
+            vbObjectError + 2001, , _
+            "Tracker_Base_Path is empty."
+
+    End If
+
+
+    originalMode = _
+        ThisWorkbook.Names("Tracker_Mode") _
+                    .RefersToRange.Value2
+
+
+    originalDeployVisibility = _
+        wsDeploy.Visible
+
+
+    'Generated trackers must not be allowed to deploy trackers.
+    If UCase$(Trim$(CStr(originalMode))) <> MODE_TEMPLATE Then
+
+        Err.Raise _
+            vbObjectError + 2002, , _
+            "Tracker deployment can only be run from the template."
+
+    End If
+
+
+    '-------------------------------------------------------
+    ' Count rows selected for deployment
+    '-------------------------------------------------------
 
     For Each tblRow In tbl.ListRows
 
@@ -161,26 +183,44 @@ Public Sub DeployTrackers()
     End If
 
 
-    '---------------------------------------------------------
+    '-------------------------------------------------------
     ' Preserve Excel state
-    '---------------------------------------------------------
+    '-------------------------------------------------------
 
-    previousScreenUpdating = Application.ScreenUpdating
-    previousDisplayAlerts = Application.DisplayAlerts
-    previousEnableEvents = Application.EnableEvents
-    previousStatusBar = Application.StatusBar
+    previousScreenUpdating = _
+        Application.ScreenUpdating
+
+    previousDisplayAlerts = _
+        Application.DisplayAlerts
+
+    previousEnableEvents = _
+        Application.EnableEvents
+
+    previousStatusBar = _
+        Application.StatusBar
 
 
     Application.ScreenUpdating = False
     Application.DisplayAlerts = False
 
-    'Important: package changes must fire Worksheet_Change.
+    'Required because changing Migration_Package must fire
+    'the existing Worksheet_Change code.
     Application.EnableEvents = True
 
 
-    '---------------------------------------------------------
-    ' Temporarily disable AutoSave if supported
-    '---------------------------------------------------------
+    '-------------------------------------------------------
+    ' Ensure VBA can update protected Summary cells
+    '-------------------------------------------------------
+
+    SetProgress _
+        "Preparing deployment: enabling VBA access to Summary..."
+
+    EnsureSummaryVBAAccess
+
+
+    '-------------------------------------------------------
+    ' Temporarily disable AutoSave
+    '-------------------------------------------------------
 
     On Error Resume Next
 
@@ -189,6 +229,7 @@ Public Sub DeployTrackers()
     If Err.Number = 0 Then
 
         autoSaveStateKnown = True
+
         ThisWorkbook.AutoSaveOn = False
 
     End If
@@ -198,28 +239,41 @@ Public Sub DeployTrackers()
     On Error GoTo FatalError
 
 
-    '---------------------------------------------------------
-    ' Process deployment table
-    '---------------------------------------------------------
+    setupComplete = True
+
+
+    '-------------------------------------------------------
+    ' Process selected packages
+    '-------------------------------------------------------
 
     For Each tblRow In tbl.ListRows
+
 
         If IsYes( _
             tblRow.Range.Cells(1, colDeploy).Value2 _
         ) Then
 
+
             processedCount = processedCount + 1
 
+
             packageName = Trim$(CStr( _
-                tblRow.Range.Cells(1, colPackage).Value2 _
+                tblRow.Range.Cells( _
+                    1, _
+                    colPackage _
+                ).Value2 _
             ))
 
+
             overwriteExisting = IsYes( _
-                tblRow.Range.Cells(1, colOverwrite).Value2 _
+                tblRow.Range.Cells( _
+                    1, _
+                    colOverwrite _
+                ).Value2 _
             )
 
 
-            Application.StatusBar = _
+            SetProgress _
                 "Deploying tracker " & _
                 processedCount & _
                 " of " & _
@@ -228,16 +282,23 @@ Public Sub DeployTrackers()
                 packageName
 
 
-            tblRow.Range.Cells(1, colStatus).Value2 = _
-                "Processing..."
+            tblRow.Range.Cells( _
+                1, _
+                colStatus _
+            ).Value2 = "Processing..."
 
-            DoEvents
 
+            outputFile = vbNullString
+
+
+            '------------------------------------------------
+            ' Deploy one tracker
+            '------------------------------------------------
 
             If Len(packageName) = 0 Then
 
-                outcome = "ERROR: Migration Package is blank"
-                outputFile = vbNullString
+                outcome = _
+                    "ERROR: Migration Package is blank"
 
             Else
 
@@ -252,11 +313,15 @@ Public Sub DeployTrackers()
             End If
 
 
-            '-------------------------------------------------
-            ' Write deployment result
-            '-------------------------------------------------
+            '------------------------------------------------
+            ' Record result
+            '------------------------------------------------
 
-            tblRow.Range.Cells(1, colStatus).Value2 = outcome
+            tblRow.Range.Cells( _
+                1, _
+                colStatus _
+            ).Value2 = outcome
+
 
             If Len(outputFile) > 0 Then
 
@@ -297,11 +362,25 @@ Public Sub DeployTrackers()
 
                 Case Else
 
-                    If Left$(outcome, 6) = "ERROR:" Then
+                    If UCase$( _
+                        Left$( _
+                            Trim$(outcome), _
+                            6 _
+                        ) _
+                    ) = "ERROR:" Then
+
                         failedCount = failedCount + 1
+
                     End If
 
             End Select
+
+
+            SetProgress _
+                packageName & _
+                ": " & _
+                outcome
+
 
         End If
 
@@ -310,64 +389,81 @@ Public Sub DeployTrackers()
 
 CleanUp:
 
-    '---------------------------------------------------------
-    ' Always restore master/template state
-    '---------------------------------------------------------
+    '-------------------------------------------------------
+    ' Restore safe template state
+    '
+    'Migration_Package is intentionally NOT restored.
+    'The master remains on the last package processed.
+    '-------------------------------------------------------
 
     On Error Resume Next
 
 
-    RestoreTemplateState originalDeployVisibility
+    If setupComplete Then
 
+        SetProgress _
+            "Finalising deployment: restoring template state..."
 
-    'Restore the package that was selected before deployment.
-    Application.EnableEvents = True
+        RestoreTemplateState _
+            originalDeployVisibility, _
+            vbNullString
 
-    ThisWorkbook.Names("Migration_Package"). _
-        RefersToRange.Value2 = originalPackage
-
-    DoEvents
-
-
-    restoreOK = WaitForWorkbookReady( _
-        30, _
-        restoreDetail _
-    )
-
-
-    ThisWorkbook.Names("Tracker_Mode"). _
-        RefersToRange.Value2 = originalMode
-
-
-    'Restore AutoSave only after the template state is clean.
-    If autoSaveStateKnown Then
-        ThisWorkbook.AutoSaveOn = autoSaveWasOn
     End If
 
 
-    Application.StatusBar = previousStatusBar
-    Application.DisplayAlerts = previousDisplayAlerts
-    Application.ScreenUpdating = previousScreenUpdating
-    Application.EnableEvents = previousEnableEvents
+    '-------------------------------------------------------
+    ' Restore AutoSave
+    '-------------------------------------------------------
+
+    If autoSaveStateKnown Then
+
+        ThisWorkbook.AutoSaveOn = _
+            autoSaveWasOn
+
+    End If
+
+
+    '-------------------------------------------------------
+    ' Restore Excel application state
+    '-------------------------------------------------------
+
+    Application.DisplayAlerts = _
+        previousDisplayAlerts
+
+    Application.ScreenUpdating = _
+        previousScreenUpdating
+
+    Application.EnableEvents = _
+        previousEnableEvents
+
+    Application.StatusBar = _
+        previousStatusBar
 
 
     On Error GoTo 0
 
+
+    '-------------------------------------------------------
+    ' Final report
+    '-------------------------------------------------------
 
     If fatalNumber <> 0 Then
 
         MsgBox _
             "Tracker deployment stopped." & _
             vbCrLf & vbCrLf & _
-            "Error " & fatalNumber & _
-            ": " & fatalDescription, _
+            "Error " & _
+            fatalNumber & _
+            ": " & _
+            fatalDescription, _
             vbExclamation, _
             "Deploy Trackers"
 
     Else
 
         MsgBox _
-            "Tracker deployment finished." & vbCrLf & vbCrLf & _
+            "Tracker deployment finished." & _
+            vbCrLf & vbCrLf & _
             "Created: " & createdCount & vbCrLf & _
             "Replaced: " & replacedCount & vbCrLf & _
             "Skipped: " & skippedCount & vbCrLf & _
@@ -376,6 +472,7 @@ CleanUp:
             "Deploy Trackers"
 
     End If
+
 
     Exit Sub
 
@@ -390,6 +487,9 @@ FatalError:
 End Sub
 
 
+'===========================================================
+' DEPLOY ONE TRACKER
+'===========================================================
 
 Private Function DeployOneTracker( _
     ByVal packageName As String, _
@@ -399,17 +499,21 @@ Private Function DeployOneTracker( _
     ByRef outputFile As String _
 ) As String
 
+
     Dim fso As Object
 
     Dim destinationFolder As String
     Dim destinationFile As String
-    Dim temporaryFile As String
+
+    Dim tempFolder As String
+    Dim tempFile As String
 
     Dim existingFile As Boolean
+
     Dim validationError As String
     Dim calculationError As String
 
-    Dim deploymentStateTouched As Boolean
+    Dim deploymentStatePrepared As Boolean
 
     Dim errorNumber As Long
     Dim errorDescription As String
@@ -418,33 +522,41 @@ Private Function DeployOneTracker( _
     On Error GoTo Failed
 
 
-    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set fso = _
+        CreateObject("Scripting.FileSystemObject")
 
 
-    '---------------------------------------------------------
-    ' Build output paths
-    '---------------------------------------------------------
+    '-------------------------------------------------------
+    ' Build destination paths
+    '-------------------------------------------------------
 
-    destinationFolder = CombinePath( _
-        basePath, _
-        packageName _
-    )
+    SetProgress _
+        packageName & _
+        ": checking destination folder..."
 
 
-    destinationFile = CombinePath( _
-        destinationFolder, _
-        OUTPUT_PREFIX & _
-        SafeFilePart(packageName) & _
-        ".xlsm" _
-    )
+    destinationFolder = _
+        CombinePath( _
+            basePath, _
+            packageName _
+        )
+
+
+    destinationFile = _
+        CombinePath( _
+            destinationFolder, _
+            OUTPUT_PREFIX & _
+            SafeFilePart(packageName) & _
+            ".xlsm" _
+        )
 
 
     outputFile = destinationFile
 
 
-    '---------------------------------------------------------
-    ' Validate destination
-    '---------------------------------------------------------
+    '-------------------------------------------------------
+    ' Destination folder must already exist
+    '-------------------------------------------------------
 
     If Not fso.FolderExists(destinationFolder) Then
 
@@ -456,10 +568,16 @@ Private Function DeployOneTracker( _
     End If
 
 
-    existingFile = fso.FileExists(destinationFile)
+    existingFile = _
+        fso.FileExists(destinationFile)
 
 
-    If existingFile And Not overwriteExisting Then
+    '-------------------------------------------------------
+    ' Existing-file policy
+    '-------------------------------------------------------
+
+    If existingFile And _
+       Not overwriteExisting Then
 
         DeployOneTracker = _
             "Already exists - skipped"
@@ -469,26 +587,36 @@ Private Function DeployOneTracker( _
     End If
 
 
-    '---------------------------------------------------------
-    ' Select migration package
+    '-------------------------------------------------------
+    ' Set Migration Package
     '
-    'Events must remain enabled here because the existing
-    'Worksheet_Change logic reacts to Migration_Package.
-    '---------------------------------------------------------
+    'Events MUST remain enabled here.
+    '-------------------------------------------------------
+
+    SetProgress _
+        packageName & _
+        ": setting Migration Package..."
+
 
     Application.EnableEvents = True
 
 
-    ThisWorkbook.Names("Migration_Package"). _
-        RefersToRange.Value2 = packageName
+    ThisWorkbook.Names("Migration_Package") _
+                .RefersToRange.Value2 = _
+                packageName
 
 
     DoEvents
 
 
-    '---------------------------------------------------------
-    ' Wait until all workbook calculations have settled
-    '---------------------------------------------------------
+    '-------------------------------------------------------
+    ' Wait for workbook calculation
+    '-------------------------------------------------------
+
+    SetProgress _
+        packageName & _
+        ": calculating workbook..."
+
 
     If Not WaitForWorkbookReady( _
         CALC_TIMEOUT_SECONDS, _
@@ -503,9 +631,14 @@ Private Function DeployOneTracker( _
     End If
 
 
-    '---------------------------------------------------------
-    ' Validate calculated migration data
-    '---------------------------------------------------------
+    '-------------------------------------------------------
+    ' Validate resulting tracker data
+    '-------------------------------------------------------
+
+    SetProgress _
+        packageName & _
+        ": validating tracker..."
+
 
     validationError = _
         ValidateTrackerState(packageName)
@@ -521,83 +654,148 @@ Private Function DeployOneTracker( _
     End If
 
 
-    '---------------------------------------------------------
-    ' Temporarily convert the open master into deployed state
-    '---------------------------------------------------------
+    '-------------------------------------------------------
+    ' Prepare the state stored in the generated copy
+    '
+    'Set flag BEFORE calling the routine, so cleanup will
+    'restore the master even if preparation fails halfway.
+    '-------------------------------------------------------
 
-    deploymentStateTouched = True
-
-    PrepareDeployedState
+    deploymentStatePrepared = True
 
 
-    '---------------------------------------------------------
-    ' Save the deployed copy
-    '---------------------------------------------------------
+    PrepareDeployedState _
+        packageName
 
-    If existingFile Then
 
-        'Save to a temporary file first.
-        'Only overwrite the existing tracker after the new
-        'copy has been generated successfully.
+    '-------------------------------------------------------
+    ' Create unique temporary filename
+    '-------------------------------------------------------
 
-        temporaryFile = CombinePath( _
-            destinationFolder, _
+    tempFolder = _
+        GetTempFolder()
+
+
+    tempFile = _
+        CombinePath( _
+            tempFolder, _
             "~" & _
             OUTPUT_PREFIX & _
             SafeFilePart(packageName) & _
             "_" & _
             Format$(Now, "yyyymmdd_hhnnss") & _
+            "_" & _
+            CStr(CLng(Timer * 100)) & _
             ".xlsm" _
         )
 
 
-        ThisWorkbook.SaveCopyAs temporaryFile
+    '-------------------------------------------------------
+    ' Save local copy
+    '-------------------------------------------------------
+
+    SetProgress _
+        packageName & _
+        ": creating local tracker copy..."
 
 
-        'Overwrite the existing tracker from the successfully
-        'generated temporary copy.
-        fso.CopyFile _
-            temporaryFile, _
-            destinationFile, _
-            True
+    ThisWorkbook.SaveCopyAs _
+        tempFile
 
 
-        fso.DeleteFile temporaryFile, True
+    '-------------------------------------------------------
+    ' Restore open template immediately
+    '-------------------------------------------------------
 
+    RestoreTemplateState _
+        restoreVisibility, _
+        packageName
+
+
+    deploymentStatePrepared = False
+
+
+    '-------------------------------------------------------
+    ' Copy local file into OneDrive migration folder
+    '-------------------------------------------------------
+
+    SetProgress _
+        packageName & _
+        ": copying tracker to migration folder..."
+
+
+    fso.CopyFile _
+        tempFile, _
+        destinationFile, _
+        overwriteExisting
+
+
+    '-------------------------------------------------------
+    ' Remove temporary file
+    '-------------------------------------------------------
+
+    SetProgress _
+        packageName & _
+        ": cleaning temporary file..."
+
+
+    fso.DeleteFile _
+        tempFile, _
+        True
+
+
+    tempFile = vbNullString
+
+
+    '-------------------------------------------------------
+    ' Result
+    '-------------------------------------------------------
+
+    If existingFile Then
 
         DeployOneTracker = "Replaced"
 
     Else
-
-        ThisWorkbook.SaveCopyAs destinationFile
 
         DeployOneTracker = "Created"
 
     End If
 
 
+    SetProgress _
+        packageName & _
+        ": deployment complete"
+
+
 CleanUp:
 
-    '---------------------------------------------------------
-    ' Restore the open master immediately after every copy
-    '---------------------------------------------------------
+    '-------------------------------------------------------
+    ' Always restore template after a partial deployment
+    '-------------------------------------------------------
 
     On Error Resume Next
 
 
-    If deploymentStateTouched Then
+    If deploymentStatePrepared Then
 
-        RestoreTemplateState restoreVisibility
+        RestoreTemplateState _
+            restoreVisibility, _
+            packageName
 
     End If
 
 
+    'Remove a leftover TEMP copy after errors.
     If Not fso Is Nothing Then
 
-        If Len(temporaryFile) > 0 Then
+        If Len(tempFile) > 0 Then
 
-            If fso.FileExists(temporaryFile) Then
-                fso.DeleteFile temporaryFile, True
+            If fso.FileExists(tempFile) Then
+
+                fso.DeleteFile _
+                    tempFile, _
+                    True
+
             End If
 
         End If
@@ -618,6 +816,7 @@ CleanUp:
 
     End If
 
+
     Exit Function
 
 
@@ -631,42 +830,150 @@ Failed:
 End Function
 
 
+'===========================================================
+' ENSURE VBA ACCESS TO PROTECTED SUMMARY
+'===========================================================
 
-Private Sub PrepareDeployedState()
+Private Sub EnsureSummaryVBAAccess()
+
+    Dim ws As Worksheet
+    Dim sheetPass As String
+
+
+    sheetPass = _
+        GetSheetPassword()
+
+
+    If Len(sheetPass) = 0 Then
+
+        Err.Raise _
+            vbObjectError + 2200, , _
+            "Sheet password configuration is empty."
+
+    End If
+
+
+    Set ws = _
+        ThisWorkbook.Worksheets(SUMMARY_SHEET)
+
+
+    SetProgress _
+        "Preparing deployment: applying UserInterfaceOnly protection..."
+
+
+    'This keeps the sheet protected for users while allowing
+    'VBA to write to locked cells, including Migration_Package.
+    ws.Protect _
+        Password:=sheetPass, _
+        UserInterfaceOnly:=True, _
+        AllowFiltering:=True, _
+        AllowSorting:=True
+
+
+    sheetPass = vbNullString
+    Set ws = Nothing
+
+End Sub
+
+
+'===========================================================
+' SINGLE SOURCE FOR SHEET PASSWORD
+'===========================================================
+
+Private Function GetSheetPassword() As String
+
+    'Keep CFG_A local here.
+    'This avoids the module-level constant issue encountered
+    'previously, while giving all deployment routines one
+    'single password source.
+
+    Const CFG_A As String = "$$44pt33hstt"
+
+
+    GetSheetPassword = _
+        PasswordDecode(CFG_A)
+
+End Function
+
+
+'===========================================================
+' PREPARE STATE STORED IN GENERATED TRACKER
+'===========================================================
+
+Private Sub PrepareDeployedState( _
+    ByVal packageName As String _
+)
 
     Dim previousEvents As Boolean
+
     Dim errorNumber As Long
     Dim errorDescription As String
 
 
-    previousEvents = Application.EnableEvents
+    previousEvents = _
+        Application.EnableEvents
+
 
     On Error GoTo Failed
 
 
-    'Internal deployment-state changes should not trigger
-    'normal workbook event processing.
     Application.EnableEvents = False
 
 
-    'Mark generated workbook explicitly.
-    ThisWorkbook.Names("Tracker_Mode"). _
-        RefersToRange.Value2 = MODE_DEPLOYED
+    '-------------------------------------------------------
+    ' Mark workbook as deployed
+    '-------------------------------------------------------
+
+    SetProgress _
+        packageName & _
+        ": setting DEPLOYED mode..."
 
 
-    'Prevent the Migration Package range from being recognised
-    'by EnableDesktopEditing in the generated tracker.
-    SetMigrationRangeTitle AER_DEPLOYED
+    ThisWorkbook.Names("Tracker_Mode") _
+                .RefersToRange.Value2 = _
+                MODE_DEPLOYED
 
 
-    'Hide deployment controls/data from generated trackers.
-    ThisWorkbook.Worksheets(DEPLOY_SHEET). _
-        Visible = xlSheetVeryHidden
+    '-------------------------------------------------------
+    ' Switch away from deployment sheet
+    '-------------------------------------------------------
+
+    SetProgress _
+        packageName & _
+        ": switching to Summary..."
+
+
+    ThisWorkbook.Worksheets(SUMMARY_SHEET) _
+                .Activate
+
+
+    '-------------------------------------------------------
+    ' Hide deployment administration sheet
+    '-------------------------------------------------------
+
+    SetProgress _
+        packageName & _
+        ": hiding deployment sheet..."
+
+
+    ThisWorkbook.Worksheets(DEPLOY_SHEET) _
+                .Visible = _
+                xlSheetVeryHidden
+
+
+    SetProgress _
+        packageName & _
+        ": deployed state ready"
 
 
 CleanUp:
 
-    Application.EnableEvents = previousEvents
+    Application.EnableEvents = _
+        previousEvents
+
+
+    'Disable this handler before propagating an error.
+    On Error GoTo 0
 
 
     If errorNumber <> 0 Then
@@ -677,6 +984,7 @@ CleanUp:
             errorDescription
 
     End If
+
 
     Exit Sub
 
@@ -691,15 +999,21 @@ Failed:
 End Sub
 
 
+'===========================================================
+' RESTORE OPEN MASTER TEMPLATE
+'===========================================================
 
 Private Sub RestoreTemplateState( _
-    ByVal deploySheetVisibility As XlSheetVisibility _
+    ByVal deploySheetVisibility As XlSheetVisibility, _
+    ByVal packageName As String _
 )
 
     Dim previousEvents As Boolean
 
 
-    previousEvents = Application.EnableEvents
+    previousEvents = _
+        Application.EnableEvents
+
 
     On Error GoTo CleanUp
 
@@ -707,106 +1021,63 @@ Private Sub RestoreTemplateState( _
     Application.EnableEvents = False
 
 
-    'Restore sheet visibility in the open master.
-    ThisWorkbook.Worksheets(DEPLOY_SHEET). _
-        Visible = deploySheetVisibility
+    If Len(packageName) > 0 Then
+
+        SetProgress _
+            packageName & _
+            ": restoring template state..."
+
+    End If
 
 
-    'Restore editable-range title.
-    SetMigrationRangeTitle AER_TEMPLATE
+    '-------------------------------------------------------
+    ' Restore deployment sheet visibility
+    '-------------------------------------------------------
+
+    ThisWorkbook.Worksheets(DEPLOY_SHEET) _
+                .Visible = _
+                deploySheetVisibility
 
 
-    'Restore template mode.
-    ThisWorkbook.Names("Tracker_Mode"). _
-        RefersToRange.Value2 = MODE_TEMPLATE
+    '-------------------------------------------------------
+    ' Restore template marker
+    '-------------------------------------------------------
+
+    ThisWorkbook.Names("Tracker_Mode") _
+                .RefersToRange.Value2 = _
+                MODE_TEMPLATE
 
 
 CleanUp:
 
-    Application.EnableEvents = previousEvents
+    Application.EnableEvents = _
+        previousEvents
 
 End Sub
 
 
-
-Private Sub SetMigrationRangeTitle( _
-    ByVal desiredTitle As String _
-)
-
-    Dim ws As Worksheet
-    Dim editRange As AllowEditRange
-
-
-    Set ws = _
-        ThisWorkbook.Worksheets(SUMMARY_SHEET)
-
-
-    For Each editRange In _
-        ws.Protection.AllowEditRanges
-
-
-        If StrComp( _
-            editRange.Title, _
-            AER_TEMPLATE, _
-            vbTextCompare _
-        ) = 0 _
-        Or _
-        StrComp( _
-            editRange.Title, _
-            AER_DEPLOYED, _
-            vbTextCompare _
-        ) = 0 Then
-
-
-            editRange.Title = desiredTitle
-
-            Exit Sub
-
-        End If
-
-    Next editRange
-
-
-    Err.Raise _
-        vbObjectError + 2100, , _
-        "The Allow Edit Range '" & _
-        AER_TEMPLATE & _
-        "' could not be found."
-
-End Sub
-
-
+'===========================================================
+' WAIT FOR CALCULATION
+'===========================================================
 
 Private Function WaitForWorkbookReady( _
     ByVal timeoutSeconds As Long, _
     ByRef errorDetail As String _
 ) As Boolean
 
-    Dim startTime As Date
+
+    Dim startTime As Double
+    Dim elapsed As Double
 
 
     On Error GoTo Failed
 
 
-    startTime = Now
+    startTime = Timer
 
 
-    'Full workbook calculation.
-    Application.CalculateFull
-
-
-    'Wait for supported asynchronous queries.
-    On Error Resume Next
-
-    Application.CalculateUntilAsyncQueriesDone
-
-    Err.Clear
-
-    On Error GoTo Failed
-
-
-    'Calculate again in case async results changed formulas.
-    Application.CalculateFull
+    'Calculate dirty cells in all open workbooks.
+    Application.Calculate
 
 
     Do While _
@@ -816,12 +1087,20 @@ Private Function WaitForWorkbookReady( _
         DoEvents
 
 
-        If DateDiff( _
-            "s", _
-            startTime, _
-            Now _
-        ) >= timeoutSeconds Then
+        elapsed = _
+            Timer - startTime
 
+
+        'Timer resets at midnight.
+        If elapsed < 0 Then
+
+            elapsed = _
+                elapsed + 86400
+
+        End If
+
+
+        If elapsed >= timeoutSeconds Then
 
             errorDetail = _
                 "Calculation timeout after " & _
@@ -833,6 +1112,9 @@ Private Function WaitForWorkbookReady( _
         End If
 
     Loop
+
+
+    DoEvents
 
 
     WaitForWorkbookReady = True
@@ -851,10 +1133,14 @@ Failed:
 End Function
 
 
+'===========================================================
+' VALIDATE TRACKER BEFORE COPYING
+'===========================================================
 
 Private Function ValidateTrackerState( _
     ByVal expectedPackage As String _
 ) As String
+
 
     Dim valueToCheck As Variant
 
@@ -862,13 +1148,13 @@ Private Function ValidateTrackerState( _
     On Error GoTo Failed
 
 
-    '---------------------------------------------------------
+    '-------------------------------------------------------
     ' Migration Package
-    '---------------------------------------------------------
+    '-------------------------------------------------------
 
     valueToCheck = _
-        ThisWorkbook.Names("Migration_Package"). _
-        RefersToRange.Value2
+        ThisWorkbook.Names("Migration_Package") _
+                    .RefersToRange.Value2
 
 
     If IsError(valueToCheck) Then
@@ -895,13 +1181,13 @@ Private Function ValidateTrackerState( _
     End If
 
 
-    '---------------------------------------------------------
+    '-------------------------------------------------------
     ' Migration Type
-    '---------------------------------------------------------
+    '-------------------------------------------------------
 
     valueToCheck = _
-        ThisWorkbook.Names("Migration_Type"). _
-        RefersToRange.Value2
+        ThisWorkbook.Names("Migration_Type") _
+                    .RefersToRange.Value2
 
 
     If IsError(valueToCheck) Then
@@ -924,13 +1210,13 @@ Private Function ValidateTrackerState( _
     End If
 
 
-    '---------------------------------------------------------
+    '-------------------------------------------------------
     ' Prep Start Date
-    '---------------------------------------------------------
+    '-------------------------------------------------------
 
     valueToCheck = _
-        ThisWorkbook.Names("Prep_Start_Date"). _
-        RefersToRange.Value
+        ThisWorkbook.Names("Prep_Start_Date") _
+                    .RefersToRange.Value
 
 
     If IsError(valueToCheck) Or _
@@ -944,13 +1230,13 @@ Private Function ValidateTrackerState( _
     End If
 
 
-    '---------------------------------------------------------
+    '-------------------------------------------------------
     ' Migration Date
-    '---------------------------------------------------------
+    '-------------------------------------------------------
 
     valueToCheck = _
-        ThisWorkbook.Names("Migration_Date"). _
-        RefersToRange.Value
+        ThisWorkbook.Names("Migration_Date") _
+                    .RefersToRange.Value
 
 
     If IsError(valueToCheck) Or _
@@ -978,10 +1264,30 @@ Failed:
 End Function
 
 
+'===========================================================
+' STATUS BAR HELPER
+'===========================================================
+
+Private Sub SetProgress( _
+    ByVal messageText As String _
+)
+
+    Application.StatusBar = _
+        messageText
+
+    DoEvents
+
+End Sub
+
+
+'===========================================================
+' YES / NO HELPER
+'===========================================================
 
 Private Function IsYes( _
     ByVal valueToCheck As Variant _
 ) As Boolean
+
 
     IsYes = _
         UCase$(Trim$(CStr(valueToCheck))) = "YES"
@@ -989,11 +1295,50 @@ Private Function IsYes( _
 End Function
 
 
+'===========================================================
+' TEMP FOLDER
+'===========================================================
+
+Private Function GetTempFolder() As String
+
+    Dim tempPath As String
+
+
+    tempPath = _
+        Environ$("TEMP")
+
+
+    If Len(tempPath) = 0 Then
+
+        tempPath = _
+            Environ$("TMP")
+
+    End If
+
+
+    If Len(tempPath) = 0 Then
+
+        tempPath = _
+            ThisWorkbook.Path
+
+    End If
+
+
+    GetTempFolder = _
+        tempPath
+
+End Function
+
+
+'===========================================================
+' PATH HELPER
+'===========================================================
 
 Private Function CombinePath( _
     ByVal parentPath As String, _
     ByVal childPath As String _
 ) As String
+
 
     If Right$( _
         parentPath, _
@@ -1015,10 +1360,14 @@ Private Function CombinePath( _
 End Function
 
 
+'===========================================================
+' FILE-NAME SANITISER
+'===========================================================
 
 Private Function SafeFilePart( _
     ByVal textValue As String _
 ) As String
+
 
     Dim invalidCharacters As Variant
     Dim item As Variant
@@ -1037,7 +1386,8 @@ Private Function SafeFilePart( _
     )
 
 
-    SafeFilePart = Trim$(textValue)
+    SafeFilePart = _
+        Trim$(textValue)
 
 
     For Each item In invalidCharacters
