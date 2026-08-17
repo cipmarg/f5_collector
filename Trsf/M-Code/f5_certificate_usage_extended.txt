@@ -26,6 +26,23 @@ let
                     ColumnsToInsert
                 ),
 
+    NormalizeText = (Value as any) as nullable text =>
+        let
+            Result =
+                if Value = null then
+                    null
+                else
+                    Text.Upper(
+                        Text.Trim(
+                            Text.From(Value)
+                        )
+                    )
+        in
+            if Result = null or Result = "" then
+                null
+            else
+                Result,
+
     Source =
         stg_F5_Certificate_Usage_Core,
 
@@ -44,12 +61,29 @@ let
             stg_CertNow_Latest
         ),
 
+    SPDWLookup =
+        Table.Buffer(
+            stg_SPDW_ITSI_Details
+        ),
+
     CertNowColumns =
         List.RemoveItems(
             Table.ColumnNames(
                 CertNowLookup
             ),
-            {"Serial"}
+            {
+                "Serial"
+            }
+        ),
+
+    SPDWColumns =
+        List.RemoveItems(
+            Table.ColumnNames(
+                SPDWLookup
+            ),
+            {
+                "ITSI Correlation Key"
+            }
         ),
 
     ClusterColumns =
@@ -68,12 +102,21 @@ let
             "Certificate Used By"
         },
 
+
+    //=====================================================
+    // CLUSTER / MIGRATION INFORMATION
+    //=====================================================
+
     #"Merged Cluster Information" =
         Table.NestedJoin(
             Source,
-            {"_HostKey"},
+            {
+                "_HostKey"
+            },
             ClusterLookup,
-            {"_HostKey"},
+            {
+                "_HostKey"
+            },
             "Cluster Information",
             JoinKind.LeftOuter
         ),
@@ -98,12 +141,21 @@ let
             }
         ),
 
+
+    //=====================================================
+    // CERTIFICATE REPRESENTATIVE / USAGE SUMMARY
+    //=====================================================
+
     #"Merged Certificate Usage Summary" =
         Table.NestedJoin(
             #"Expanded Cluster Information",
-            {"_UsageKey"},
+            {
+                "_UsageKey"
+            },
             CertificateUsageLookup,
-            {"_UsageKey"},
+            {
+                "_UsageKey"
+            },
             "Certificate Usage Summary",
             JoinKind.LeftOuter
         ),
@@ -124,12 +176,21 @@ let
             }
         ),
 
+
+    //=====================================================
+    // CERTNOW INFORMATION
+    //=====================================================
+
     #"Merged CertNow" =
         Table.NestedJoin(
             #"Expanded Certificate Usage Summary",
-            {"_NormalizedSerial"},
+            {
+                "_NormalizedSerial"
+            },
             CertNowLookup,
-            {"Serial"},
+            {
+                "Serial"
+            },
             "CertNow Match",
             JoinKind.LeftOuter
         ),
@@ -142,15 +203,64 @@ let
             CertNowColumns
         ),
 
+
+    //=====================================================
+    // SPDW ITSI INFORMATION
+    //=====================================================
+
+    #"Added ITSI Correlation Key" =
+        Table.AddColumn(
+            #"Expanded CertNow",
+            "_ITSICorrelationKey",
+            each
+                NormalizeText(
+                    [#"CertNow_C1. ITSI Correlation ID"]
+                ),
+            type nullable text
+        ),
+
+    #"Merged SPDW ITSI Information" =
+        Table.NestedJoin(
+            #"Added ITSI Correlation Key",
+            {
+                "_ITSICorrelationKey"
+            },
+            SPDWLookup,
+            {
+                "ITSI Correlation Key"
+            },
+            "SPDW ITSI Information",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded SPDW ITSI Information" =
+        Table.ExpandTableColumn(
+            #"Merged SPDW ITSI Information",
+            "SPDW ITSI Information",
+            SPDWColumns,
+            SPDWColumns
+        ),
+
+
+    //=====================================================
+    // CLEANUP
+    //=====================================================
+
     #"Removed Technical Columns" =
         Table.RemoveColumns(
-            #"Expanded CertNow",
+            #"Expanded SPDW ITSI Information",
             {
                 "_HostKey",
                 "_NormalizedSerial",
-                "_UsageKey"
+                "_UsageKey",
+                "_ITSICorrelationKey"
             }
         ),
+
+
+    //=====================================================
+    // COLUMN ORDER
+    //=====================================================
 
     ColumnOrderWithCluster =
         InsertAfter(
@@ -168,11 +278,18 @@ let
             CertificateSummaryColumns
         ),
 
-    FinalColumnOrder =
+    ColumnOrderWithCertNow =
         InsertAfter(
             ColumnOrderWithCertificateSummary,
             "serial_number",
             CertNowColumns
+        ),
+
+    FinalColumnOrder =
+        InsertAfter(
+            ColumnOrderWithCertNow,
+            "CertNow_C1. ITSI Correlation ID",
+            SPDWColumns
         ),
 
     #"Reordered Columns" =

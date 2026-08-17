@@ -1,0 +1,249 @@
+let
+    CombineDistinctText = (Values as list) as nullable text =>
+        let
+            CleanValues =
+                List.Sort(
+                    List.Distinct(
+                        List.Select(
+                            List.Transform(
+                                Values,
+                                each
+                                    if _ = null then
+                                        null
+                                    else
+                                        Text.Trim(
+                                            Text.From(_)
+                                        )
+                            ),
+                            each
+                                _ <> null
+                                    and _ <> ""
+                        )
+                    )
+                )
+        in
+            if List.IsEmpty(CleanValues) then
+                null
+            else
+                Text.Combine(
+                    CleanValues,
+                    " | "
+                ),
+
+    ITSIKeys =
+        List.Buffer(
+            Table.Column(
+                stg_F5_ITSI_Keys,
+                "ITSI Correlation Key"
+            )
+        ),
+
+    ITSIList =
+        Text.Combine(
+            ITSIKeys,
+            "|"
+        ),
+
+    Database =
+        Sql.Database(
+            "",
+            "staging",
+            [
+                MultiSubnetFailover = true,
+                CommandTimeout = #duration(0, 0, 10, 0)
+            ]
+        ),
+
+    SqlStatement =
+"
+WITH RequestedITSI AS
+(
+    SELECT DISTINCT
+        UPPER(LTRIM(RTRIM([value]))) AS [ITSI Correlation Key]
+    FROM STRING_SPLIT(@ITSIList, '|')
+    WHERE LTRIM(RTRIM([value])) <> ''
+)
+
+SELECT DISTINCT
+    UPPER(
+        LTRIM(
+            RTRIM(
+                sh.[IT Service Instance Correlation ID]
+            )
+        )
+    ) AS [ITSI Correlation Key],
+
+    sh.[IT Business Service],
+    sh.[IT Business Service Owning Transaction Cycle],
+    sh.[IT Business Service Owning Transaction Cycle ID],
+    sh.[IT Business Service Business Owner],
+    sh.[IT Business Service RTB Lead],
+    sh.[IT Business Service RTB Manager],
+    sh.[IT Business Service RTB Manager (Deputy)],
+    sh.[Department Level 1],
+    sh.[IT Business Service CDR],
+    sh.[IT Service Instance Service Environment],
+    sh.[IT Service Instance Operational Status],
+    sh.[SRP L1 Department Name],
+    sh.[IT Business Service Support Group],
+
+    itbs_owner.[Email]
+        AS [IT Business Service Business Owner Email],
+
+    itbs_rtbLead.[Email]
+        AS [IT Business Service RTB Lead Email],
+
+    itbs_rtbManager.[Email]
+        AS [IT Business Service RTB Manager Email],
+
+    itbs_rtbManagerDeputy.[Email]
+        AS [IT Business Service RTB Manager (Deputy) Email]
+
+FROM [dbo].[spdw_vwSFServiceHierarchyConsolidated] AS sh
+
+INNER JOIN RequestedITSI AS requested
+    ON requested.[ITSI Correlation Key]
+        =
+        UPPER(
+            LTRIM(
+                RTRIM(
+                    sh.[IT Service Instance Correlation ID]
+                )
+            )
+        )
+
+LEFT JOIN [dbo].[spdw_vwsfuser_sub] AS itbs_owner
+    ON itbs_owner.[User (Join)]
+        =
+        sh.[IT Business Service Business Owner (Join)]
+
+LEFT JOIN [dbo].[spdw_vwsfuser_sub] AS itbs_rtbLead
+    ON itbs_rtbLead.[User (Join)]
+        =
+        sh.[IT Business Service RTB Lead (Join)]
+
+LEFT JOIN [dbo].[spdw_vwsfuser_sub] AS itbs_rtbManager
+    ON itbs_rtbManager.[User (Join)]
+        =
+        sh.[IT Business Service RTB Manager (Join)]
+
+LEFT JOIN [dbo].[spdw_vwsfuser_sub] AS itbs_rtbManagerDeputy
+    ON itbs_rtbManagerDeputy.[User (Join)]
+        =
+        sh.[IT Business Service RTB Deputy Manager (Join)];
+",
+
+    EmptyResult =
+        #table(
+            {
+                "ITSI Correlation Key",
+                "IT Business Service",
+                "IT Business Service Owning Transaction Cycle",
+                "IT Business Service Owning Transaction Cycle ID",
+                "IT Business Service Business Owner",
+                "IT Business Service RTB Lead",
+                "IT Business Service RTB Manager",
+                "IT Business Service RTB Manager (Deputy)",
+                "Department Level 1",
+                "IT Business Service CDR",
+                "IT Service Instance Service Environment",
+                "IT Service Instance Operational Status",
+                "SRP L1 Department Name",
+                "IT Business Service Support Group",
+                "IT Business Service Business Owner Email",
+                "IT Business Service RTB Lead Email",
+                "IT Business Service RTB Manager Email",
+                "IT Business Service RTB Manager (Deputy) Email"
+            },
+            {}
+        ),
+
+    RawResult =
+        if List.IsEmpty(ITSIKeys) then
+            EmptyResult
+
+        else if List.AnyTrue(
+            List.Transform(
+                ITSIKeys,
+                each Text.Contains(_, "|")
+            )
+        ) then
+            error "An ITSI correlation ID contains the reserved | delimiter."
+
+        else
+            Value.NativeQuery(
+                Database,
+                SqlStatement,
+                [
+                    ITSIList = ITSIList
+                ],
+                [
+                    EnableFolding = true
+                ]
+            ),
+
+    SPDWFields =
+        {
+            "IT Business Service",
+            "IT Business Service Owning Transaction Cycle",
+            "IT Business Service Owning Transaction Cycle ID",
+            "IT Business Service Business Owner",
+            "IT Business Service RTB Lead",
+            "IT Business Service RTB Manager",
+            "IT Business Service RTB Manager (Deputy)",
+            "Department Level 1",
+            "IT Business Service CDR",
+            "IT Service Instance Service Environment",
+            "IT Service Instance Operational Status",
+            "SRP L1 Department Name",
+            "IT Business Service Support Group",
+            "IT Business Service Business Owner Email",
+            "IT Business Service RTB Lead Email",
+            "IT Business Service RTB Manager Email",
+            "IT Business Service RTB Manager (Deputy) Email"
+        },
+
+    // Guarantee exactly one lookup row per ITSI correlation ID.
+    // If SPDW unexpectedly contains different values for the same ID,
+    // preserve all unique values separated by " | ".
+    #"Grouped by ITSI Correlation ID" =
+        Table.Group(
+            RawResult,
+            {
+                "ITSI Correlation Key"
+            },
+            List.Transform(
+                SPDWFields,
+                (ColumnName) =>
+                    {
+                        ColumnName,
+                        each
+                            CombineDistinctText(
+                                Table.Column(
+                                    _,
+                                    ColumnName
+                                )
+                            ),
+                        type nullable text
+                    }
+            )
+        ),
+
+    PrefixRenames =
+        List.Transform(
+            SPDWFields,
+            each
+                {
+                    _,
+                    "SPDW_" & _
+                }
+        ),
+
+    #"Prefixed SPDW Columns" =
+        Table.RenameColumns(
+            #"Grouped by ITSI Correlation ID",
+            PrefixRenames,
+            MissingField.Ignore
+        )
+in
+    #"Prefixed SPDW Columns"

@@ -1,0 +1,105 @@
+let
+    NormalizeText = (Value as any) as nullable text =>
+        let
+            Result =
+                if Value = null then
+                    null
+                else
+                    Text.Upper(
+                        Text.Trim(
+                            Text.From(Value)
+                        )
+                    )
+        in
+            if Result = null or Result = "" then
+                null
+            else
+                Result,
+
+    CertNowLookup =
+        Table.Buffer(
+            Table.SelectColumns(
+                stg_CertNow_Latest,
+                {
+                    "Serial",
+                    "CertNow_C1. ITSI Correlation ID"
+                },
+                MissingField.UseNull
+            )
+        ),
+
+    UsageSerials =
+        Table.Distinct(
+            Table.SelectRows(
+                Table.SelectColumns(
+                    stg_F5_Certificate_Usage_Core,
+                    {
+                        "_NormalizedSerial"
+                    }
+                ),
+                each
+                    [_NormalizedSerial] <> null
+                        and [_NormalizedSerial] <> ""
+            )
+        ),
+
+    #"Merged CertNow" =
+        Table.NestedJoin(
+            UsageSerials,
+            {
+                "_NormalizedSerial"
+            },
+            CertNowLookup,
+            {
+                "Serial"
+            },
+            "CertNow",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded ITSI Correlation ID" =
+        Table.ExpandTableColumn(
+            #"Merged CertNow",
+            "CertNow",
+            {
+                "CertNow_C1. ITSI Correlation ID"
+            },
+            {
+                "ITSI Correlation Key"
+            }
+        ),
+
+    #"Normalized ITSI Keys" =
+        Table.TransformColumns(
+            #"Expanded ITSI Correlation ID",
+            {
+                {
+                    "ITSI Correlation Key",
+                    each NormalizeText(_),
+                    type nullable text
+                }
+            }
+        ),
+
+    #"Filtered Blank Keys" =
+        Table.SelectRows(
+            #"Normalized ITSI Keys",
+            each
+                [ITSI Correlation Key] <> null
+                    and [ITSI Correlation Key] <> ""
+        ),
+
+    #"Selected Key Only" =
+        Table.SelectColumns(
+            #"Filtered Blank Keys",
+            {
+                "ITSI Correlation Key"
+            }
+        ),
+
+    #"Distinct ITSI Keys" =
+        Table.Distinct(
+            #"Selected Key Only"
+        )
+in
+    #"Distinct ITSI Keys"
