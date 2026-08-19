@@ -78,7 +78,7 @@ abort_script()
 trap 'abort_script' INT TERM HUP
 trap 'cleanup; exit 131' QUIT
 
-printf "enter pass for %s: " "$SSH_USER"
+printf "Enter password for %s: " "$SSH_USER"
 stty -echo
 read PASS
 READ_RC=$?
@@ -218,7 +218,9 @@ ACTIVE_SHORT=`short_name "$ACTIVE_HOST"`
 
 echo "Active device: $ACTIVE_SHORT"
 
-OUT_FILE="${ACTIVE_SHORT}_MTS_`date '+%d-%m-%Y'`.txt"
+DATE_STR=`date '+%d-%m-%Y'`
+OUT_FILE="${ACTIVE_SHORT}_MTS_${DATE_STR}.txt"
+OUT_FILE=`echo "$OUT_FILE" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'`
 OUT_TMP=".${OUT_FILE}.tmp.$$"
 
 echo "Preparing persistent SSH connection to $ACTIVE_HOST ..."
@@ -288,6 +290,7 @@ run_mts_command()
     _display_cmd="$1"
     _remote_cmd="$2"
 
+    echo "Executing: $_display_cmd"
     echo "$_display_cmd" >> "$OUT_TMP"
 
     run_remote_command "$_remote_cmd"
@@ -302,6 +305,7 @@ run_mts_grep()
     _remote_cmd="$2"
     _grep_expr="$3"
 
+    echo "Executing: $_display_cmd"
     echo "$_display_cmd" >> "$OUT_TMP"
 
     # IMPORTANT:
