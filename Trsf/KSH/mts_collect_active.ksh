@@ -220,27 +220,10 @@ echo "Active device: $ACTIVE_SHORT"
 OUT_FILE="${ACTIVE_SHORT}_MTS_`date '+%d-%m-%Y'`.txt"
 OUT_TMP=".${OUT_FILE}.tmp.$$"
 
-echo "Opening persistent SSH connection to $ACTIVE_HOST ..."
-
-sshpass -e ssh $SSH_OPTS \
-    -o ControlMaster=yes \
-    -o ControlPath="$CONTROL_SOCKET" \
-    -o ControlPersist=60 \
-    -MNf "$SSH_USER@$ACTIVE_HOST"
-
-if [ $? -ne 0 ]; then
-    echo "ERROR: Unable to establish SSH connection to $ACTIVE_HOST."
-    cleanup
-    exit 1
-fi
+echo "Preparing persistent SSH connection to $ACTIVE_HOST ..."
 
 MASTER_HOST="$ACTIVE_HOST"
-MASTER_OPEN=1
-
-# The password is no longer needed after the master connection is established.
-PASS=""
-SSHPASS=""
-export SSHPASS
+MASTER_OPEN=0
 
 : > "$OUT_TMP" || {
     echo "ERROR: Cannot create temporary output file $OUT_TMP."
@@ -260,12 +243,39 @@ run_mts_command()
     echo "$_cmd" >> "$OUT_TMP"
     rm -f "$CMD_TMP" "$CMD_ERR"
 
-    printf 'y\n' | ssh $SSH_OPTS \
-        -S "$CONTROL_SOCKET" \
-        "$SSH_USER@$MASTER_HOST" \
-        "$_cmd" >"$CMD_TMP" 2>"$CMD_ERR"
+    if [ "$MASTER_OPEN" -eq 0 ]; then
+        # Establish the multiplexed master connection with the first real
+        # MTS command. This uses the same command-style SSH invocation that
+        # already worked during HA probing. ControlPersist keeps the TCP
+        # connection alive after this command returns.
+        printf 'y\n' | sshpass -e ssh $SSH_OPTS \
+            -o ControlMaster=yes \
+            -o ControlPath="$CONTROL_SOCKET" \
+            -o ControlPersist=60 \
+            "$SSH_USER@$MASTER_HOST" \
+            "$_cmd" >"$CMD_TMP" 2>"$CMD_ERR"
 
-    _rc=$?
+        _rc=$?
+
+        if [ "$_rc" -eq 0 ]; then
+            MASTER_OPEN=1
+
+            # Authentication is complete; subsequent commands use only
+            # the existing control socket and cannot fall back to another
+            # interactive password prompt.
+            PASS=""
+            SSHPASS=""
+            export SSHPASS
+        fi
+    else
+        printf 'y\n' | ssh $SSH_OPTS \
+            -o BatchMode=yes \
+            -S "$CONTROL_SOCKET" \
+            "$SSH_USER@$MASTER_HOST" \
+            "$_cmd" >"$CMD_TMP" 2>"$CMD_ERR"
+
+        _rc=$?
+    fi
 
     if [ "$_rc" -ne 0 ]; then
         echo "ERROR: Command failed on $MASTER_HOST:"
