@@ -37,6 +37,7 @@ fi
 
 CONTROL_SOCKET="/tmp/mtsctl.$$"
 PROBE_ERR="/tmp/mts_probe_err.$$"
+CMD_RAW="/tmp/mts_cmd_raw.$$"
 CMD_TMP="/tmp/mts_cmd.$$"
 CMD_ERR="/tmp/mts_cmd_err.$$"
 OUT_TMP=""
@@ -55,7 +56,7 @@ cleanup()
         ssh $SSH_OPTS -S "$CONTROL_SOCKET" -O exit "$SSH_USER@$MASTER_HOST" >/dev/null 2>&1
     fi
 
-    rm -f "$CONTROL_SOCKET" "$PROBE_ERR" "$CMD_TMP" "$CMD_ERR"
+    rm -f "$CONTROL_SOCKET" "$PROBE_ERR" "$CMD_RAW" "$CMD_TMP" "$CMD_ERR"
 
     if [ -n "$OUT_TMP" ] && [ -f "$OUT_TMP" ]; then
         rm -f "$OUT_TMP"
@@ -236,33 +237,25 @@ append_marker()
     echo "$1" >> "$OUT_TMP"
 }
 
-run_mts_command()
+run_remote_command()
 {
-    _cmd="$1"
+    _remote_cmd="$1"
 
-    echo "$_cmd" >> "$OUT_TMP"
-    rm -f "$CMD_TMP" "$CMD_ERR"
+    rm -f "$CMD_RAW" "$CMD_ERR"
 
     if [ "$MASTER_OPEN" -eq 0 ]; then
-        # Establish the multiplexed master connection with the first real
-        # MTS command. This uses the same command-style SSH invocation that
-        # already worked during HA probing. ControlPersist keeps the TCP
-        # connection alive after this command returns.
+        # Establish the multiplexed connection with the first real MTS command.
         printf 'y\n' | sshpass -e ssh $SSH_OPTS \
             -o ControlMaster=yes \
             -o ControlPath="$CONTROL_SOCKET" \
             -o ControlPersist=60 \
             "$SSH_USER@$MASTER_HOST" \
-            "$_cmd" >"$CMD_TMP" 2>"$CMD_ERR"
+            "$_remote_cmd" >"$CMD_RAW" 2>"$CMD_ERR"
 
         _rc=$?
 
         if [ "$_rc" -eq 0 ]; then
             MASTER_OPEN=1
-
-            # Authentication is complete; subsequent commands use only
-            # the existing control socket and cannot fall back to another
-            # interactive password prompt.
             PASS=""
             SSHPASS=""
             export SSHPASS
@@ -272,19 +265,61 @@ run_mts_command()
             -o BatchMode=yes \
             -S "$CONTROL_SOCKET" \
             "$SSH_USER@$MASTER_HOST" \
-            "$_cmd" >"$CMD_TMP" 2>"$CMD_ERR"
+            "$_remote_cmd" >"$CMD_RAW" 2>"$CMD_ERR"
 
         _rc=$?
     fi
 
     if [ "$_rc" -ne 0 ]; then
         echo "ERROR: Command failed on $MASTER_HOST:"
-        echo "       $_cmd"
+        echo "       $_remote_cmd"
 
         if [ -s "$CMD_ERR" ]; then
             cat "$CMD_ERR"
         fi
 
+        cleanup
+        exit 1
+    fi
+}
+
+run_mts_command()
+{
+    _display_cmd="$1"
+    _remote_cmd="$2"
+
+    echo "$_display_cmd" >> "$OUT_TMP"
+
+    run_remote_command "$_remote_cmd"
+
+    cat "$CMD_RAW" >> "$OUT_TMP"
+    echo "" >> "$OUT_TMP"
+}
+
+run_mts_grep()
+{
+    _display_cmd="$1"
+    _remote_cmd="$2"
+    _grep_expr="$3"
+
+    echo "$_display_cmd" >> "$OUT_TMP"
+
+    # IMPORTANT:
+    # The BIG-IP account lands directly in tmsh. A pipe character sent as part
+    # of the SSH remote command is therefore parsed by tmsh and fails with:
+    #   Syntax Error: unexpected argument "|"
+    #
+    # Run only the tmsh command remotely, then perform grep locally on the
+    # jump server. The command written to the MTS output remains identical to
+    # the original manual instruction.
+    run_remote_command "$_remote_cmd"
+
+    grep -E "$_grep_expr" "$CMD_RAW" > "$CMD_TMP"
+    _grep_rc=$?
+
+    if [ "$_grep_rc" -gt 1 ]; then
+        echo "ERROR: Local grep failed for:"
+        echo "       $_display_cmd"
         cleanup
         exit 1
     fi
@@ -297,26 +332,48 @@ append_marker "#MTS Generator Commands v1.0"
 echo "" >> "$OUT_TMP"
 
 append_marker "#Hostname"
-run_mts_command 'list sys global-settings hostname'
+run_mts_command \
+    'list sys global-settings hostname' \
+    'list sys global-settings hostname'
 
 append_marker "#Timestamp"
-run_mts_command 'show sys clock'
+run_mts_command \
+    'show sys clock' \
+    'show sys clock'
 
 append_marker "#Get VS Status,current connection,packets in&out"
-run_mts_command 'show ltm virtual raw field-fmt | grep -E "ltm virtual|clientside.pkts|status.availability-state|status.enabled-state|clientside.cur-conns|destination"'
+run_mts_grep \
+    'show ltm virtual raw field-fmt | grep -E "ltm virtual|clientside.pkts|status.availability-state|status.enabled-state|clientside.cur-conns|destination"' \
+    'show ltm virtual raw field-fmt' \
+    'ltm virtual|clientside\.pkts|status\.availability-state|status\.enabled-state|clientside\.cur-conns|destination'
 
 append_marker "#VS to Client & Server Profile"
-run_mts_command 'show ltm virtual detail | grep -E "Ltm::Virtual Server|Ltm::ClientSSL Profile|Ltm::ServerSSL Profile"'
+run_mts_grep \
+    'show ltm virtual detail | grep -E "Ltm::Virtual Server|Ltm::ClientSSL Profile|Ltm::ServerSSL Profile"' \
+    'show ltm virtual detail' \
+    'Ltm::Virtual Server|Ltm::ClientSSL Profile|Ltm::ServerSSL Profile'
 
 append_marker "#Client & Server Profile to Cert"
-run_mts_command 'list ltm profile client-ssl cert | grep -E "ltm profile|cert"'
-run_mts_command 'list ltm profile server-ssl cert | grep -E "ltm profile|cert"'
+run_mts_grep \
+    'list ltm profile client-ssl cert | grep -E "ltm profile|cert"' \
+    'list ltm profile client-ssl cert' \
+    'ltm profile|cert'
+run_mts_grep \
+    'list ltm profile server-ssl cert | grep -E "ltm profile|cert"' \
+    'list ltm profile server-ssl cert' \
+    'ltm profile|cert'
 
 append_marker "#Certificate to Serial"
-run_mts_command 'list sys file ssl-cert all-properties | grep -E "sys file|serial-number"'
+run_mts_grep \
+    'list sys file ssl-cert all-properties | grep -E "sys file|serial-number"' \
+    'list sys file ssl-cert all-properties' \
+    'sys file|serial-number'
 
 append_marker "#Pools Data"
-run_mts_command 'show ltm virtual detail | grep -E "Ltm::Virtual Server|Ltm::Pool|Ltm::Node"'
+run_mts_grep \
+    'show ltm virtual detail | grep -E "Ltm::Virtual Server|Ltm::Pool|Ltm::Node"' \
+    'show ltm virtual detail' \
+    'Ltm::Virtual Server|Ltm::Pool|Ltm::Node'
 
 mv "$OUT_TMP" "$OUT_FILE"
 
