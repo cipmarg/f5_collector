@@ -1,0 +1,476 @@
+let
+    TasksRaw = PlanningDetails,
+    PacksRaw = Pack_List,
+
+    PhaseMap =
+        #table(
+            type table [WBSKey = text, Phase = text, PhaseOrder = Int64.Type],
+            {
+                {"1", "Preparation", 1},
+                {"7", "Hardware Deployment", 2},
+                {"3", "Base F5 Tenant and ACI Build", 3},
+                {"2", "NTAiR", 4},
+                {"4", "Main Build", 5},
+                {"5", "Final Migration Checks", 6},
+                {"6", "Change Management", 7},
+                {"8", "Decommission", 8},
+                {"9.17", "NTAIR submitted", 9}
+            }
+        ),
+
+    PhaseColumns =
+        {
+            "Preparation",
+            "Hardware Deployment",
+            "Base F5 Tenant and ACI Build",
+            "NTAiR",
+            "Main Build",
+            "Final Migration Checks",
+            "Change Management",
+            "Decommission",
+            "NTAIR submitted"
+        },
+
+    PhaseRAGColumns =
+        List.Transform(
+            PhaseColumns,
+            each _ & " RAG"
+        ),
+
+    InterleavedPhaseColumns =
+        List.Combine(
+            List.Transform(
+                PhaseColumns,
+                each { _ & " RAG", _ }
+            )
+        ),
+
+    FirstNonBlank =
+        (Values as list) as any =>
+            let
+                Clean =
+                    List.Select(
+                        Values,
+                        each _ <> null and Text.Trim(Text.From(_)) <> ""
+                    )
+            in
+                if List.IsEmpty(Clean) then null else Clean{0},
+
+    TasksClean =
+        Table.TransformColumns(
+            TasksRaw,
+            {
+                {"Migration Package", each if _ = null then null else Text.Trim(Text.From(_)), type text},
+                {"TechTracker Filename", each if _ = null then null else Text.Trim(Text.From(_)), type text},
+                {"Tech Tracker Link", each if _ = null then null else Text.Trim(Text.From(_)), type text},
+                {"WBS", each if _ = null then null else Text.Trim(Text.From(_)), type text},
+                {"Status", each if _ = null then "" else Text.Trim(Text.From(_)), type text},
+                {"AT", each if _ = null then "" else Text.Trim(Text.From(_)), type text},
+                {"ATCode", each if _ = null then "" else Text.Trim(Text.From(_)), type text},
+                {"RAG", each try Number.From(_) otherwise null, Int64.Type},
+                {"Overall RAG", each try Number.From(_) otherwise null, Int64.Type},
+                {"Tracker Version", each try Number.From(_) otherwise null, type nullable number}
+            },
+            null,
+            MissingField.Ignore
+        ),
+
+    TrackerLinks =
+        Table.Group(
+            TasksClean,
+            {"Migration Package"},
+            {
+                {"TT", each FirstNonBlank([Tech Tracker Link]), type text}
+            }
+        ),
+
+    TrackerMeta =
+        Table.Group(
+            TasksClean,
+            {"Migration Package"},
+            {
+                {"Tracker Version", each FirstNonBlank([Tracker Version]), type nullable number},
+                {"Overall RAG", each FirstNonBlank([Overall RAG]), Int64.Type},
+                {"Overall Status Description", each FirstNonBlank([Overall Status Description]), type text},
+                {"Prep Progress", each FirstNonBlank([Prep Progress]), type text},
+                {"Decom Progress", each FirstNonBlank([Decom Progress]), type text},
+                {"DM Progress", each FirstNonBlank([DM Progress]), type text}
+            }
+        ),
+
+    AddWBSKey =
+        Table.AddColumn(
+            TasksClean,
+            "WBSKey",
+            each
+                let
+                    WBSValue =
+                        if [WBS] = null then
+                            ""
+                        else
+                            Text.Trim(Text.From([WBS])),
+
+                    PrefixValue =
+                        try Text.Split(WBSValue, "."){0}
+                        otherwise WBSValue,
+
+                    ExactKeys =
+                        PhaseMap[WBSKey]
+                in
+                    if List.Contains(ExactKeys, WBSValue) then
+                        WBSValue
+                    else
+                        PrefixValue,
+            type text
+        ),
+
+    MergePhase =
+        Table.NestedJoin(
+            AddWBSKey,
+            {"WBSKey"},
+            PhaseMap,
+            {"WBSKey"},
+            "PhaseMap",
+            JoinKind.LeftOuter
+        ),
+
+    ExpandPhase =
+        Table.ExpandTableColumn(
+            MergePhase,
+            "PhaseMap",
+            {"Phase", "PhaseOrder"},
+            {"Phase", "PhaseOrder"}
+        ),
+
+    PhaseRAGRows =
+        Table.SelectRows(
+            ExpandPhase,
+            each [Phase] <> null
+                and [RAG] <> null
+                and [WBS] <> null
+                and Text.Trim(Text.From([WBS])) = Text.Trim(Text.From([WBSKey]))
+        ),
+
+    PhaseRAGGrouped =
+        Table.Group(
+            PhaseRAGRows,
+            {"Migration Package", "Phase"},
+            {
+                {
+                    "Phase RAG",
+                    each FirstNonBlank([RAG]),
+                    Int64.Type
+                }
+            }
+        ),
+
+    PhaseRAGPivoted =
+        Table.Pivot(
+            PhaseRAGGrouped,
+            PhaseColumns,
+            "Phase",
+            "Phase RAG",
+            List.Max
+        ),
+
+    PhaseRAGRenamed =
+        Table.RenameColumns(
+            PhaseRAGPivoted,
+            List.Zip(
+                {
+                    PhaseColumns,
+                    PhaseRAGColumns
+                }
+            ),
+            MissingField.Ignore
+        ),
+
+    TaskRowsOnly =
+        Table.SelectRows(
+            ExpandPhase,
+            each [WBS] <> null
+                and Text.Contains(Text.From([WBS]), ".")
+                and [Phase] <> null
+        ),
+
+    AddATIncluded =
+        Table.AddColumn(
+            TaskRowsOnly,
+            "ATIncluded",
+            each
+                let
+                    IsNew =
+                        try [Is New Tracker] = true otherwise false,
+
+                    ATText =
+                        Text.Upper(Text.Trim(Text.From([AT]))),
+
+                    Code =
+                        Text.Upper(Text.Trim(Text.From([ATCode]))),
+
+                    Tokens =
+                        List.Transform(
+                            Text.Split(ATText, ","),
+                            each Text.Trim(_)
+                        )
+                in
+                    if not IsNew then
+                        true
+                    else if Code = "" then
+                        false
+                    else
+                        List.Contains(Tokens, Code),
+            type logical
+        ),
+
+    IncludedRows =
+        Table.SelectRows(
+            AddATIncluded,
+            each [ATIncluded] = true
+        ),
+
+    AddEligible =
+        Table.AddColumn(
+            IncludedRows,
+            "EligibleTask",
+            each
+                let
+                    s = Text.Upper(Text.Trim(Text.From([Status])))
+                in
+                    if s = "N/A" or s = "" then 0 else 1,
+            Int64.Type
+        ),
+
+    AddCompleted =
+        Table.AddColumn(
+            AddEligible,
+            "CompletedTask",
+            each
+                let
+                    s = Text.Upper(Text.Trim(Text.From([Status])))
+                in
+                    if s = "COMPLETED" or s = "COMPLETE" then 1 else 0,
+            Int64.Type
+        ),
+
+    GroupedProgress =
+        Table.Group(
+            AddCompleted,
+            {"Migration Package", "Phase"},
+            {
+                {"Eligible Tasks", each List.Sum([EligibleTask]), Int64.Type},
+                {"Completed Tasks", each List.Sum([CompletedTask]), Int64.Type}
+            }
+        ),
+
+    AddProgress =
+        Table.AddColumn(
+            GroupedProgress,
+            "Completed %",
+            each
+                if [Eligible Tasks] = 0 then null
+                else [Completed Tasks] / [Eligible Tasks],
+            Percentage.Type
+        ),
+
+    KeepProgress =
+        Table.SelectColumns(
+            AddProgress,
+            {"Migration Package", "Phase", "Completed %"}
+        ),
+
+    ProgressPivoted =
+        Table.Pivot(
+            KeepProgress,
+            PhaseColumns,
+            "Phase",
+            "Completed %",
+            List.Max
+        ),
+
+    PacksKeep =
+        Table.SelectColumns(
+            PacksRaw,
+            {
+                "Migration Package",
+                "Prep Start Date",
+                "Migration Date",
+                "Migration type",
+                "Project Manager",
+                "Migration Engineer"
+            },
+            MissingField.UseNull
+        ),
+
+    PacksClean =
+        Table.TransformColumns(
+            PacksKeep,
+            {
+                {"Migration Package", each if _ = null then null else Text.Trim(Text.From(_)), type text},
+                {"Prep Start Date", each try Date.From(_, "en-GB") otherwise null, type nullable date},
+                {"Migration Date", each try Date.From(_, "en-GB") otherwise null, type nullable date},
+                {"Migration type", each if _ = null then null else Text.Trim(Text.From(_)), type text},
+                {"Project Manager", each if _ = null then null else Text.From(_), type text},
+                {"Migration Engineer", each if _ = null then null else Text.From(_), type text}
+            },
+            null,
+            MissingField.Ignore
+        ),
+
+    MergeLinks =
+        Table.NestedJoin(
+            PacksClean,
+            {"Migration Package"},
+            TrackerLinks,
+            {"Migration Package"},
+            "TrackerLinks",
+            JoinKind.LeftOuter
+        ),
+
+    ExpandLinks =
+        Table.ExpandTableColumn(
+            MergeLinks,
+            "TrackerLinks",
+            {"TT"},
+            {"TT"}
+        ),
+
+    MergeMeta =
+        Table.NestedJoin(
+            ExpandLinks,
+            {"Migration Package"},
+            TrackerMeta,
+            {"Migration Package"},
+            "TrackerMeta",
+            JoinKind.LeftOuter
+        ),
+
+    ExpandMeta =
+        Table.ExpandTableColumn(
+            MergeMeta,
+            "TrackerMeta",
+            {
+                "Tracker Version",
+                "Overall RAG",
+                "Overall Status Description",
+                "Prep Progress",
+                "Decom Progress",
+                "DM Progress"
+            },
+            {
+                "Tracker Version",
+                "Overall RAG",
+                "Overall Status Description",
+                "Prep Progress",
+                "Decom Progress",
+                "DM Progress"
+            }
+        ),
+
+    MergeProgress =
+        Table.NestedJoin(
+            ExpandMeta,
+            {"Migration Package"},
+            ProgressPivoted,
+            {"Migration Package"},
+            "PhaseProgress",
+            JoinKind.LeftOuter
+        ),
+
+    ExpandProgress =
+        Table.ExpandTableColumn(
+            MergeProgress,
+            "PhaseProgress",
+            PhaseColumns,
+            PhaseColumns
+        ),
+
+    MergePhaseRAG =
+        Table.NestedJoin(
+            ExpandProgress,
+            {"Migration Package"},
+            PhaseRAGRenamed,
+            {"Migration Package"},
+            "PhaseRAG",
+            JoinKind.LeftOuter
+        ),
+
+    ExpandPhaseRAG =
+        Table.ExpandTableColumn(
+            MergePhaseRAG,
+            "PhaseRAG",
+            PhaseRAGColumns,
+            PhaseRAGColumns
+        ),
+
+    AddMigrationWeek =
+        Table.AddColumn(
+            ExpandPhaseRAG,
+            "Migration Week",
+            each
+                if [Migration Date] = null then
+                    null
+                else
+                    "Week " & Text.From(Date.WeekOfYear([Migration Date], Day.Monday)),
+            type text
+        ),
+
+    RenameEngineer =
+        Table.RenameColumns(
+            AddMigrationWeek,
+            {{"Migration Engineer", "Engineer"}},
+            MissingField.Ignore
+        ),
+
+    Final =
+        Table.ReorderColumns(
+            RenameEngineer,
+            {
+                "Migration Week",
+                "Migration Package",
+                "Prep Start Date",
+                "Migration Date",
+                "Migration type",
+                "TT",
+                "Project Manager",
+                "Engineer",
+                "Tracker Version",
+                "Overall RAG",
+                "Overall Status Description",
+                "Prep Progress",
+                "Decom Progress",
+                "DM Progress"
+            }
+            & InterleavedPhaseColumns,
+            MissingField.Ignore
+        ),
+
+    AddSortDate =
+        Table.AddColumn(
+            Final,
+            "__SortDate",
+            each
+                if [Migration Date] = null then
+                    #date(9999, 12, 31)
+                else
+                    [Migration Date],
+            type date
+        ),
+
+    Sorted =
+        Table.Sort(
+            AddSortDate,
+            {
+                {"__SortDate", Order.Ascending},
+                {"Migration Package", Order.Ascending}
+            }
+        ),
+
+    RemovedSortDate =
+        Table.RemoveColumns(
+            Sorted,
+            {"__SortDate"},
+            MissingField.Ignore
+        )
+in
+    RemovedSortDate

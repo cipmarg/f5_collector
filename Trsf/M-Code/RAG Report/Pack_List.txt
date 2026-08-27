@@ -1,0 +1,89 @@
+let
+    Source =
+        Excel.Workbook(
+            Web.Contents(
+              ""
+            ),
+            null,
+            true
+        ),
+
+    Pack_List_Table =
+        Source{[Item="Pack_List",Kind="Table"]}[Data],
+
+    #"Changed Type1" =
+        Table.TransformColumnTypes(
+            Pack_List_Table,
+            {
+                {"Hostname", type text},
+                {"MP", type text},
+                {"Migration Package", type text},
+                {"Prep Start Date", type any},
+                {"Migration Date", type any},
+                {"Pack Members", type text},
+                {"Equivalent#(lf)Pack", type text},
+                {"Silo", type text},
+                {"Migration type", type text},
+                {"Status", type text},
+                {"Region", type text},
+                {"Location", type text},
+                {"Purpose", type any},
+                {"Environment", type any},
+                {"Environment _ 1", type text},
+                {"Environment _ 2", type any},
+                {"Quarter", type text},
+                {"Project Manager", type text},
+                {"Technical Lead", type text},
+                {"Migration Engineer", type text},
+                {"ACI#(lf)Engineer", type text},
+                {"Migration#(lf)Change", type text},
+                {"Migration time #(lf)BST TIME zone", type text},
+                {"Testing#(lf)Change", type text},
+                {"Testing time #(lf)BST TIME zone", type text},
+                {"NetOps #(lf)Change folder", type text},
+                {"Command Centre channel", type text},
+                {"Decomm Engineer", type text},
+                {"Decomm #(lf)Change ref", type text},
+                {"Installation#(lf)AIR Ref", type text},
+                {"Installation#(lf)AIR status", type text},
+                {"Decommission#(lf)Reverse AIR Ref", type text},
+                {"Decommission#(lf)Reverse AIR Status", type text},
+                {"Decommission#(lf)AIR Completion Date", type any},
+                {"Decommission#(lf)AIR Assignee", type text},
+                {"Comments", type text}
+            },
+            [Culture = "en-GB", MissingField = MissingField.Ignore]
+        ),
+
+    #"Removed Columns" =
+        Table.RemoveColumns(
+            #"Changed Type1",
+            {"MP"},
+            MissingField.Ignore
+        ),
+
+    #"Changed Type" =
+        Table.TransformColumns(
+            #"Removed Columns",
+            {
+                {
+                    "Migration Date",
+                    each try Date.From(_, "en-GB") otherwise null,
+                    type nullable date
+                },
+                {
+                    "Prep Start Date",
+                    each try Date.From(_, "en-GB") otherwise null,
+                    type nullable date
+                },
+                {
+                    "Decommission#(lf)AIR Completion Date",
+                    each try Date.From(_, "en-GB") otherwise null,
+                    type nullable date
+                }
+            },
+            null,
+            MissingField.Ignore
+        )
+in
+    #"Changed Type"

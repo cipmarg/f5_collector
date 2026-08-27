@@ -1,0 +1,161 @@
+let
+    Source =
+        Excel.Workbook(
+            Web.Contents(
+                ""
+            ),
+            null,
+            true
+        ),
+
+    PlanningDetails_Table =
+        Source{[Item="PlanningDetails",Kind="Table"]}[Data],
+
+    #"Kept Columns" =
+        Table.SelectColumns(
+            PlanningDetails_Table,
+            {
+                "Migration Package",
+                "TechTracker Filename"
+            },
+            MissingField.UseNull
+        ),
+
+    #"Changed Type" =
+        Table.TransformColumnTypes(
+            #"Kept Columns",
+            {
+                {"Migration Package", type text},
+                {"TechTracker Filename", type text}
+            },
+            [Culture = "en-GB", MissingField = MissingField.Ignore]
+        ),
+
+    #"Filtered Rows" =
+        Table.SelectRows(
+            #"Changed Type",
+            each [TechTracker Filename] <> null
+                and Text.Trim([TechTracker Filename]) <> ""
+                and Text.Upper(Text.Trim([TechTracker Filename])) <> "NOT FOUND"
+        ),
+
+    FixedPath =
+        "",
+
+    #"Added Expected Full Path" =
+        Table.AddColumn(
+            #"Filtered Rows",
+            "Expected Full Path",
+            each FixedPath & [Migration Package] & "/" & [TechTracker Filename],
+            type text
+        ),
+
+    SPFiles =
+        SharePoint.Files(
+            "",
+            [ApiVersion = 15]
+        ),
+
+    #"Filtered SPFiles" =
+        Table.SelectRows(
+            SPFiles,
+            each Text.StartsWith([Folder Path], FixedPath)
+        ),
+
+    #"Added Actual Full Path" =
+        Table.AddColumn(
+            #"Filtered SPFiles",
+            "Actual Full Path",
+            each [Folder Path] & [Name],
+            type text
+        ),
+
+    #"Merged Files" =
+        Table.NestedJoin(
+            #"Added Expected Full Path",
+            {"Expected Full Path"},
+            #"Added Actual Full Path",
+            {"Actual Full Path"},
+            "SPFile",
+            JoinKind.Inner
+        ),
+
+    #"Expanded File" =
+        Table.ExpandTableColumn(
+            #"Merged Files",
+            "SPFile",
+            {"Content"},
+            {"Content"}
+        ),
+
+    #"Added Tech Tracker Link" =
+        Table.AddColumn(
+            #"Expanded File",
+            "Tech Tracker Link",
+            each [Expected Full Path],
+            type text
+        ),
+
+    #"Invoked Function" =
+        Table.AddColumn(
+            #"Added Tech Tracker Link",
+            "TT Values",
+            each fnReadTechTracker([Content], [Migration Package])
+        ),
+
+    #"Expanded TT Values" =
+        Table.ExpandTableColumn(
+            #"Invoked Function",
+            "TT Values",
+            {
+                "Migration Package",
+                "Hostname",
+                "WBS",
+                "Activity",
+                "Owner",
+                "Status",
+                "RAG",
+                "AT",
+                "Tracker Version",
+                "Is New Tracker",
+                "Tracker Migration Type",
+                "ATCode",
+                "Overall RAG",
+                "Overall Status Description",
+                "Prep Progress",
+                "Decom Progress",
+                "DM Progress"
+            },
+            {
+                "TT Migration Package",
+                "Hostname",
+                "WBS",
+                "Activity",
+                "Owner",
+                "Status",
+                "RAG",
+                "AT",
+                "Tracker Version",
+                "Is New Tracker",
+                "Tracker Migration Type",
+                "ATCode",
+                "Overall RAG",
+                "Overall Status Description",
+                "Prep Progress",
+                "Decom Progress",
+                "DM Progress"
+            }
+        ),
+
+    #"Removed Helper Columns" =
+        Table.RemoveColumns(
+            #"Expanded TT Values",
+            {
+                "Content",
+                "Expected Full Path",
+                "TT Migration Package"
+            },
+            MissingField.Ignore
+        )
+in
+    #"Removed Helper Columns"

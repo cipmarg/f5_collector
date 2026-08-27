@@ -1,0 +1,430 @@
+(FileContent as binary, MigrationPackage as text) as table =>
+let
+    Workbook =
+        Excel.Workbook(FileContent, null, true),
+
+    Summary_Sheet =
+        Workbook{[Item="Summary",Kind="Sheet"]}[Data],
+
+    GetCell =
+        (RowIndex as number, ColumnIndex as number) as any =>
+            try Record.Field(Summary_Sheet{RowIndex}, "Column" & Text.From(ColumnIndex))
+            otherwise null,
+
+    FirstNonBlank =
+        (Values as list) as any =>
+            let
+                Clean =
+                    List.Select(
+                        Values,
+                        each _ <> null and Text.Trim(Text.From(_)) <> ""
+                    )
+            in
+                if List.IsEmpty(Clean) then null else Clean{0},
+
+    GetDefinedNameValue =
+        (Name as text) as any =>
+            let
+                NamedTable =
+                    try Workbook{[Item=Name,Kind="DefinedName"]}[Data]
+                    otherwise null,
+
+                Columns =
+                    if NamedTable is table then
+                        Table.ColumnNames(NamedTable)
+                    else
+                        {},
+
+                Value =
+                    if NamedTable is table
+                        and Table.RowCount(NamedTable) > 0
+                        and List.Count(Columns) > 0
+                    then
+                        Record.Field(NamedTable{0}, Columns{0})
+                    else
+                        null
+            in
+                Value,
+
+    ToText =
+        (Value as any) as nullable text =>
+            if Value = null then
+                null
+            else
+                Text.Trim(Text.From(Value)),
+
+    ToNumber =
+        (Value as any) as nullable number =>
+            let
+                Direct =
+                    try Number.From(Value) otherwise null,
+
+                FromText =
+                    if Direct <> null then
+                        Direct
+                    else
+                        try Number.FromText(Text.Trim(Text.From(Value)), "en-US") otherwise null
+            in
+                FromText,
+
+    NormalizeWBS =
+        (Value as any) as text =>
+            let
+                RawText =
+                    if Value = null then
+                        ""
+                    else
+                        Text.Trim(Text.From(Value)),
+
+                AsNumber =
+                    ToNumber(Value),
+
+                Result =
+                    if Value = null then
+                        ""
+                    else if Value.Is(Value, type number) and AsNumber <> null then
+                        Number.ToText(Number.Round(AsNumber, 3), "0.###", "en-US")
+                    else if AsNumber <> null and Text.Contains(RawText, "999999") then
+                        Number.ToText(Number.Round(AsNumber, 3), "0.###", "en-US")
+                    else
+                        RawText
+            in
+                Result,
+
+    GetFieldAny =
+        (Row as record, FieldNames as list) as any =>
+            let
+                Values =
+                    List.Transform(
+                        FieldNames,
+                        each try Record.Field(Row, _) otherwise null
+                    )
+            in
+                FirstNonBlank(Values),
+
+    GetFieldText =
+        (Row as record, FieldNames as list) as nullable text =>
+            ToText(GetFieldAny(Row, FieldNames)),
+
+    TrackerVersionRaw =
+        FirstNonBlank(
+            {
+                GetDefinedNameValue("TemplateVersion"),
+                GetCell(0, 5)
+            }
+        ),
+
+    TrackerVersion =
+        ToNumber(TrackerVersionRaw),
+
+    IsNewTracker =
+        TrackerVersion <> null and TrackerVersion > 2,
+
+    TrackerMigrationType =
+        FirstNonBlank(
+            {
+                GetDefinedNameValue("Migration_Type"),
+                GetCell(2, 4)
+            }
+        ),
+
+    TrackerMigrationTypeText =
+        if TrackerMigrationType = null then
+            null
+        else
+            Text.Trim(Text.From(TrackerMigrationType)),
+
+    MigrationTypeKey =
+        if TrackerMigrationTypeText = null then
+            ""
+        else
+            Text.Upper(
+                Text.Replace(
+                    Text.Replace(
+                        TrackerMigrationTypeText,
+                        "-",
+                        ""
+                    ),
+                    " ",
+                    ""
+                )
+            ),
+
+    ATCode =
+        if Text.Contains(MigrationTypeKey, "3DF") then
+            "3DF"
+        else if Text.Contains(MigrationTypeKey, "TYPE1") then
+            "T1"
+        else if Text.Contains(MigrationTypeKey, "TYPE2") then
+            "T2"
+        else if Text.Contains(MigrationTypeKey, "TYPE3") then
+            "T3"
+        else if Text.Contains(MigrationTypeKey, "DECOM") then
+            "DCM"
+        else
+            null,
+
+    TenantRow =
+        try
+            Table.SelectRows(
+                Summary_Sheet,
+                each Text.Trim(Text.From([Column1])) = "F5 Tenant/VE #1"
+            ){0}
+        otherwise
+            null,
+
+    HostName =
+        if TenantRow = null then
+            null
+        else
+            FirstNonBlank(
+                {
+                    try TenantRow[Column3] otherwise null,
+                    try TenantRow[Column2] otherwise null,
+                    try TenantRow[Column4] otherwise null
+                }
+            ),
+
+    PrepProgress =
+        FirstNonBlank(
+            {
+                GetCell(8, 8),
+                GetDefinedNameValue("Prep_Progress")
+            }
+        ),
+
+    DecomProgress =
+        FirstNonBlank(
+            {
+                GetCell(9, 8),
+                GetDefinedNameValue("Decom_Progress")
+            }
+        ),
+
+    DMProgress =
+        FirstNonBlank(
+            {
+                GetCell(10, 8),
+                GetDefinedNameValue("DM_Progress")
+            }
+        ),
+
+    OverallRAG =
+        ToNumber(GetCell(11, 7)),
+
+    OverallStatusDescription =
+        ToText(GetCell(11, 8)),
+
+    HeaderRowIndex =
+        List.PositionOf(
+            List.Transform(
+                Table.Column(Summary_Sheet, "Column1"),
+                each Text.Trim(Text.From(_))
+            ),
+            "Task"
+        ),
+
+    TaskTableRaw =
+        if HeaderRowIndex >= 0 then
+            Table.Skip(Summary_Sheet, HeaderRowIndex)
+        else
+            #table(type table [Column1 = any], {}),
+
+    TrimmedCells =
+        Table.TransformColumns(
+            TaskTableRaw,
+            List.Transform(
+                Table.ColumnNames(TaskTableRaw),
+                each {_, each if _ is text then Text.Trim(_) else _}
+            )
+        ),
+
+    PromotedHeaders =
+        if Table.RowCount(TrimmedCells) = 0 then
+            #table(
+                type table [
+                    Task = any,
+                    Subtask = any,
+                    Activity = any,
+                    Owner = any,
+                    Status = any,
+                    RAG = any,
+                    AT = any
+                ],
+                {}
+            )
+        else
+            Table.PromoteHeaders(
+                TrimmedCells,
+                [PromoteAllScalars=false]
+            ),
+
+    CleanHeaders =
+        Table.TransformColumnNames(
+            PromotedHeaders,
+            each Text.Trim(_)
+        ),
+
+    AddedWBS =
+        Table.AddColumn(
+            CleanHeaders,
+            "WBS",
+            each
+                let
+                    SubtaskRaw =
+                        GetFieldAny(_, {"Subtask", "Subta"}),
+
+                    TaskRaw =
+                        GetFieldAny(_, {"Task", "Tas"}),
+
+                    SubtaskValue =
+                        NormalizeWBS(SubtaskRaw),
+
+                    TaskValue =
+                        NormalizeWBS(TaskRaw),
+
+                    WBSValue =
+                        if SubtaskValue <> "" and SubtaskValue <> "-" then
+                            SubtaskValue
+                        else if TaskValue <> "" and TaskValue <> "-" then
+                            TaskValue
+                        else
+                            null
+                in
+                    WBSValue,
+            type text
+        ),
+
+    AddedTaskRAG =
+        Table.AddColumn(
+            AddedWBS,
+            "RAG",
+            each ToNumber(GetFieldAny(_, {"RAG", "RA"})),
+            Int64.Type
+        ),
+
+    AddedAT =
+        Table.AddColumn(
+            AddedTaskRAG,
+            "AT",
+            each GetFieldText(_, {"AT"}),
+            type text
+        ),
+
+    AddedHostname =
+        Table.AddColumn(
+            AddedAT,
+            "Hostname",
+            each HostName,
+            type text
+        ),
+
+    AddedMigrationPackage =
+        Table.AddColumn(
+            AddedHostname,
+            "Migration Package",
+            each MigrationPackage,
+            type text
+        ),
+
+    AddedTrackerVersion =
+        Table.AddColumn(
+            AddedMigrationPackage,
+            "Tracker Version",
+            each TrackerVersion,
+            type nullable number
+        ),
+
+    AddedIsNewTracker =
+        Table.AddColumn(
+            AddedTrackerVersion,
+            "Is New Tracker",
+            each IsNewTracker,
+            type logical
+        ),
+
+    AddedTrackerMigrationType =
+        Table.AddColumn(
+            AddedIsNewTracker,
+            "Tracker Migration Type",
+            each TrackerMigrationTypeText,
+            type text
+        ),
+
+    AddedATCode =
+        Table.AddColumn(
+            AddedTrackerMigrationType,
+            "ATCode",
+            each ATCode,
+            type text
+        ),
+
+    AddedOverallRAG =
+        Table.AddColumn(
+            AddedATCode,
+            "Overall RAG",
+            each OverallRAG,
+            Int64.Type
+        ),
+
+    AddedOverallDescription =
+        Table.AddColumn(
+            AddedOverallRAG,
+            "Overall Status Description",
+            each OverallStatusDescription,
+            type text
+        ),
+
+    AddedPrepProgress =
+        Table.AddColumn(
+            AddedOverallDescription,
+            "Prep Progress",
+            each ToText(PrepProgress),
+            type text
+        ),
+
+    AddedDecomProgress =
+        Table.AddColumn(
+            AddedPrepProgress,
+            "Decom Progress",
+            each ToText(DecomProgress),
+            type text
+        ),
+
+    AddedDMProgress =
+        Table.AddColumn(
+            AddedDecomProgress,
+            "DM Progress",
+            each ToText(DMProgress),
+            type text
+        ),
+
+    Result =
+        Table.SelectRows(
+            Table.SelectColumns(
+                AddedDMProgress,
+                {
+                    "Migration Package",
+                    "Hostname",
+                    "WBS",
+                    "Activity",
+                    "Owner",
+                    "Status",
+                    "RAG",
+                    "AT",
+                    "Tracker Version",
+                    "Is New Tracker",
+                    "Tracker Migration Type",
+                    "ATCode",
+                    "Overall RAG",
+                    "Overall Status Description",
+                    "Prep Progress",
+                    "Decom Progress",
+                    "DM Progress"
+                },
+                MissingField.UseNull
+            ),
+            each [WBS] <> null and Text.Trim(Text.From([WBS])) <> ""
+        )
+in
+    Result
