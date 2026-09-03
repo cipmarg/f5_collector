@@ -23,7 +23,7 @@ OUTPUT_FILE="${2:-nethsm_inventory.tsv}"
 SSH_USER="${USER}_net"
 
 VTL_SERVERS_COMMAND='bash -c "/usr/safenet/lunaclient/bin/vtl listServers"'
-HSM_SELF_COMMAND='list net self *HSM* one-line'
+HSM_SELF_COMMAND='list net self one-line | grep -i HSM'
 PARTITION_COMMAND='show sys crypto encrypted-attributes'
 VTL_VERIFY_COMMAND='bash -c "/usr/safenet/lunaclient/bin/vtl verify"'
 
