@@ -205,11 +205,13 @@ def ssh_exec(host, user, password, remote_command):
 def retrieve_version(host, user, password, privileged=False):
     # A regular F5 account may land directly in tmsh, whereas the privileged
     # account may have bash. Try both harmless read-only forms.
-    commands = (
-        ["tmsh -q show sys version", "show sys version"]
-        if privileged
-        else ["show sys version", "tmsh -q show sys version"]
-    )
+    # Both the regular and privileged accounts land in tmsh.
+    # Prefer native tmsh syntax. If we ever need to execute a bash-side
+    # tmsh command, explicitly enter bash with bash -c.
+    commands = [
+        "show sys version",
+        'bash -c "tmsh -q show sys version"',
+    ]
 
     for command in commands:
         rc, out, err = ssh_exec(host, user, password, command)
@@ -217,7 +219,7 @@ def retrieve_version(host, user, password, privileged=False):
         if rc == 0 and re.search(r"\bVersion\b", text, re.I):
             version = None
             build = None
-            hotfix = None
+            edition = None
 
             m = re.search(r"(?mi)^\s*Version\s+(\S+)", text)
             if m:
@@ -227,23 +229,23 @@ def retrieve_version(host, user, password, privileged=False):
             if m:
                 build = m.group(1)
 
-            # Some versions expose a hotfix/product line differently.
-            for pattern in (
-                r"(?mi)^\s*Hotfix\s+(.+?)\s*$",
-                r"(?mi)^\s*Product\s+(.+?Hotfix.+?)\s*$",
-            ):
-                m = re.search(pattern, text)
-                if m:
-                    hotfix = m.group(1).strip()
-                    break
+            m = re.search(r"(?mi)^\s*Edition\s+(.+?)\s*$", text)
+            if m:
+                edition = m.group(1).strip()
+
+            # "Hotfix List" is a heading followed by installed hotfix IDs;
+            # it is not itself the hotfix name.
+            hotfix_ids = sorted(set(re.findall(r"\bID\d+(?:-\d+)?\b", text)))
 
             parts = []
             if version:
                 parts.append(f"version={version}")
             if build:
                 parts.append(f"build={build}")
-            if hotfix:
-                parts.append(f"hotfix={hotfix}")
+            if edition:
+                parts.append(f"edition={edition}")
+            if hotfix_ids:
+                parts.append(f"hotfix_ids={len(hotfix_ids)}")
 
             return True, ", ".join(parts) if parts else first_line(text)
 
@@ -253,7 +255,7 @@ def retrieve_version(host, user, password, privileged=False):
 def test_bash(host, user, password):
     marker = "__F5_ENV_PROBE_BASH_OK__"
     # Harmless: just start bash long enough to print a marker.
-    command = f"bash -c 'printf {marker}'"
+    command = f'bash -c "printf {marker}"'
     rc, out, err = ssh_exec(host, user, password, command)
     return rc == 0 and marker in out
 
@@ -269,7 +271,7 @@ def remote_probe(host):
         add("FAIL", f"{host}: account probe", "USER is not set")
         return
 
-    # Regular account
+    # Regular account (lands in tmsh)
     if regular_pass:
         ok, detail = retrieve_version(host, user, regular_pass, privileged=False)
         if ok:
@@ -292,7 +294,7 @@ def remote_probe(host):
     else:
         add("SKIP", f"{host}: regular-account probe", "SSHPASS not set")
 
-    # Privileged account
+    # Privileged account (also lands in tmsh; use bash -c for bash commands)
     privileged_user = f"{user}_net"
     if privileged_pass:
         ok, detail = retrieve_version(host, privileged_user, privileged_pass, privileged=True)
