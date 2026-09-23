@@ -5,7 +5,9 @@
 F5OS login lands in the appliance CLI. One interactive SSH session is used
 per endpoint. Supply --snapshot-dir on the first live run so unexpected CLI
 output can be checked safely offline. Ctrl+C interrupts the current SSH
-session and continues; Ctrl+\\ terminates the process.
+session and continues; Ctrl+\\ terminates the process. Permission probes use
+short direct SSH calls; NTP synchronization uses the privileged BIG-IP login
+when SSHPASSNET is set.
 """
 
 from __future__ import annotations
@@ -140,6 +142,94 @@ def password_for(kind: str) -> tuple[str, str]:
     if not password:
         raise ValueError(f"No password supplied for {login}")
     return login, password
+
+
+def remote_probe_command(host: str, kind: str, command: str,
+                         host_key_mode: str, timeout: int = 20) -> tuple[int, str]:
+    """Run the same direct SSH command style used by f5_env_probe.py."""
+    username = os.environ["USER"] + ("_net" if kind == "privileged" else "")
+    env = os.environ.copy()
+    env["SSHPASS"] = env["SSHPASSNET" if kind == "privileged" else "SSHPASS"]
+    argv = ["sshpass", "-e", "ssh", "-o", "BatchMode=no",
+            "-o", "NumberOfPasswordPrompts=1", "-o", "ConnectTimeout=8",
+            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+            "-o", "LogLevel=ERROR"]
+    if host_key_mode == "legacy":
+        argv += ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+    else:
+        argv += ["-o", f"StrictHostKeyChecking={host_key_mode}"]
+    argv += ["-l", username, host, command]
+    try:
+        completed = subprocess.run(argv, env=env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, timeout=timeout)
+        return completed.returncode, redact_transcript(completed.stdout.decode("utf-8", "replace"))
+    except subprocess.TimeoutExpired:
+        return 124, f"SSH probe timed out after {timeout}s"
+
+
+def collect_privileged_ntp(host: str, host_key_mode: str) -> dict:
+    rc, raw = remote_probe_command(host, "privileged", NTP_SYNC_COMMAND, host_key_mode)
+    return {"host": host, "cli": "bigip", "account": "privileged",
+            "commands": [NTP_SYNC_COMMAND], "returncode": rc,
+            "error": None if rc == 0 else f"Privileged ntpq command exited {rc}; inspect snapshot",
+            "raw": raw, "sections": {NTP_SYNC_COMMAND: raw}}
+
+
+def check_permissions(reporter: Reporter, manifest: dict, host_key_mode: str,
+                      *, offline: bool, check_system: bool, check_bigip: bool) -> None:
+    """Check the jump-host credentials and both BIG-IP roles before collection."""
+    print("\nUser permissions")
+    if offline:
+        reporter.add("SKIP", "SSH permission probe", "Offline snapshot mode")
+        return
+    username = os.environ.get("USER")
+    reporter.add("PASS" if username else "FAIL", "Regular username",
+                 f"{username} (privileged: {username}_net)" if username else "USER is not set")
+    for tool in ("ssh", "sshpass"):
+        reporter.add("PASS" if shutil.which(tool) else "FAIL", f"Jump host {tool}",
+                     "available" if shutil.which(tool) else "not found")
+    regular = bool(os.environ.get("SSHPASS"))
+    privileged = bool(os.environ.get("SSHPASSNET"))
+    reporter.add("PASS" if regular else "WARN", "SSHPASS",
+                 "set" if regular else "not set; regular collection will prompt and regular permission checks are skipped")
+    reporter.add("PASS" if privileged else "WARN", "SSHPASSNET",
+                 "set" if privileged else "not set; privileged permission checks"
+                 + (" and NTP synchronization" if check_system else "") + " are skipped")
+    if not check_bigip or not username or not shutil.which("ssh") or not shutil.which("sshpass"):
+        return
+    seen: set[str] = set()
+    for side in ("a", "b"):
+        for role in ("source", "target"):
+            host = manifest["devices"][side][role]["ssh_host"]
+            if host.casefold() in seen:
+                continue
+            seen.add(host.casefold())
+            label = f"{side.upper()} {role} {host}"
+            if regular:
+                rc, output = remote_probe_command(host, "regular", "show sys version", host_key_mode)
+                connected = rc == 0 and bool(BIGIP_READY.search(output))
+                reporter.add("PASS" if connected else "FAIL", f"{label} regular SSH/tmsh",
+                             "show sys version succeeded" if connected else f"Version probe failed (exit {rc})")
+                if connected:
+                    rc, output = remote_probe_command(host, "regular",
+                                                      'bash -c "printf __F5_PERMISSION_BASH_OK__"', host_key_mode)
+                    unrestricted = rc == 0 and "__F5_PERMISSION_BASH_OK__" in output
+                    restricted = not unrestricted and rc not in (124, 255)
+                    reporter.add("FAIL" if unrestricted else "PASS" if restricted else "WARN",
+                                 f"{label} regular bash restriction",
+                                 "regular user can enter bash" if unrestricted else
+                                 "regular user cannot enter bash" if restricted else "bash restriction probe could not complete")
+            if privileged:
+                rc, output = remote_probe_command(host, "privileged", "show sys version", host_key_mode)
+                connected = rc == 0 and bool(BIGIP_READY.search(output))
+                reporter.add("PASS" if connected else "FAIL", f"{label} privileged SSH/tmsh",
+                             "show sys version succeeded" if connected else f"Version probe failed (exit {rc})")
+                if connected:
+                    rc, output = remote_probe_command(host, "privileged",
+                                                      'bash -c "printf __F5_PERMISSION_BASH_OK__"', host_key_mode)
+                    allowed = rc == 0 and "__F5_PERMISSION_BASH_OK__" in output
+                    reporter.add("PASS" if allowed else "WARN", f"{label} privileged bash access",
+                                 "bash available" if allowed else "bash access not confirmed")
 
 
 def collect_ssh(host: str, cli: str, commands: list[str], account: str,
@@ -325,7 +415,7 @@ NETWORK_COMMANDS = {"vlan": "list net vlan one-line", "self": "list net self one
 ROUTE_COMMANDS = {"traffic": "list net route one-line",
                   "management": "list sys management-route one-line"}
 SYSTEM_COMMANDS = {"dns": "list sys dns one-line", "ntp": "list sys ntp one-line"}
-NTP_SYNC_COMMAND = 'run util bash -c "ntpq -np"'
+NTP_SYNC_COMMAND = 'bash -c "ntpq -np"'
 
 
 def tmsh_objects(output: str, kind: str) -> dict[str, str]:
@@ -395,6 +485,13 @@ def route_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | None, 
         return None, error
     try:
         component = "route" if kind == "traffic" else "sys management-route"
+        if not output or not output.strip():
+            raw = clean_transcript(record.get("raw", "")) if record else ""
+            if re.search(r"(?m)^\s*" + (r"net\s+route" if kind == "traffic" else r"sys\s+management-route") + r"\s+\S+\s*\{", raw):
+                output = raw
+            elif not (record and re.search(r"(?i)no entries (?:found|to display)",
+                                           record.get("sections", {}).get(command, ""))):
+                return None, f"{command} returned no parseable output; cannot verify empty inventory"
         objects = tmsh_objects(output or "", component)
         if not objects and output.strip() and not re.search(r"(?i)no entries (?:found|to display)", output):
             return None, f"No {component} objects parsed; inspect raw snapshot"
@@ -423,25 +520,33 @@ def system_data(record: dict | None, kind: str) -> tuple[dict[str, object] | Non
         return None, error
     try:
         header = re.search(r"(?m)^\s*sys\s+" + re.escape(kind) + r"\s*\{", output or "")
+        if not header and record:
+            raw = clean_transcript(record.get("raw", ""))
+            header = re.search(r"(?m)^\s*sys\s+" + re.escape(kind) + r"\s*\{", raw)
+            if header:
+                output = raw
         if not header:
             return None, f"No sys {kind} object found; inspect raw snapshot"
         body = tmsh_block((output or "")[header.start():], kind)
         if body is None:
             raise ValueError(f"Incomplete sys {kind} object")
-        fields = tmsh_fields(body)
         lists = ("name-servers", "search") if kind == "dns" else ("servers",)
         result: dict[str, object] = {}
         for field in lists:
-            value = fields.get(field, "none")
-            result[field] = () if value == "none" else value
-            if not isinstance(result[field], tuple):
-                raise ValueError(f"sys {kind}: unexpected {field} value {value!r}")
+            contents = tmsh_block(body, field)
+            if contents is None:
+                if (value := tmsh_property(body, field)) not in (None, "none"):
+                    raise ValueError(f"sys {kind}: unexpected {field} value {value!r}")
+                result[field] = ()
+            else:
+                result[field] = tuple(token.strip('"') for token in
+                                      re.findall(r'"(?:\\.|[^"\\])*"|[^\s{}]+', contents))
         if kind == "dns":
-            result["number-of-dots"] = fields.get("number-of-dots")
+            result["number-of-dots"] = tmsh_property(body, "number-of-dots")
         else:
-            if not fields.get("timezone"):
+            if not (timezone := tmsh_property(body, "timezone")):
                 raise ValueError("sys ntp: timezone missing")
-            result["timezone"] = fields["timezone"]
+            result["timezone"] = timezone
         return result, None
     except ValueError as exc:
         return None, str(exc)
@@ -1047,26 +1152,35 @@ def compare_system(reporter: Reporter, side: str, source: dict | None,
             original, actual = old.get(setting), new.get(setting)
             if original is None and actual is None:
                 continue
-            reporter.add("PASS" if original == actual else "WARN",
+            status = "PASS" if original == actual else ("FAIL" if kind == "ntp" and setting == "timezone" else "WARN")
+            reporter.add(status,
                          f"{side.upper()} {kind} {setting}",
                          f"source={original!r} target={actual!r}")
 
 
-def compare_ntp_sync(reporter: Reporter, side: str, target: dict | None) -> None:
-    output, error = inventory_section(target, NTP_SYNC_COMMAND)
+def compare_ntp_sync(reporter: Reporter, side: str, role: str, record: dict | None) -> None:
+    ntp_record = record.get("privileged_ntp") if record else None
+    if ntp_record is None:
+        reporter.add("SKIP", f"{side.upper()} {role} NTP synchronization",
+                     "Privileged ntpq output absent; set SSHPASSNET and collect new snapshots")
+        return
+    output, error = inventory_section(ntp_record, NTP_SYNC_COMMAND)
     if error:
-        reporter.add("ERROR", f"{side.upper()} target NTP synchronization", error)
+        reporter.add("ERROR", f"{side.upper()} {role} NTP synchronization", error)
         return
     # ntpq marks the selected system peer with '*', immediately before its address.
-    peers = re.findall(r"(?m)^\s*\*(\S+)\s+", output or "")
+    peers = re.findall(r"(?m)^\s*\*(\S+)\s+\S+\s+\d+\s+\S+\s+\S+\s+\d+\s+([0-7]{1,3})\s+", output or "")
+    label = f"{side.upper()} {role} NTP synchronization"
     if peers:
-        reporter.add("PASS", f"{side.upper()} target NTP synchronization", f"selected peer={peers[0]}")
+        address, reach = peers[0]
+        reporter.add("PASS" if int(reach, 8) else ("FAIL" if role == "target" else "WARN"),
+                     label, f"selected peer={address} reach={reach}")
     elif re.search(r"(?m)^\s*[+ox#-]?\S+\s+\S+\s+\d+\s+\S+\s+", output or ""):
-        reporter.add("WARN", f"{side.upper()} target NTP synchronization", "ntpq listed peers but none is selected")
+        reporter.add("FAIL" if role == "target" else "WARN", label, "ntpq listed peers but none is selected")
     elif re.search(r"(?i)no association|no peers", output or ""):
-        reporter.add("WARN", f"{side.upper()} target NTP synchronization", "ntpq reported no peers")
+        reporter.add("FAIL" if role == "target" else "WARN", label, "ntpq reported no peers")
     else:
-        reporter.add("ERROR", f"{side.upper()} target NTP synchronization", "Unrecognized ntpq output; inspect raw snapshot")
+        reporter.add("ERROR", label, "Unrecognized ntpq output; inspect raw snapshot")
 
 
 def main() -> int:
@@ -1075,7 +1189,7 @@ def main() -> int:
     ap.add_argument("--checks", default="basic,platform", help="basic,platform,network,routes,system,all and !category exclusions")
     ap.add_argument("--filter", metavar="STATUSES", help="show only listed result labels, e.g. FAIL or FAIL,ERROR; summary still counts all")
     ap.add_argument("--nocolor", action="store_true", help="disable colored status labels")
-    ap.add_argument("--ntp-sync", action="store_true", help="also check target ntpq -np (requires util bash permission; use with --checks system)")
+    ap.add_argument("--ntp-sync", action="store_true", help="compatibility option; NTP sync runs automatically for system checks when SSHPASSNET is set")
     ap.add_argument("--snapshot-dir", type=Path, help="write restricted raw SSH snapshots here")
     ap.add_argument("--from-snapshot", type=Path, help="compare previously saved snapshots offline")
     ap.add_argument("--collect-only", action="store_true")
@@ -1094,8 +1208,6 @@ def main() -> int:
     if not args.from_snapshot and not args.snapshot_dir:
         ap.error("A live run requires --snapshot-dir for raw CLI evidence")
     checks = parse_checks(args.checks)
-    if args.ntp_sync and "system" not in checks:
-        ap.error("--ntp-sync requires --checks system or all")
     try:
         status_filter = parse_status_filter(args.filter)
     except ValueError as exc:
@@ -1105,6 +1217,9 @@ def main() -> int:
              and "NO_COLOR" not in os.environ)
     reporter = Reporter(status_filter=status_filter, color=color)
     print(f"Migration {manifest['migration_package']} | checks={','.join(sorted(checks))} | read-only")
+    check_permissions(reporter, manifest, args.host_key_mode,
+                      offline=bool(args.from_snapshot), check_system="system" in checks,
+                      check_bigip=bool(checks & {"basic", "network", "routes", "system"}))
 
     for side in ("a", "b"):
         device = manifest["devices"][side]
@@ -1124,8 +1239,6 @@ def main() -> int:
                     commands += list(ROUTE_COMMANDS.values())
                 if "system" in checks:
                     commands += list(SYSTEM_COMMANDS.values())
-                    if args.ntp_sync and role == "target":
-                        commands.append(NTP_SYNC_COMMAND)
             else:
                 commands = ["show system version | nomore", "show system state hostname",
                             "show system mgmt-ip", "show tenants | nomore", "show fips | nomore"]
@@ -1139,6 +1252,8 @@ def main() -> int:
                 else:
                     record = collect_ssh(host, cli, commands, account, args.timeout,
                                          args.cli_ready_timeout, args.host_key_mode)
+                    if cli == "bigip" and "system" in checks and os.environ.get("SSHPASSNET"):
+                        record["privileged_ntp"] = collect_privileged_ntp(host, args.host_key_mode)
                     if args.snapshot_dir:
                         save_snapshot(snapshot_path(args.snapshot_dir, side, role), record)
                 if record.get("error"):
@@ -1169,8 +1284,8 @@ def main() -> int:
             compare_routes(reporter, side, collected.get("source"), collected.get("target"))
         if "system" in checks:
             compare_system(reporter, side, collected.get("source"), collected.get("target"))
-            if args.ntp_sync:
-                compare_ntp_sync(reporter, side, collected.get("target"))
+            for role in ("source", "target"):
+                compare_ntp_sync(reporter, side, role, collected.get(role))
     return reporter.finish()
 
 
