@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read-only F5 migration validator (manifest schema 2).
 
-`basic`, `platform`, and `network` are implemented. BIG-IP login lands in tmsh;
+`basic`, `platform`, `network`, `routes`, and `system` are implemented. BIG-IP login lands in tmsh;
 F5OS login lands in the appliance CLI. One interactive SSH session is used
 per endpoint. Supply --snapshot-dir on the first live run so unexpected CLI
 output can be checked safely offline. Ctrl+C interrupts the current SSH
@@ -39,7 +39,7 @@ BIGIP_READY = re.compile(r"(?im)^\s*Version\s+\d+(?:\.\d+){2,4}\s*$")
 
 def parse_checks(spec: str) -> set[str]:
     selected: set[str] = set()
-    known = {"basic", "platform", "network"}
+    known = {"basic", "platform", "network", "routes", "system"}
     for token in spec.split(","):
         token = token.strip().lower()
         if not token:
@@ -51,7 +51,7 @@ def parse_checks(spec: str) -> set[str]:
         elif token in known:
             selected.add(token)
         else:
-            raise ValueError(f"Unsupported check category: {token!r}; available: basic,platform,network")
+            raise ValueError(f"Unsupported check category: {token!r}; available: basic,platform,network,routes,system")
     if not selected:
         raise ValueError("No checks selected")
     return selected
@@ -322,12 +322,18 @@ def bigip_data(record: dict | None) -> dict:
 
 
 NETWORK_COMMANDS = {"vlan": "list net vlan one-line", "self": "list net self one-line"}
+ROUTE_COMMANDS = {"traffic": "list net route one-line",
+                  "management": "list sys management-route one-line"}
+SYSTEM_COMMANDS = {"dns": "list sys dns one-line", "ntp": "list sys ntp one-line"}
+NTP_SYNC_COMMAND = 'run util bash -c "ntpq -np"'
 
 
 def tmsh_objects(output: str, kind: str) -> dict[str, str]:
     """Extract complete tmsh objects, including multiline nested blocks."""
     objects: dict[str, str] = {}
-    header = re.compile(r"(?m)^\s*net\s+" + re.escape(kind) + r"\s+(\S+)\s*\{")
+    component = kind if " " in kind else "net " + kind
+    header = re.compile(r"(?m)^\s*" + re.escape(component).replace(r"\ ", r"\s+")
+                        + r"\s+(\S+)\s*\{")
     for match in header.finditer(output):
         depth = 1
         start = match.end()
@@ -345,6 +351,100 @@ def tmsh_objects(output: str, kind: str) -> dict[str, str]:
             raise ValueError(f"Repeated net {kind} object {name!r}")
         objects[name] = output[start:end - 1]
     return objects
+
+
+def inventory_section(record: dict | None, command: str) -> tuple[str | None, str | None]:
+    """Read an inventory, rejecting missing commands and truncated terminal output."""
+    if record is None:
+        return None, "No snapshot or SSH output"
+    if record.get("error"):
+        return None, record["error"]
+    if command not in record.get("commands", []):
+        return None, f"{command} absent from snapshot; collect a new snapshot for these checks"
+    output, error = section(record, command)
+    if error and not error.startswith("Command boundary missing:"):
+        # tmsh can report an empty route inventory as 'No entries found'.
+        if not (command in ROUTE_COMMANDS.values() and
+                re.search(r"(?i)no entries (?:found|to display)",
+                          record.get("sections", {}).get(command, ""))):
+            return None, error
+        output, error = "", None
+    if error:
+        output = clean_transcript(record.get("raw", ""))
+    if re.search(r"(?i)Display all(?: \d+)? items\?|--More--|\(END\)",
+                 clean_transcript(record.get("raw", ""))):
+        return None, f"{command} stopped at a tmsh display prompt; inventory may be incomplete"
+    return output or "", None
+
+
+def canonical_route_network(value: str) -> str:
+    value = value.strip('"')
+    if value in ("default", "default-inet6"):
+        return "0.0.0.0/0" if value == "default" else "::/0"
+    match = re.fullmatch(r"([^/%]+)(%\d+)?/(.+)", value)
+    if not match:
+        raise ValueError(f"Unrecognized route destination {value!r}")
+    network = ipaddress.ip_network(f"{match.group(1)}/{match.group(3)}", strict=False)
+    return f"{network.network_address}{match.group(2) or ''}/{network.prefixlen}"
+
+
+def route_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | None, str | None]:
+    command = ROUTE_COMMANDS[kind]
+    output, error = inventory_section(record, command)
+    if error:
+        return None, error
+    try:
+        component = "route" if kind == "traffic" else "sys management-route"
+        objects = tmsh_objects(output or "", component)
+        if not objects and output.strip() and not re.search(r"(?i)no entries (?:found|to display)", output):
+            return None, f"No {component} objects parsed; inspect raw snapshot"
+        routes: dict[str, dict] = {}
+        for name, body in objects.items():
+            fields = tmsh_fields(body)
+            name_part = name.rsplit("/", 1)[-1]
+            partition = name.rsplit("/", 1)[0] if "/" in name else "/Common"
+            destination = canonical_route_network(str(fields.get("network") or name_part))
+            if kind == "management" and destination in ("0.0.0.0/0", "::/0"):
+                continue  # The manifest's target gateway is checked by `basic`.
+            key = f"{partition}:{destination}"
+            if key in routes:
+                raise ValueError(f"Multiple {kind} routes to {key}: {routes[key]['name']} and {name}")
+            keys = ("gw", "interface", "pool", "blackhole", "mtu") if kind == "traffic" else ("gateway", "type", "mtu")
+            routes[key] = {"name": name, "settings": {field: fields[field] for field in keys if field in fields}}
+        return routes, None
+    except ValueError as exc:
+        return None, str(exc)
+
+
+def system_data(record: dict | None, kind: str) -> tuple[dict[str, object] | None, str | None]:
+    command = SYSTEM_COMMANDS[kind]
+    output, error = inventory_section(record, command)
+    if error:
+        return None, error
+    try:
+        header = re.search(r"(?m)^\s*sys\s+" + re.escape(kind) + r"\s*\{", output or "")
+        if not header:
+            return None, f"No sys {kind} object found; inspect raw snapshot"
+        body = tmsh_block((output or "")[header.start():], kind)
+        if body is None:
+            raise ValueError(f"Incomplete sys {kind} object")
+        fields = tmsh_fields(body)
+        lists = ("name-servers", "search") if kind == "dns" else ("servers",)
+        result: dict[str, object] = {}
+        for field in lists:
+            value = fields.get(field, "none")
+            result[field] = () if value == "none" else value
+            if not isinstance(result[field], tuple):
+                raise ValueError(f"sys {kind}: unexpected {field} value {value!r}")
+        if kind == "dns":
+            result["number-of-dots"] = fields.get("number-of-dots")
+        else:
+            if not fields.get("timezone"):
+                raise ValueError("sys ntp: timezone missing")
+            result["timezone"] = fields["timezone"]
+        return result, None
+    except ValueError as exc:
+        return None, str(exc)
 
 
 def tmsh_block(body: str, property_name: str) -> str | None:
@@ -901,12 +1001,81 @@ def compare_network(reporter: Reporter, side: str, source: dict | None,
                      f"target={sync_ips}" if sync_ips else "No target self IP on SYNC VLAN")
 
 
+def compare_routes(reporter: Reporter, side: str, source: dict | None,
+                   target: dict | None) -> None:
+    for kind in ROUTE_COMMANDS:
+        old, old_error = route_data(source, kind)
+        new, new_error = route_data(target, kind)
+        for role, error in (("source", old_error), ("target", new_error)):
+            if error:
+                reporter.add("ERROR", f"{side.upper()} {role} {kind} route inventory", error)
+        if old_error or new_error:
+            continue
+        assert old is not None and new is not None
+        if not old and not new:
+            reporter.add("PASS", f"{side.upper()} {kind} routes", "No configured routes on either device")
+        for destination, route in sorted(old.items()):
+            label = f"{side.upper()} {kind} route {destination}"
+            if destination not in new:
+                reporter.add("WARN", label, f"Source route {route['name']} missing from target; review route mapping")
+                continue
+            migrated = new[destination]
+            reporter.add("PASS", label, f"source={route['name']} target={migrated['name']}")
+            for setting in sorted(route["settings"].keys() | migrated["settings"].keys()):
+                original = route["settings"].get(setting)
+                actual = migrated["settings"].get(setting)
+                reporter.add("PASS" if original == actual else "WARN", f"{label} {setting}",
+                             f"source={original!r} target={actual!r}")
+        for destination, route in sorted(new.items()):
+            if destination not in old:
+                reporter.add("WARN", f"{side.upper()} target {kind} route {destination}",
+                             f"No source route for {route['name']}; review route mapping")
+
+
+def compare_system(reporter: Reporter, side: str, source: dict | None,
+                   target: dict | None) -> None:
+    for kind in SYSTEM_COMMANDS:
+        old, old_error = system_data(source, kind)
+        new, new_error = system_data(target, kind)
+        for role, error in (("source", old_error), ("target", new_error)):
+            if error:
+                reporter.add("ERROR", f"{side.upper()} {role} {kind} config", error)
+        if old_error or new_error:
+            continue
+        assert old is not None and new is not None
+        for setting in sorted(old.keys() | new.keys()):
+            original, actual = old.get(setting), new.get(setting)
+            if original is None and actual is None:
+                continue
+            reporter.add("PASS" if original == actual else "WARN",
+                         f"{side.upper()} {kind} {setting}",
+                         f"source={original!r} target={actual!r}")
+
+
+def compare_ntp_sync(reporter: Reporter, side: str, target: dict | None) -> None:
+    output, error = inventory_section(target, NTP_SYNC_COMMAND)
+    if error:
+        reporter.add("ERROR", f"{side.upper()} target NTP synchronization", error)
+        return
+    # ntpq marks the selected system peer with '*', immediately before its address.
+    peers = re.findall(r"(?m)^\s*\*(\S+)\s+", output or "")
+    if peers:
+        reporter.add("PASS", f"{side.upper()} target NTP synchronization", f"selected peer={peers[0]}")
+    elif re.search(r"(?m)^\s*[+ox#-]?\S+\s+\S+\s+\d+\s+\S+\s+", output or ""):
+        reporter.add("WARN", f"{side.upper()} target NTP synchronization", "ntpq listed peers but none is selected")
+    elif re.search(r"(?i)no association|no peers", output or ""):
+        reporter.add("WARN", f"{side.upper()} target NTP synchronization", "ntpq reported no peers")
+    else:
+        reporter.add("ERROR", f"{side.upper()} target NTP synchronization", "Unrecognized ntpq output; inspect raw snapshot")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("manifest", type=Path, help="JSON from Export-F5Migration.ps1")
-    ap.add_argument("--checks", default="basic,platform", help="basic,platform,network,all,!basic,!platform,!network")
+    ap.add_argument("--checks", default="basic,platform", help="basic,platform,network,routes,system,all and !category exclusions")
     ap.add_argument("--filter", metavar="STATUSES", help="show only listed result labels, e.g. FAIL or FAIL,ERROR; summary still counts all")
     ap.add_argument("--nocolor", action="store_true", help="disable colored status labels")
+    ap.add_argument("--ntp-sync", action="store_true", help="also check target ntpq -np (requires util bash permission; use with --checks system)")
     ap.add_argument("--snapshot-dir", type=Path, help="write restricted raw SSH snapshots here")
     ap.add_argument("--from-snapshot", type=Path, help="compare previously saved snapshots offline")
     ap.add_argument("--collect-only", action="store_true")
@@ -925,6 +1094,8 @@ def main() -> int:
     if not args.from_snapshot and not args.snapshot_dir:
         ap.error("A live run requires --snapshot-dir for raw CLI evidence")
     checks = parse_checks(args.checks)
+    if args.ntp_sync and "system" not in checks:
+        ap.error("--ntp-sync requires --checks system or all")
     try:
         status_filter = parse_status_filter(args.filter)
     except ValueError as exc:
@@ -937,7 +1108,7 @@ def main() -> int:
 
     for side in ("a", "b"):
         device = manifest["devices"][side]
-        roles = (["source", "target"] if checks & {"basic", "network"} else []) + (["rseries_host"] if checks & {"platform", "network"} else [])
+        roles = (["source", "target"] if checks & {"basic", "network", "routes", "system"} else []) + (["rseries_host"] if checks & {"platform", "network"} else [])
         collected: dict[str, dict | None] = {}
         for role in roles:
             expected = device[role]
@@ -949,6 +1120,12 @@ def main() -> int:
                             "list sys management-ip", "list sys management-route default"]
                 if "network" in checks:
                     commands += list(NETWORK_COMMANDS.values())
+                if "routes" in checks:
+                    commands += list(ROUTE_COMMANDS.values())
+                if "system" in checks:
+                    commands += list(SYSTEM_COMMANDS.values())
+                    if args.ntp_sync and role == "target":
+                        commands.append(NTP_SYNC_COMMAND)
             else:
                 commands = ["show system version | nomore", "show system state hostname",
                             "show system mgmt-ip", "show tenants | nomore", "show fips | nomore"]
@@ -988,6 +1165,12 @@ def main() -> int:
         if "network" in checks:
             compare_network(reporter, side, collected.get("source"), collected.get("target"),
                             collected.get("rseries_host"), device["target"]["tenant_name_candidates"])
+        if "routes" in checks:
+            compare_routes(reporter, side, collected.get("source"), collected.get("target"))
+        if "system" in checks:
+            compare_system(reporter, side, collected.get("source"), collected.get("target"))
+            if args.ntp_sync:
+                compare_ntp_sync(reporter, side, collected.get("target"))
     return reporter.finish()
 
 
