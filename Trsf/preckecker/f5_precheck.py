@@ -543,7 +543,7 @@ def licensed_host_model(output: str) -> str | None:
 
 def f5os_data(record: dict | None, candidates: list[str]) -> dict:
     values: dict = {}
-    output, error = section(record, "show system licensing")
+    output, error = section(record, "show system licensing | nomore")
     if error:
         values["model_error"] = error
     else:
@@ -953,7 +953,7 @@ def main() -> int:
                 commands = ["show system version | nomore", "show system state hostname",
                             "show system mgmt-ip", "show tenants | nomore", "show fips | nomore"]
                 if "platform" in checks:
-                    commands.append("show system licensing")
+                    commands.append("show system licensing | nomore")
             label = f"{side.upper()} {role} {host}"
             print(f"\nCollecting {label} ({account})...", flush=True)
             try:
