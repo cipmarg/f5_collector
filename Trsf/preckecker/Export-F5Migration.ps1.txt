@@ -360,7 +360,8 @@ try {
         [IO.File]::WriteAllText($tempPath, $json + [Environment]::NewLine,
             (New-Object System.Text.UTF8Encoding($false)))
         if ([IO.File]::Exists($outputPath)) {
-            [IO.File]::Replace($tempPath, $outputPath, $null)
+            # File.Replace with a null backup path fails on some Windows/.NET builds.
+            [IO.File]::Copy($tempPath, $outputPath, $true)
         } else {
             [IO.File]::Move($tempPath, $outputPath)
         }
