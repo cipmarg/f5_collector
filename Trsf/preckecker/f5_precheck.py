@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Read-only F5 migration validator (manifest schema 2).
 
-`basic`, `platform`, `network`, `routes`, `system`, and `applications` are implemented. BIG-IP login lands in tmsh;
-F5OS login lands in the appliance CLI. One interactive SSH session is used
-per endpoint. Supply --snapshot-dir on the first live run so unexpected CLI
+`basic`, `platform`, `network`, `routes`, `system`, and `applications` are implemented. BIG-IP
+uses separate tmsh commands over one multiplexed SSH connection per endpoint;
+F5OS uses one interactive appliance CLI session. Supply --snapshot-dir so unexpected CLI
 output can be checked safely offline. Ctrl+C interrupts the current SSH
 session and continues; Ctrl+\\ terminates the process. Permission probes use
 short direct SSH calls; NTP synchronization uses the privileged BIG-IP login
@@ -18,7 +18,6 @@ import ipaddress
 import json
 import os
 from pathlib import Path
-import pty
 import re
 import select
 import shutil
@@ -26,7 +25,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import tty
 
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -39,10 +37,9 @@ ERROR_TEXT = re.compile(r"(?im)^\s*(?:syntax error\b|%\s*(?:error|invalid|no ent
 VERSION_TEXT = re.compile(r"\b(\d+(?:\.\d+){2,4})\s+([0-9]+(?:\.[0-9]+){2,4})\b")
 F5OS_READY = re.compile(r"(?m)^\s*system\s+version\s+os-version\s+\S+")
 BIGIP_READY = re.compile(r"(?im)^\s*Version\s+\d+(?:\.\d+){2,4}\s*$")
-BIGIP_PROMPT = re.compile(r"(?im)^[^\n]{0,320}\(tmos\)#[ \t\n]*\Z")
-DISPLAY_CONFIRM = re.compile(r"(?i)Display all\s+\d+\s+items\?\s*\(y/n\)[ \t\n]*\Z")
 DISPLAY_PROMPT = re.compile(r"(?i)Display all\s+\d+\s+items\?")
 DISPLAY_DECLINED = re.compile(r"(?i)Display all\s+\d+\s+items\?\s*\(y/n\)\s*n\b")
+DISPLAY_ACCEPTED = re.compile(r"(?i)Display all\s+\d+\s+items\?\s*\(y/n\)\s*y\b")
 
 
 def parse_checks(spec: str) -> set[str]:
@@ -238,10 +235,93 @@ def check_permissions(reporter: Reporter, manifest: dict, host_key_mode: str,
                                  "bash available" if allowed else "bash access not confirmed")
 
 
+def collect_bigip_mux(host: str, commands: list[str], account: str,
+                      timeout: int, ready_timeout: int, host_key_mode: str) -> dict:
+    """One noninteractive tmsh command per SSH channel, sharing a TCP connection."""
+    username, password = password_for(account)
+    env = os.environ.copy()
+    env["SSHPASS"] = password
+    options = ["-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=10",
+               "-o", "ServerAliveCountMax=2", "-o", "LogLevel=ERROR"]
+    if host_key_mode == "legacy":
+        options += ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+    else:
+        options += ["-o", f"StrictHostKeyChecking={host_key_mode}"]
+    sections: dict[str, str] = {}
+    raw_parts: list[str] = []
+    confirmed: dict[str, int] = {}
+    error = None
+    returncode = 0
+    with tempfile.TemporaryDirectory(prefix="f5-precheck-") as socket_dir:
+        socket_path = str(Path(socket_dir) / "control")
+        master_options = ["-o", "ControlMaster=yes", "-o", "ControlPersist=60",
+                          "-o", f"ControlPath={socket_path}"]
+        reuse_options = ["-o", "BatchMode=yes", "-S", socket_path]
+        try:
+            for index, command in enumerate(commands):
+                argv = (["sshpass", "-e", "ssh"] if index == 0 else ["ssh"])
+                argv += options + (master_options if index == 0 else reuse_options)
+                argv += ["-l", username, host, command]
+                try:
+                    completed = subprocess.run(
+                        argv, input=b"y\n", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        env=env, timeout=min(ready_timeout, timeout) if index == 0 else timeout)
+                except subprocess.TimeoutExpired as exc:
+                    captured = (exc.stdout or b"").decode("utf-8", "replace")
+                    raw_parts.append(f"$ {command}\n{redact_transcript(captured)}")
+                    returncode = 124
+                    error = f"{command} timed out after {min(ready_timeout, timeout) if index == 0 else timeout}s"
+                    if re.search(r"(?i)\(less\s+\d+%\)|--More--|Display all\s+\d+\s+items\?", captured):
+                        error += "; remote pager or display confirmation blocked output"
+                    break
+                output = redact_transcript(completed.stdout.decode("utf-8", "replace"))
+                stderr = redact_transcript(completed.stderr.decode("utf-8", "replace"))
+                raw_parts.append(f"$ {command}\n{output}" + (f"\n[ssh stderr] {stderr}" if stderr else ""))
+                returncode = completed.returncode
+                if returncode:
+                    error = f"{command} exited {returncode}: {(stderr or output).strip()[:180]}"
+                    break
+                if index == 0:
+                    if not BIGIP_READY.search(clean_transcript(output)):
+                        error = "BIG-IP readiness command returned no version; inspect raw snapshot"
+                        break
+                    if not Path(socket_path).exists():
+                        error = "SSH control socket was not established; cannot reuse connection"
+                        break
+                if re.search(r"(?i)\(less\s+\d+%\)|--More--|\(END\)", output):
+                    error = f"{command} stopped in a remote pager; inventory is incomplete"
+                    break
+                sections[command] = output
+                accepted = len(DISPLAY_ACCEPTED.findall(output))
+                if accepted:
+                    confirmed[command] = accepted
+        except KeyboardInterrupt:
+            error = "SSH interrupted by Ctrl+C"
+            returncode = 130
+        finally:
+            if Path(socket_path).exists():
+                try:
+                    subprocess.run(["ssh", *options, "-S", socket_path, "-O", "exit",
+                                    "-l", username, host], stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=5, env=env)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            env.pop("SSHPASS", None)
+            password = ""
+    return {"host": host, "cli": "bigip", "account": account,
+            "commands": commands, "returncode": returncode, "error": error,
+            "raw": "\n".join(raw_parts), "sections": sections,
+            "confirmed_display_prompts": confirmed}
+
+
 def collect_ssh(host: str, cli: str, commands: list[str], account: str,
                 timeout: int, ready_timeout: int, host_key_mode: str) -> dict:
     if not shutil.which("sshpass") or not shutil.which("ssh"):
         raise RuntimeError("ssh and sshpass are required on the jump host")
+    if cli == "bigip":
+        return collect_bigip_mux(host, commands, account, timeout, ready_timeout, host_key_mode)
+    if cli != "f5os":
+        raise ValueError(f"Unsupported CLI: {cli}")
     username, password = password_for(account)
     ssh_env = os.environ.copy()
     ssh_env["SSHPASS"] = password
@@ -255,40 +335,15 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
     else:
         argv += ["-o", f"StrictHostKeyChecking={host_key_mode}"]
     argv += ["-l", username, host]
-    exit_cmd = "quit" if cli == "bigip" else "exit"
-    # The CLI may discard keystrokes sent while the login banner is still
-    # loading. Retry a read-only probe until its *output* proves readiness.
-    ready_pattern = BIGIP_READY if cli == "bigip" else F5OS_READY
+    # F5OS login lands in the appliance CLI; wait for the first probe result
+    # before sending the remaining commands as in the working collector.
     collected = bytearray()
-    sections: dict[str, str] = {}
-    confirmed_display_prompts: dict[str, int] = {}
     error = None
     proc = None
-    input_master = None
-    input_slave = None
     try:
-        if cli == "bigip":
-            # A piped local SSH stdin causes some tmsh installations to
-            # default the display-threshold question to 'n' immediately.
-            # Present a real local terminal to SSH as in a manual session.
-            input_master, input_slave = pty.openpty()
-            tty.setraw(input_slave)
-        proc = subprocess.Popen(argv, stdin=input_slave if input_slave is not None else subprocess.PIPE,
-                                stdout=subprocess.PIPE,
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, env=ssh_env)
-        if input_slave is not None:
-            os.close(input_slave)
-            input_slave = None
-        assert proc.stdout
-
-        def send_input(value: str) -> None:
-            if input_master is not None:
-                os.write(input_master, value.encode())
-            else:
-                assert proc and proc.stdin
-                proc.stdin.write(value.encode())
-                proc.stdin.flush()
-
+        assert proc.stdin and proc.stdout
         fd = proc.stdout.fileno()
         started = time.monotonic()
         deadline = started + timeout
@@ -296,17 +351,14 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
         next_probe = started
         ready = False
         eof = False
-        next_command = 1
-        segment_start = 0
-        last_display_response = 0
-        exit_sent = False
         try:
             while time.monotonic() < deadline:
                 now = time.monotonic()
                 if not ready and now >= next_probe and proc.poll() is None:
                     try:
-                        send_input(commands[0] + "\n")
-                    except (BrokenPipeError, OSError):
+                        proc.stdin.write((commands[0] + "\n").encode())
+                        proc.stdin.flush()
+                    except BrokenPipeError:
                         break
                     next_probe = now + 3
                 readable, _, _ = select.select([fd], [], [], min(0.5, max(0, deadline - now)))
@@ -316,43 +368,14 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
                         eof = True
                         break
                     collected.extend(chunk)
-                    cleaned = clean_transcript(collected.decode("utf-8", "replace"))
-                    if not ready and ready_pattern.search(cleaned):
+                    if not ready and F5OS_READY.search(clean_transcript(collected.decode("utf-8", "replace"))):
                         ready = True
-                        if cli == "f5os":
-                            # The F5OS collector uses the established nomore
-                            # flow; BIG-IP waits for each tmsh prompt below.
-                            try:
-                                send_input("\n".join([*commands[1:], exit_cmd, ""]))
-                                assert proc.stdin
-                                proc.stdin.close()
-                            except (BrokenPipeError, OSError):
-                                break
-                    if ready and cli == "bigip" and not exit_sent:
-                        pending_display = DISPLAY_CONFIRM.search(cleaned[segment_start:])
-                        if pending_display and segment_start + pending_display.end() > last_display_response:
-                            # tmsh asks for confirmation before printing large
-                            # one-line inventories. A newline alone may decline.
-                            try:
-                                send_input("y\n")
-                                command = commands[next_command - 1]
-                                confirmed_display_prompts[command] = confirmed_display_prompts.get(command, 0) + 1
-                                last_display_response = segment_start + pending_display.end()
-                            except (BrokenPipeError, OSError):
-                                break
-                        prompt = BIGIP_PROMPT.search(cleaned)
-                        if prompt and prompt.end() > segment_start:
-                            sections[commands[next_command - 1]] = cleaned[segment_start:prompt.start()].strip()
-                            try:
-                                if next_command < len(commands):
-                                    send_input(commands[next_command] + "\n")
-                                    next_command += 1
-                                    segment_start = len(cleaned)
-                                else:
-                                    send_input(exit_cmd + "\n")
-                                    exit_sent = True
-                            except (BrokenPipeError, OSError):
-                                break
+                        try:
+                            proc.stdin.write(("\n".join([*commands[1:], "exit", ""])).encode())
+                            proc.stdin.flush()
+                            proc.stdin.close()
+                        except BrokenPipeError:
+                            break
                 if not ready and time.monotonic() >= ready_deadline:
                     error = f"CLI readiness probe did not succeed within {ready_timeout}s"
                     break
@@ -371,16 +394,11 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
                                if re.search(r"permission denied|host key|resolve hostname|connection refused|no route|timed out", line, re.I)), "")
             error = f"SSH exited {proc.returncode}" + (f": {diagnostic[:180]}" if diagnostic else "; inspect raw snapshot")
     finally:
-        if input_master is not None:
-            os.close(input_master)
-        if input_slave is not None:
-            os.close(input_slave)
         ssh_env.pop("SSHPASS", None)
         password = ""  # Never save credentials to the snapshot.
-    return {"host": host, "cli": cli, "account": account, "commands": commands,
+    return {"host": host, "cli": "f5os", "account": account, "commands": commands,
             "returncode": proc.returncode, "error": error, "raw": raw,
-            "sections": sections if cli == "bigip" else split_transcript(raw, commands),
-            "confirmed_display_prompts": confirmed_display_prompts}
+            "sections": split_transcript(raw, commands)}
 
 
 def snapshot_path(directory: Path, side: str, role: str) -> Path:
@@ -530,7 +548,7 @@ def inventory_pager_error(record: dict, command: str, output: str) -> str | None
         return f"{command}: tmsh declined the display confirmation; inventory was not printed"
     count = len(DISPLAY_PROMPT.findall(output))
     confirmed = record.get("confirmed_display_prompts", {}).get(command, 0)
-    if count > confirmed or re.search(r"(?i)--More--|\(END\)", output):
+    if count > confirmed or re.search(r"(?i)--More--|\(END\)|\(less\s+\d+%\)", output):
         return f"{command} stopped at a tmsh display prompt; inventory may be incomplete"
     return None
 
@@ -1468,7 +1486,7 @@ def main() -> int:
     ap.add_argument("--from-snapshot", type=Path, help="compare previously saved snapshots offline")
     ap.add_argument("--collect-only", action="store_true")
     ap.add_argument("--f5os-account", choices=("regular", "privileged"), default="regular")
-    ap.add_argument("--timeout", type=int, default=90, help="seconds per SSH session")
+    ap.add_argument("--timeout", type=int, default=90, help="seconds per BIG-IP command or F5OS SSH session")
     ap.add_argument("--cli-ready-timeout", type=int, default=20, help="seconds to await a valid CLI response")
     ap.add_argument("--host-key-mode", choices=("yes", "accept-new", "legacy"), default="legacy",
                     help="legacy matches the working ksh collector (disables host-key verification); accept-new verifies known keys")
