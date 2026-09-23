@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""Read-only first slice of the F5 migration validator (manifest schema 2).
+
+Only `basic` and `platform` are implemented. BIG-IP login lands in tmsh;
+F5OS login lands in the appliance CLI. One interactive SSH session is used
+per endpoint. Supply --snapshot-dir on the first live run so unexpected CLI
+output can be checked safely offline. Ctrl+C interrupts the current SSH
+session and continues; Ctrl+\\ terminates the process.
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+SAFE_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
+SAFE_TENANT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
+ERROR_TEXT = re.compile(r"(?im)^\s*(?:syntax error\b|%\s*(?:error|invalid|no entries)\b|error:|unknown command\b|permission denied\b)")
+VERSION_TEXT = re.compile(r"\b(\d+(?:\.\d+){2,4})\s+([0-9]+(?:\.[0-9]+){2,4})\b")
+
+
+def parse_checks(spec: str) -> set[str]:
+    selected: set[str] = set()
+    known = {"basic", "platform"}
+    for token in spec.split(","):
+        token = token.strip().lower()
+        if not token:
+            raise ValueError("Empty --checks item")
+        if token == "all":
+            selected.update(known)
+        elif token.startswith("!") and token[1:] in known:
+            selected.discard(token[1:])
+        elif token in known:
+            selected.add(token)
+        else:
+            raise ValueError(f"Unsupported check category: {token!r}; available: basic,platform")
+    if not selected:
+        raise ValueError("No checks selected")
+    return selected
+
+
+def checked_name(value: str, pattern: re.Pattern[str], label: str) -> str:
+    if not isinstance(value, str) or not pattern.fullmatch(value):
+        raise ValueError(f"Invalid {label} in manifest: {value!r}")
+    return value
+
+
+def load_manifest(path: Path) -> dict:
+    manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+    if manifest.get("schema_version") != 2:
+        raise ValueError("Expected manifest schema_version 2")
+    devices = manifest.get("devices")
+    if not isinstance(devices, dict) or set(devices) != {"a", "b"}:
+        raise ValueError("Manifest must contain exactly devices.a and devices.b")
+    for side in ("a", "b"):
+        for role in ("source", "target", "rseries_host"):
+            endpoint = devices[side][role]
+            checked_name(endpoint["ssh_host"], SAFE_HOST, f"{side}.{role}.ssh_host")
+        target = devices[side]["target"]
+        for name in target["tenant_name_candidates"]:
+            checked_name(name, SAFE_TENANT, f"{side}.target.tenant_name_candidate")
+    return manifest
+
+
+def clean_transcript(raw: str) -> str:
+    return ANSI.sub("", raw.replace("\r\n", "\n").replace("\r", "\n")).replace("\x08", "")
+
+
+def is_command_echo(line: str, command: str) -> bool:
+    stripped = line.strip()
+    if stripped == command:
+        return True
+    return bool(re.search(r"[#>]\s*" + re.escape(command) + r"\s*$", stripped, re.I))
+
+
+def split_transcript(raw: str, commands: list[str]) -> dict[str, str]:
+    """Separate echoed CLI commands without relying on vendor prompt syntax."""
+    lines = clean_transcript(raw).splitlines()
+    positions: list[int | None] = []
+    search_from = 0
+    for command in commands:
+        pos = next((i for i in range(search_from, len(lines))
+                    if is_command_echo(lines[i], command)), None)
+        positions.append(pos)
+        if pos is not None:
+            search_from = pos + 1
+    sections: dict[str, str] = {}
+    for n, command in enumerate(commands):
+        pos = positions[n]
+        if pos is None:
+            continue
+        end = next((p for p in positions[n + 1:] if p is not None), len(lines))
+        sections[command] = "\n".join(lines[pos + 1:end]).strip()
+    # If a single remote command was accepted but the CLI did not echo it,
+    # use the complete transcript. Multiple commands require boundaries.
+    if len(commands) == 1 and commands[0] not in sections:
+        sections[commands[0]] = clean_transcript(raw)
+    return sections
+
+
+def password_for(kind: str) -> tuple[str, str]:
+    user = os.environ.get("USER")
+    if not user:
+        raise ValueError("Set USER to the regular F5 SSH username")
+    env_name = "SSHPASSNET" if kind == "privileged" else "SSHPASS"
+    login = f"{user}_net" if kind == "privileged" else user
+    password = os.environ.get(env_name) or getpass.getpass(f"Enter password for {login}: ")
+    if not password:
+        raise ValueError(f"No password supplied for {login}")
+    return login, password
+
+
+def collect_ssh(host: str, cli: str, commands: list[str], account: str, timeout: int) -> dict:
+    if not shutil.which("sshpass") or not shutil.which("ssh"):
+        raise RuntimeError("ssh and sshpass are required on the jump host")
+    username, password = password_for(account)
+    ssh_env = os.environ.copy()
+    ssh_env["SSHPASS"] = password
+    argv = ["sshpass", "-e", "ssh", "-tt", "-o", "BatchMode=no",
+            "-o", "StrictHostKeyChecking=yes", "-o", "NumberOfPasswordPrompts=1",
+            "-o", "ConnectTimeout=12", "-l", username, host]
+    exit_cmd = "quit" if cli == "bigip" else "exit"
+    # The interactive account is already in tmsh or F5OS CLI; do not call bash.
+    payload = "\n".join([*commands, exit_cmd, ""])
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, errors="replace", env=ssh_env)
+        try:
+            raw, _ = proc.communicate(payload, timeout=timeout)
+            error = None if proc.returncode == 0 else f"SSH exited {proc.returncode}"
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
+            proc.kill()
+            raw, _ = proc.communicate()
+            error = "SSH timed out" if isinstance(exc, subprocess.TimeoutExpired) else "SSH interrupted by Ctrl+C"
+    finally:
+        ssh_env.pop("SSHPASS", None)
+        password = ""  # Never save credentials to the snapshot.
+    return {"host": host, "cli": cli, "account": account, "commands": commands,
+            "returncode": proc.returncode, "error": error, "raw": raw,
+            "sections": split_transcript(raw, commands)}
+
+
+def snapshot_path(directory: Path, side: str, role: str) -> Path:
+    return directory / f"{side}_{role}.json"
+
+
+def save_snapshot(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    fd, temp_name = tempfile.mkstemp(prefix=".f5-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(record, file, indent=2)
+            file.write("\n")
+        os.replace(temp_name, path)
+        os.chmod(path, 0o600)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def read_snapshot(path: Path, expected_host: str) -> dict:
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if record.get("host", "").lower() != expected_host.lower():
+        raise ValueError(f"Snapshot host mismatch in {path}: expected {expected_host}")
+    if not isinstance(record.get("sections"), dict):
+        raise ValueError(f"Snapshot has no command sections: {path}")
+    return record
+
+
+def section(record: dict | None, command: str) -> tuple[str | None, str | None]:
+    if record is None:
+        return None, "No snapshot or SSH output"
+    if record.get("error"):
+        return None, record["error"]
+    output = record.get("sections", {}).get(command)
+    if output is None:
+        return None, f"Command boundary missing: {command}; inspect raw snapshot"
+    if ERROR_TEXT.search(output):
+        return None, f"CLI rejected {command}; inspect raw snapshot"
+    return output, None
+
+
+def bigip_data(record: dict | None) -> dict:
+    values: dict = {}
+    output, error = section(record, "show sys version")
+    if error:
+        values["version_error"] = error
+    else:
+        version = re.search(r"(?im)^\s*Version\s+(\d+(?:\.\d+){2,4})\s*$", output)
+        build = re.search(r"(?im)^\s*Build\s+([\d.]+)\s*$", output)
+        values["version"] = version.group(1) if version else None
+        values["build"] = build.group(1) if build else None
+    output, error = section(record, "list sys global-settings hostname")
+    if error:
+        values["hostname_error"] = error
+    else:
+        match = re.search(r"(?im)^\s*hostname\s+(\S+)", output)
+        values["hostname"] = match.group(1).strip('"') if match else None
+    output, error = section(record, "list sys management-ip")
+    if error:
+        values["management_ip_error"] = error
+    else:
+        match = re.search(r"(?im)^\s*sys\s+management-ip\s+((?:\d{1,3}\.){3}\d{1,3})(?:/\d+)?\b", output)
+        values["management_ip"] = match.group(1) if match else None
+    return values
+
+
+def parse_f5os_tenant(output: str) -> dict | None:
+    if ERROR_TEXT.search(output):
+        return None
+    name = re.search(r"(?im)^\s*tenants\s+tenant\s+([A-Za-z0-9-]+)\s*$", output)
+    if not name:
+        return None
+    state: dict[str, str] = {"name": name.group(1)}
+    for key, value in re.findall(r"(?im)^\s*state\s+([\w-]+)\s+(.+?)\s*$", output):
+        state[key.lower()] = value.strip().strip('"')
+    # `state image` is the deployment image. Only image-version reflects the
+    # version currently running inside the tenant.
+    running = VERSION_TEXT.search(state.get("image-version", ""))
+    state["running_version"] = running.group(1) if running else None
+    state["running_build"] = running.group(2) if running else None
+    return state
+
+
+def f5os_data(record: dict | None, candidates: list[str]) -> dict:
+    values: dict = {}
+    output, error = section(record, "show system state hostname")
+    if error:
+        values["hostname_error"] = error
+    else:
+        match = re.search(r"(?im)^\s*(?:system\s+)?(?:state\s+)?hostname\s+(\S+)", output)
+        values["hostname"] = match.group(1).strip('"') if match else None
+    output, error = section(record, "show system mgmt-ip")
+    if error:
+        values["management_ip_error"] = error
+    else:
+        match = re.search(r"(?im)^\s*system\s+mgmt-ip\s+state\s+ipv4\s+system\s+address\s+((?:\d{1,3}\.){3}\d{1,3})\b", output)
+        values["management_ip"] = match.group(1) if match else None
+    for name in dict.fromkeys(candidates):
+        command = f"show tenants tenant {name}"
+        output, error = section(record, command)
+        if error:
+            continue
+        tenant = parse_f5os_tenant(output)
+        if tenant and tenant["name"].casefold() == name.casefold():
+            values["tenant"] = tenant
+            values["matched_lookup"] = name
+            break
+    if "tenant" not in values:
+        values["tenant_error"] = "Tenant not found with either name case; inspect raw snapshot"
+    return values
+
+
+class Reporter:
+    def __init__(self) -> None:
+        self.results: list[tuple[str, str, str]] = []
+
+    def add(self, status: str, label: str, detail: str) -> None:
+        self.results.append((status, label, detail))
+        print(f"[{status:<5}] {label:<45} {detail}")
+
+    def compare(self, label: str, expected: object, actual: object,
+                error: str | None = None, *, casefold: bool = False) -> None:
+        if error:
+            self.add("ERROR", label, error)
+        elif actual is None or str(actual).strip() == "":
+            self.add("ERROR", label, "Value missing in device output")
+        elif expected is None:
+            self.add("SKIP", label, "No expected value in manifest")
+        else:
+            a, b = str(actual).strip(), str(expected).strip()
+            matches = a.casefold() == b.casefold() if casefold else a == b
+            self.add("PASS" if matches else "FAIL", label,
+                     f"expected={b!r} actual={a!r}")
+
+    def finish(self) -> int:
+        counts = {status: sum(1 for row in self.results if row[0] == status)
+                  for status in ("PASS", "FAIL", "WARN", "ERROR", "SKIP", "INFO")}
+        print("\n" + " ".join(f"{key}={value}" for key, value in counts.items()))
+        return 2 if counts["ERROR"] else 1 if counts["FAIL"] else 0
+
+
+def compare_bigip(reporter: Reporter, side: str, role: str, expected: dict,
+                  observed: dict) -> None:
+    prefix = f"{side.upper()} {role} BIG-IP"
+    reporter.compare(f"{prefix} hostname", expected["expected_hostname"],
+                     observed.get("hostname"), observed.get("hostname_error"), casefold=True)
+    reporter.compare(f"{prefix} management IP", expected["management_ip"],
+                     observed.get("management_ip"), observed.get("management_ip_error"))
+    if role == "source":
+        if observed.get("version_error") or not observed.get("version") or not observed.get("build"):
+            reporter.add("ERROR", f"{prefix} software", observed.get("version_error") or "Version or build missing")
+        else:
+            version = observed["version"]
+            reporter.add("INFO", f"{prefix} software", f"version={version} build={observed.get('build')} major={version.split('.')[0]}")
+    else:
+        expected_software = expected["software"]
+        reporter.compare(f"{prefix} version", expected_software["version"],
+                         observed.get("version"), observed.get("version_error"))
+        reporter.compare(f"{prefix} build", expected_software["build"],
+                         observed.get("build"), observed.get("version_error"))
+
+
+def compare_platform(reporter: Reporter, side: str, expected: dict, observed: dict) -> None:
+    prefix = f"{side.upper()} F5OS"
+    host = expected["rseries_host"]
+    target = expected["target"]
+    reporter.compare(f"{prefix} host hostname", host["expected_hostname"],
+                     observed.get("hostname"), observed.get("hostname_error"), casefold=True)
+    reporter.compare(f"{prefix} host management IP", host["management_ip"],
+                     observed.get("management_ip"), observed.get("management_ip_error"))
+    tenant = observed.get("tenant")
+    if tenant is None:
+        reporter.add("ERROR", f"{prefix} tenant lookup", observed.get("tenant_error", "No tenant output"))
+        return
+    reporter.compare(f"{prefix} tenant name", target["tenant_name"], tenant.get("name"), casefold=True)
+    reporter.compare(f"{prefix} tenant management IP", target["management_ip"], tenant.get("mgmt-ip"))
+    reporter.compare(f"{prefix} prefix length", target["management_prefix_length"], tenant.get("prefix-length"))
+    reporter.compare(f"{prefix} gateway", target["management_gateway"], tenant.get("gateway"))
+    reporter.compare(f"{prefix} running version", target["software"]["version"], tenant.get("running_version"))
+    reporter.compare(f"{prefix} running build", target["software"]["build"], tenant.get("running_build"))
+    reporter.compare(f"{prefix} vCPUs", target["tenant"]["vcpu"], tenant.get("vcpu-cores-per-node"))
+    reporter.compare(f"{prefix} type", "BIG-IP", tenant.get("type"), casefold=True)
+    reporter.compare(f"{prefix} deployment", "deployed", tenant.get("running-state"), casefold=True)
+    reporter.compare(f"{prefix} status", "Running", tenant.get("status"), casefold=True)
+    if target["tenant"].get("fips_keys") is not None:
+        reporter.compare(f"{prefix} FIPS partition", target["tenant"]["fips_partition_name"],
+                         tenant.get("fips-partition"), casefold=True)
+        reporter.compare(f"{prefix} QAT VF count", target["tenant"]["fips_accelerator_devices"],
+                         tenant.get("qat-vf-count"))
+        reporter.add("SKIP", f"{prefix} FIPS key capacity", "Partition capacity collector follows in the FIPS slice")
+    else:
+        reporter.add("SKIP", f"{prefix} FIPS", "Not applicable for this host model")
+    reporter.add("SKIP", f"{prefix} host model", "No verified read-only F5OS model command yet")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("manifest", type=Path, help="JSON from Export-F5Migration.ps1")
+    ap.add_argument("--checks", default="basic,platform", help="basic,platform,all,!basic,!platform")
+    ap.add_argument("--snapshot-dir", type=Path, help="write restricted raw SSH snapshots here")
+    ap.add_argument("--from-snapshot", type=Path, help="compare previously saved snapshots offline")
+    ap.add_argument("--collect-only", action="store_true")
+    ap.add_argument("--f5os-account", choices=("regular", "privileged"), default="regular")
+    ap.add_argument("--timeout", type=int, default=90, help="seconds per SSH session")
+    args = ap.parse_args()
+    if args.snapshot_dir and args.from_snapshot:
+        ap.error("--snapshot-dir and --from-snapshot cannot be combined")
+    if args.timeout < 10:
+        ap.error("--timeout must be at least 10 seconds")
+    if not args.from_snapshot and not args.snapshot_dir:
+        ap.error("A live run requires --snapshot-dir for raw CLI evidence")
+    checks = parse_checks(args.checks)
+    manifest = load_manifest(args.manifest)
+    reporter = Reporter()
+    print(f"Migration {manifest['migration_package']} | checks={','.join(sorted(checks))} | read-only")
+
+    for side in ("a", "b"):
+        device = manifest["devices"][side]
+        roles = (["source", "target"] if "basic" in checks else []) + (["rseries_host"] if "platform" in checks else [])
+        collected: dict[str, dict | None] = {}
+        for role in roles:
+            expected = device[role]
+            host = expected["ssh_host"]
+            cli = "f5os" if role == "rseries_host" else "bigip"
+            account = args.f5os_account if cli == "f5os" else "regular"
+            if cli == "bigip":
+                commands = ["show sys version", "list sys global-settings hostname", "list sys management-ip"]
+            else:
+                commands = ["show system state hostname", "show system mgmt-ip"] + [
+                    f"show tenants tenant {name}" for name in dict.fromkeys(device["target"]["tenant_name_candidates"])]
+            label = f"{side.upper()} {role} {host}"
+            print(f"\nCollecting {label} ({account})...", flush=True)
+            try:
+                if args.from_snapshot:
+                    record = read_snapshot(snapshot_path(args.from_snapshot, side, role), host)
+                else:
+                    record = collect_ssh(host, cli, commands, account, args.timeout)
+                    if args.snapshot_dir:
+                        save_snapshot(snapshot_path(args.snapshot_dir, side, role), record)
+                if record.get("error"):
+                    reporter.add("ERROR", label, record["error"])
+                elif args.collect_only:
+                    reporter.add("INFO", label, "Collected")
+                collected[role] = record
+            except (OSError, ValueError, RuntimeError) as exc:
+                reporter.add("ERROR", label, str(exc))
+                collected[role] = None
+
+        if args.collect_only:
+            continue
+        if "basic" in checks:
+            for role in ("source", "target"):
+                compare_bigip(reporter, side, role, device[role], bigip_data(collected.get(role)))
+        if "platform" in checks:
+            compare_platform(reporter, side, device, f5os_data(
+                collected.get("rseries_host"), device["target"]["tenant_name_candidates"]))
+    return reporter.finish()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (ValueError, OSError, KeyError, json.JSONDecodeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
