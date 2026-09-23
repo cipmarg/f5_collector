@@ -37,6 +37,7 @@ ERROR_TEXT = re.compile(r"(?im)^\s*(?:syntax error\b|%\s*(?:error|invalid|no ent
 VERSION_TEXT = re.compile(r"\b(\d+(?:\.\d+){2,4})\s+([0-9]+(?:\.[0-9]+){2,4})\b")
 F5OS_READY = re.compile(r"(?m)^\s*system\s+version\s+os-version\s+\S+")
 BIGIP_READY = re.compile(r"(?im)^\s*Version\s+\d+(?:\.\d+){2,4}\s*$")
+BIGIP_PROMPT = re.compile(r"(?im)^[^\n]{0,320}\(tmos\)#[ \t\n]*\Z")
 
 
 def parse_checks(spec: str) -> set[str]:
@@ -268,6 +269,9 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
         next_probe = started
         ready = False
         eof = False
+        next_command = 1
+        segment_start = 0
+        exit_sent = False
         try:
             while time.monotonic() < deadline:
                 now = time.monotonic()
@@ -285,14 +289,35 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
                         eof = True
                         break
                     collected.extend(chunk)
-                    if not ready and ready_pattern.search(clean_transcript(collected.decode("utf-8", "replace"))):
+                    cleaned = clean_transcript(collected.decode("utf-8", "replace"))
+                    if not ready and ready_pattern.search(cleaned):
                         ready = True
-                        try:
-                            proc.stdin.write(("\n".join([*commands[1:], exit_cmd, ""])).encode())
-                            proc.stdin.flush()
-                            proc.stdin.close()
-                        except BrokenPipeError:
-                            break
+                        if cli == "f5os":
+                            # The F5OS collector uses the established nomore
+                            # flow; BIG-IP waits for each tmsh prompt below.
+                            try:
+                                proc.stdin.write(("\n".join([*commands[1:], exit_cmd, ""])).encode())
+                                proc.stdin.flush()
+                                proc.stdin.close()
+                            except BrokenPipeError:
+                                break
+                    if ready and cli == "bigip" and not exit_sent:
+                        prompt = BIGIP_PROMPT.search(cleaned)
+                        if prompt and prompt.end() > segment_start:
+                            sections[commands[next_command - 1]] = cleaned[segment_start:prompt.start()].strip()
+                            try:
+                                if next_command < len(commands):
+                                    proc.stdin.write((commands[next_command] + "\n").encode())
+                                    proc.stdin.flush()
+                                    next_command += 1
+                                    segment_start = len(cleaned)
+                                else:
+                                    proc.stdin.write((exit_cmd + "\n").encode())
+                                    proc.stdin.flush()
+                                    proc.stdin.close()
+                                    exit_sent = True
+                            except BrokenPipeError:
+                                break
                 if not ready and time.monotonic() >= ready_deadline:
                     error = f"CLI readiness probe did not succeed within {ready_timeout}s"
                     break
@@ -315,7 +340,7 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
         password = ""  # Never save credentials to the snapshot.
     return {"host": host, "cli": cli, "account": account, "commands": commands,
             "returncode": proc.returncode, "error": error, "raw": raw,
-            "sections": split_transcript(raw, commands)}
+            "sections": sections if cli == "bigip" else split_transcript(raw, commands)}
 
 
 def snapshot_path(directory: Path, side: str, role: str) -> Path:
@@ -418,7 +443,7 @@ SYSTEM_COMMANDS = {"dns": "list sys dns one-line", "ntp": "list sys ntp one-line
 NTP_SYNC_COMMAND = 'bash -c "ntpq -np"'
 
 
-def tmsh_objects(output: str, kind: str) -> dict[str, str]:
+def tmsh_objects(output: str, kind: str, *, allow_identical_duplicates: bool = False) -> dict[str, str]:
     """Extract complete tmsh objects, including multiline nested blocks."""
     objects: dict[str, str] = {}
     component = kind if " " in kind else "net " + kind
@@ -438,6 +463,8 @@ def tmsh_objects(output: str, kind: str) -> dict[str, str]:
             raise ValueError(f"Incomplete net {kind} object {match.group(1)!r}")
         name = match.group(1)
         if name in objects:
+            if allow_identical_duplicates and tmsh_fields(objects[name]) == tmsh_fields(output[start:end - 1]):
+                continue  # A legacy snapshot may contain both the default query and the full listing.
             raise ValueError(f"Repeated net {kind} object {name!r}")
         objects[name] = output[start:end - 1]
     return objects
@@ -475,7 +502,9 @@ def inventory_section(record: dict | None, command: str) -> tuple[str | None, st
     if error:
         output = echoed_inventory(record, command)
         if output is None:
-            return None, error
+            # Older snapshots have interleaved command echoes such as "l ist".
+            # Recover from object headers; each parser still validates its object.
+            output = clean_transcript(record.get("raw", ""))
     if re.search(r"(?i)Display all(?: \d+)? items\?|--More--|\(END\)",
                  clean_transcript(record.get("raw", ""))):
         return None, f"{command} stopped at a tmsh display prompt; inventory may be incomplete"
@@ -502,12 +531,15 @@ def route_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | None, 
         component = "route" if kind == "traffic" else "sys management-route"
         if not output or not output.strip():
             recovered = echoed_inventory(record, command) if record else None
+            if not recovered and record:
+                recovered = clean_transcript(record.get("raw", ""))
             if recovered and re.search(r"(?m)^\s*" + (r"net\s+route" if kind == "traffic" else r"sys\s+management-route") + r"\s+\S+\s*\{", recovered):
                 output = recovered
             elif not (record and re.search(r"(?i)no entries (?:found|to display)",
                                            record.get("sections", {}).get(command, ""))):
                 return None, f"{command} returned no parseable output; cannot verify empty inventory"
-        objects = tmsh_objects(output or "", component)
+        objects = tmsh_objects(output or "", component,
+                               allow_identical_duplicates=kind == "management")
         if not objects and output.strip() and not re.search(r"(?i)no entries (?:found|to display)", output):
             return None, f"No {component} objects parsed; inspect raw snapshot"
         routes: dict[str, dict] = {}
