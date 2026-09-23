@@ -31,6 +31,11 @@ ERROR_TEXT = re.compile(r"(?im)^\s*(?:syntax error\b|%\s*(?:error|invalid|no ent
 VERSION_TEXT = re.compile(r"\b(\d+(?:\.\d+){2,4})\s+([0-9]+(?:\.[0-9]+){2,4})\b")
 F5OS_READY = re.compile(r"(?m)^\s*system\s+version\s+os-version\s+\S+")
 BIGIP_READY = re.compile(r"(?im)^\s*Version\s+\d+(?:\.\d+){2,4}\s*$")
+BIGIP_RESPONSES = (
+    re.compile(r"(?ims)^\s*Version\s+\d+(?:\.\d+){2,4}\s*$.*?^\s*Build\s+[\d.]+\s*$"),
+    re.compile(r"(?im)\bhostname[ \t]+[A-Za-z0-9][A-Za-z0-9._-]+\b"),
+    re.compile(r"(?im)\bsys\s+management-ip\s+(?:\d{1,3}\.){3}\d{1,3}"),
+)
 
 
 def parse_checks(spec: str) -> set[str]:
@@ -146,6 +151,7 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
     # loading. Retry a read-only probe until its *output* proves readiness.
     ready_pattern = BIGIP_READY if cli == "bigip" else F5OS_READY
     collected = bytearray()
+    sections: dict[str, str] = {}
     error = None
     proc = None
     try:
@@ -160,33 +166,85 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
         ready = False
         eof = False
         try:
-            while time.monotonic() < deadline:
-                now = time.monotonic()
-                if not ready and now >= next_probe and proc.poll() is None:
-                    try:
-                        proc.stdin.write((commands[0] + "\n").encode())
-                        proc.stdin.flush()
-                    except BrokenPipeError:
-                        break
-                    next_probe = now + 1
-                readable, _, _ = select.select([fd], [], [], min(0.5, max(0, deadline - now)))
-                if readable:
-                    chunk = os.read(fd, 65536)
-                    if not chunk:
-                        eof = True
-                        break
-                    collected.extend(chunk)
-                    if not ready and ready_pattern.search(clean_transcript(collected.decode("utf-8", "replace"))):
-                        ready = True
+            if cli == "bigip":
+                # tmsh on these tenants may swallow or omit individual command
+                # echoes. Advance only after each actual response is seen and
+                # keep the response as its section without relying on echoes.
+                command_index = 0
+                response = bytearray()
+                stage_deadline = ready_deadline
+                while time.monotonic() < deadline:
+                    now = time.monotonic()
+                    if command_index < len(commands) and now >= next_probe and proc.poll() is None:
                         try:
-                            proc.stdin.write(("\n".join([*commands[1:], exit_cmd, ""])).encode())
+                            proc.stdin.write((commands[command_index] + "\n").encode())
                             proc.stdin.flush()
-                            proc.stdin.close()
                         except BrokenPipeError:
                             break
-                if not ready and time.monotonic() >= ready_deadline:
-                    error = f"CLI readiness probe did not succeed within {ready_timeout}s"
-                    break
+                        next_probe = now + 1
+                    readable, _, _ = select.select([fd], [], [], min(0.5, max(0, deadline - now)))
+                    if readable:
+                        chunk = os.read(fd, 65536)
+                        if not chunk:
+                            eof = True
+                            break
+                        collected.extend(chunk)
+                        response.extend(chunk)
+                        output = clean_transcript(response.decode("utf-8", "replace"))
+                        if command_index < len(commands) and (
+                                BIGIP_RESPONSES[command_index].search(output) or ERROR_TEXT.search(output)):
+                            sections[commands[command_index]] = output
+                            command_index += 1
+                            response.clear()
+                            stage_deadline = min(time.monotonic() + ready_timeout, deadline)
+                            next_probe = time.monotonic()
+                            if command_index == len(commands):
+                                proc.stdin.write((exit_cmd + "\n").encode())
+                                proc.stdin.flush()
+                                proc.stdin.close()
+                    if command_index < len(commands) and time.monotonic() >= stage_deadline:
+                        if command_index == 0:
+                            error = f"CLI readiness probe did not succeed within {ready_timeout}s"
+                            break
+                        # Preserve the partial response for a meaningful field
+                        # error; continue with remaining read-only commands.
+                        sections[commands[command_index]] = clean_transcript(response.decode("utf-8", "replace"))
+                        command_index += 1
+                        response.clear()
+                        stage_deadline = min(time.monotonic() + ready_timeout, deadline)
+                        next_probe = time.monotonic()
+                        if command_index == len(commands):
+                            proc.stdin.write((exit_cmd + "\n").encode())
+                            proc.stdin.flush()
+                            proc.stdin.close()
+            else:
+                while time.monotonic() < deadline:
+                    now = time.monotonic()
+                    if not ready and now >= next_probe and proc.poll() is None:
+                        try:
+                            proc.stdin.write((commands[0] + "\n").encode())
+                            proc.stdin.flush()
+                        except BrokenPipeError:
+                            break
+                        next_probe = now + 1
+                    readable, _, _ = select.select([fd], [], [], min(0.5, max(0, deadline - now)))
+                    if readable:
+                        chunk = os.read(fd, 65536)
+                        if not chunk:
+                            eof = True
+                            break
+                        collected.extend(chunk)
+                        if not ready and ready_pattern.search(clean_transcript(collected.decode("utf-8", "replace"))):
+                            ready = True
+                            try:
+                                proc.stdin.write(("\n".join([*commands[1:], exit_cmd, ""])).encode())
+                                proc.stdin.flush()
+                                proc.stdin.close()
+                            except BrokenPipeError:
+                                break
+                    if not ready and time.monotonic() >= ready_deadline:
+                        error = f"CLI readiness probe did not succeed within {ready_timeout}s"
+                        break
             if not eof and proc.poll() is None:
                 error = error or f"SSH timed out after {timeout}s"
                 proc.kill()
@@ -206,7 +264,7 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
         password = ""  # Never save credentials to the snapshot.
     return {"host": host, "cli": cli, "account": account, "commands": commands,
             "returncode": proc.returncode, "error": error, "raw": raw,
-            "sections": split_transcript(raw, commands)}
+            "sections": sections if cli == "bigip" else split_transcript(raw, commands)}
 
 
 def snapshot_path(directory: Path, side: str, role: str) -> Path:
@@ -252,7 +310,15 @@ def section(record: dict | None, command: str) -> tuple[str | None, str | None]:
 
 def bigip_data(record: dict | None) -> dict:
     values: dict = {}
-    output, error = section(record, "show sys version")
+    def bigip_section(command: str) -> tuple[str | None, str | None]:
+        output, error = section(record, command)
+        if error and error.startswith("Command boundary missing:") and record and record.get("raw"):
+            # Older snapshots were split by echoes, which tmsh sometimes
+            # omits. Each snapshot contains only one BIG-IP endpoint.
+            return clean_transcript(record["raw"]), None
+        return output, error
+
+    output, error = bigip_section("show sys version")
     if error:
         values["version_error"] = error
     else:
@@ -260,13 +326,13 @@ def bigip_data(record: dict | None) -> dict:
         build = re.search(r"(?im)^\s*Build\s+([\d.]+)\s*$", output)
         values["version"] = version.group(1) if version else None
         values["build"] = build.group(1) if build else None
-    output, error = section(record, "list sys global-settings hostname")
+    output, error = bigip_section("list sys global-settings hostname")
     if error:
         values["hostname_error"] = error
     else:
-        match = re.search(r"(?im)^\s*hostname\s+(\S+)", output)
+        match = re.search(r"(?im)\bhostname[ \t]+([A-Za-z0-9][A-Za-z0-9._-]+)\b", output)
         values["hostname"] = match.group(1).strip('"') if match else None
-    output, error = section(record, "list sys management-ip")
+    output, error = bigip_section("list sys management-ip")
     if error:
         values["management_ip_error"] = error
     else:
