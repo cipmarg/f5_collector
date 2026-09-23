@@ -18,6 +18,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import pty
 import re
 import select
 import shutil
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tty
 
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -40,6 +42,7 @@ BIGIP_READY = re.compile(r"(?im)^\s*Version\s+\d+(?:\.\d+){2,4}\s*$")
 BIGIP_PROMPT = re.compile(r"(?im)^[^\n]{0,320}\(tmos\)#[ \t\n]*\Z")
 DISPLAY_CONFIRM = re.compile(r"(?i)Display all\s+\d+\s+items\?\s*\(y/n\)[ \t\n]*\Z")
 DISPLAY_PROMPT = re.compile(r"(?i)Display all\s+\d+\s+items\?")
+DISPLAY_DECLINED = re.compile(r"(?i)Display all\s+\d+\s+items\?\s*\(y/n\)\s*n\b")
 
 
 def parse_checks(spec: str) -> set[str]:
@@ -261,10 +264,31 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
     confirmed_display_prompts: dict[str, int] = {}
     error = None
     proc = None
+    input_master = None
+    input_slave = None
     try:
-        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        if cli == "bigip":
+            # A piped local SSH stdin causes some tmsh installations to
+            # default the display-threshold question to 'n' immediately.
+            # Present a real local terminal to SSH as in a manual session.
+            input_master, input_slave = pty.openpty()
+            tty.setraw(input_slave)
+        proc = subprocess.Popen(argv, stdin=input_slave if input_slave is not None else subprocess.PIPE,
+                                stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, env=ssh_env)
-        assert proc.stdin and proc.stdout
+        if input_slave is not None:
+            os.close(input_slave)
+            input_slave = None
+        assert proc.stdout
+
+        def send_input(value: str) -> None:
+            if input_master is not None:
+                os.write(input_master, value.encode())
+            else:
+                assert proc and proc.stdin
+                proc.stdin.write(value.encode())
+                proc.stdin.flush()
+
         fd = proc.stdout.fileno()
         started = time.monotonic()
         deadline = started + timeout
@@ -281,11 +305,10 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
                 now = time.monotonic()
                 if not ready and now >= next_probe and proc.poll() is None:
                     try:
-                        proc.stdin.write((commands[0] + "\n").encode())
-                        proc.stdin.flush()
-                    except BrokenPipeError:
+                        send_input(commands[0] + "\n")
+                    except (BrokenPipeError, OSError):
                         break
-                    next_probe = now + 1
+                    next_probe = now + 3
                 readable, _, _ = select.select([fd], [], [], min(0.5, max(0, deadline - now)))
                 if readable:
                     chunk = os.read(fd, 65536)
@@ -300,10 +323,10 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
                             # The F5OS collector uses the established nomore
                             # flow; BIG-IP waits for each tmsh prompt below.
                             try:
-                                proc.stdin.write(("\n".join([*commands[1:], exit_cmd, ""])).encode())
-                                proc.stdin.flush()
+                                send_input("\n".join([*commands[1:], exit_cmd, ""]))
+                                assert proc.stdin
                                 proc.stdin.close()
-                            except BrokenPipeError:
+                            except (BrokenPipeError, OSError):
                                 break
                     if ready and cli == "bigip" and not exit_sent:
                         pending_display = DISPLAY_CONFIRM.search(cleaned[segment_start:])
@@ -311,28 +334,24 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
                             # tmsh asks for confirmation before printing large
                             # one-line inventories. A newline alone may decline.
                             try:
-                                proc.stdin.write(b"y\n")
-                                proc.stdin.flush()
+                                send_input("y\n")
                                 command = commands[next_command - 1]
                                 confirmed_display_prompts[command] = confirmed_display_prompts.get(command, 0) + 1
                                 last_display_response = segment_start + pending_display.end()
-                            except BrokenPipeError:
+                            except (BrokenPipeError, OSError):
                                 break
                         prompt = BIGIP_PROMPT.search(cleaned)
                         if prompt and prompt.end() > segment_start:
                             sections[commands[next_command - 1]] = cleaned[segment_start:prompt.start()].strip()
                             try:
                                 if next_command < len(commands):
-                                    proc.stdin.write((commands[next_command] + "\n").encode())
-                                    proc.stdin.flush()
+                                    send_input(commands[next_command] + "\n")
                                     next_command += 1
                                     segment_start = len(cleaned)
                                 else:
-                                    proc.stdin.write((exit_cmd + "\n").encode())
-                                    proc.stdin.flush()
-                                    proc.stdin.close()
+                                    send_input(exit_cmd + "\n")
                                     exit_sent = True
-                            except BrokenPipeError:
+                            except (BrokenPipeError, OSError):
                                 break
                 if not ready and time.monotonic() >= ready_deadline:
                     error = f"CLI readiness probe did not succeed within {ready_timeout}s"
@@ -352,6 +371,10 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
                                if re.search(r"permission denied|host key|resolve hostname|connection refused|no route|timed out", line, re.I)), "")
             error = f"SSH exited {proc.returncode}" + (f": {diagnostic[:180]}" if diagnostic else "; inspect raw snapshot")
     finally:
+        if input_master is not None:
+            os.close(input_master)
+        if input_slave is not None:
+            os.close(input_slave)
         ssh_env.pop("SSHPASS", None)
         password = ""  # Never save credentials to the snapshot.
     return {"host": host, "cli": cli, "account": account, "commands": commands,
@@ -503,6 +526,8 @@ def echoed_inventory(record: dict, command: str) -> str | None:
 
 
 def inventory_pager_error(record: dict, command: str, output: str) -> str | None:
+    if DISPLAY_DECLINED.search(output):
+        return f"{command}: tmsh declined the display confirmation; inventory was not printed"
     count = len(DISPLAY_PROMPT.findall(output))
     confirmed = record.get("confirmed_display_prompts", {}).get(command, 0)
     if count > confirmed or re.search(r"(?i)--More--|\(END\)", output):
