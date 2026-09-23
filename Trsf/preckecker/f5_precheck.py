@@ -93,6 +93,11 @@ def clean_transcript(raw: str) -> str:
     return ANSI.sub("", raw.replace("\r\n", "\n").replace("\r", "\n")).replace("\x08", "")
 
 
+def redact_transcript(raw: str) -> str:
+    """F5OS licensing displays a registration key; omit it from snapshots."""
+    return re.sub(r"(?im)^(\s*Registration key\s+)\S+", r"\g<1>[REDACTED]", raw)
+
+
 def is_command_echo(line: str, command: str) -> bool:
     stripped = line.strip()
     if stripped == command:
@@ -210,7 +215,7 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
             proc.wait(timeout=5)
             error = "SSH interrupted by Ctrl+C"
         collected.extend(proc.stdout.read() or b"")
-        raw = collected.decode("utf-8", "replace")
+        raw = redact_transcript(collected.decode("utf-8", "replace"))
         if not error and proc.returncode:
             diagnostic = next((line.strip() for line in reversed(clean_transcript(raw).splitlines())
                                if re.search(r"permission denied|host key|resolve hostname|connection refused|no route|timed out", line, re.I)), "")
@@ -524,14 +529,27 @@ def f5os_fips(output: str) -> dict:
     return partitions
 
 
+def licensed_host_model(output: str) -> str | None:
+    """Read the hardware model on the Active Modules Local Traffic Manager line."""
+    active = re.search(r"(?im)^\s*Active Modules\s*$", output)
+    if not active:
+        return None
+    modules = output[active.end():]
+    models = set(re.findall(
+        r"(?im)^\s*Local Traffic Manager,\s*(r\d+(?:-[A-Za-z0-9]+)*)\s*(?=\(|$)",
+        modules))
+    return next(iter(models)) if len(models) == 1 else None
+
+
 def f5os_data(record: dict | None, candidates: list[str]) -> dict:
     values: dict = {}
-    output, error = section(record, "show system version | nomore")
+    output, error = section(record, "show system licensing")
     if error:
-        values["product_error"] = error
+        values["model_error"] = error
     else:
-        match = re.search(r"(?im)^\s*system\s+version\s+product\s+(\S+)", output)
-        values["product"] = match.group(1) if match else None
+        values["model"] = licensed_host_model(output)
+        if values["model"] is None:
+            values["model_error"] = "Model missing or ambiguous in Active Modules / Local Traffic Manager license entry"
     output, error = section(record, "show system state hostname")
     if error:
         values["hostname_error"] = error
@@ -644,9 +662,8 @@ def compare_platform(reporter: Reporter, side: str, expected: dict, observed: di
                      observed.get("hostname"), observed.get("hostname_error"), casefold=True)
     reporter.compare(f"{prefix} host management IP", host["management_ip"],
                      observed.get("management_ip"), observed.get("management_ip_error"))
-    reporter.add("INFO" if observed.get("product") else "SKIP", f"{prefix} host product",
-                 f"reported={observed['product']!r} expected model={host['model']!r}"
-                 if observed.get("product") else observed.get("product_error") or "Product missing in F5OS version output")
+    reporter.compare(f"{prefix} host product", host["model"],
+                     observed.get("model"), observed.get("model_error"), casefold=True)
     tenant = observed.get("tenant")
     if tenant is None:
         reporter.add("ERROR", f"{prefix} tenant lookup", observed.get("tenant_error", "No tenant output"))
@@ -935,6 +952,8 @@ def main() -> int:
             else:
                 commands = ["show system version | nomore", "show system state hostname",
                             "show system mgmt-ip", "show tenants | nomore", "show fips | nomore"]
+                if "platform" in checks:
+                    commands.append("show system licensing")
             label = f"{side.upper()} {role} {host}"
             print(f"\nCollecting {label} ({account})...", flush=True)
             try:
