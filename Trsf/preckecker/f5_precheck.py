@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Read-only first slice of the F5 migration validator (manifest schema 2).
+"""Read-only F5 migration validator (manifest schema 2).
 
-Only `basic` and `platform` are implemented. BIG-IP login lands in tmsh;
+`basic`, `platform`, and `network` are implemented. BIG-IP login lands in tmsh;
 F5OS login lands in the appliance CLI. One interactive SSH session is used
 per endpoint. Supply --snapshot-dir on the first live run so unexpected CLI
 output can be checked safely offline. Ctrl+C interrupts the current SSH
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -35,7 +36,7 @@ BIGIP_READY = re.compile(r"(?im)^\s*Version\s+\d+(?:\.\d+){2,4}\s*$")
 
 def parse_checks(spec: str) -> set[str]:
     selected: set[str] = set()
-    known = {"basic", "platform"}
+    known = {"basic", "platform", "network"}
     for token in spec.split(","):
         token = token.strip().lower()
         if not token:
@@ -47,7 +48,7 @@ def parse_checks(spec: str) -> set[str]:
         elif token in known:
             selected.add(token)
         else:
-            raise ValueError(f"Unsupported check category: {token!r}; available: basic,platform")
+            raise ValueError(f"Unsupported check category: {token!r}; available: basic,platform,network")
     if not selected:
         raise ValueError("No checks selected")
     return selected
@@ -303,6 +304,137 @@ def bigip_data(record: dict | None) -> dict:
     return values
 
 
+NETWORK_COMMANDS = {"vlan": "list net vlan one-line", "self": "list net self one-line"}
+
+
+def tmsh_objects(output: str, kind: str) -> dict[str, str]:
+    """Extract complete tmsh objects, including multiline nested blocks."""
+    objects: dict[str, str] = {}
+    header = re.compile(r"(?m)^\s*net\s+" + re.escape(kind) + r"\s+(\S+)\s*\{")
+    for match in header.finditer(output):
+        depth = 1
+        start = match.end()
+        end = start
+        while end < len(output) and depth:
+            if output[end] == "{":
+                depth += 1
+            elif output[end] == "}":
+                depth -= 1
+            end += 1
+        if depth:
+            raise ValueError(f"Incomplete net {kind} object {match.group(1)!r}")
+        name = match.group(1)
+        if name in objects:
+            raise ValueError(f"Repeated net {kind} object {name!r}")
+        objects[name] = output[start:end - 1]
+    return objects
+
+
+def tmsh_block(body: str, property_name: str) -> str | None:
+    match = re.search(r"\b" + re.escape(property_name) + r"\s*\{", body)
+    if not match:
+        return None
+    start = match.end()
+    depth = 1
+    for pos in range(start, len(body)):
+        if body[pos] == "{":
+            depth += 1
+        elif body[pos] == "}":
+            depth -= 1
+            if not depth:
+                return body[start:pos]
+    raise ValueError(f"Incomplete {property_name} block")
+
+
+def tmsh_property(body: str, name: str) -> str | None:
+    match = re.search(r"(?<![\w-])" + re.escape(name) + r"\s+(?!\{)([^\s{}]+)", body)
+    return match.group(1).strip('"') if match else None
+
+
+def normalize_self_address(address: str) -> str:
+    """Normalize masks while keeping BIG-IP route-domain suffixes such as %1."""
+    match = re.fullmatch(r"([^/%]+)(%\d+)?/(.+)", address)
+    if not match:
+        raise ValueError(f"Invalid self IP address: {address!r}")
+    interface = ipaddress.ip_interface(f"{match.group(1)}/{match.group(3)}")
+    return f"{interface.ip}{match.group(2) or ''}/{interface.network.prefixlen}"
+
+
+def network_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | None, str | None]:
+    """Read a selected command; missing echoes may fall back to this host's raw output."""
+    command = NETWORK_COMMANDS[kind]
+    if record is None:
+        return None, "No snapshot or SSH output"
+    if record.get("error"):
+        return None, record["error"]
+    if command not in record.get("commands", []):
+        return None, f"{command} absent from snapshot; collect a new network snapshot"
+    output, error = section(record, command)
+    raw = clean_transcript(record.get("raw", ""))
+    if error and not error.startswith("Command boundary missing:"):
+        return None, error
+    if error:
+        output = raw
+    if re.search(r"(?i)Display all(?: \d+)? items\?|--More--|\(END\)", raw):
+        return None, f"{command} stopped at a tmsh display prompt; inventory may be incomplete"
+    try:
+        objects = tmsh_objects(output or "", kind)
+        if not objects and raw and raw != output:
+            objects = tmsh_objects(raw, kind)
+        if not objects:
+            return None, f"No net {kind} objects found; inspect raw snapshot for pager or CLI errors"
+        result: dict[str, dict] = {}
+        for name, body in objects.items():
+            if kind == "vlan":
+                interfaces = tmsh_block(body, "interfaces")
+                members = []
+                if interfaces is not None:
+                    for member, props in tmsh_objects_from_block(interfaces):
+                        tagged = "untagged" if re.search(r"\buntagged\b", props) else (
+                            "tagged" if re.search(r"\btagged\b", props) else "unspecified")
+                        members.append((member, tagged))
+                tag = tmsh_property(body, "tag")
+                if tag is None:
+                    raise ValueError(f"net vlan {name}: tag missing")
+                result[name] = {"tag": tag, "interfaces": sorted(members)}
+            else:
+                address = tmsh_property(body, "address")
+                vlan = tmsh_property(body, "vlan")
+                group = tmsh_property(body, "traffic-group")
+                if not all((address, vlan, group)):
+                    raise ValueError(f"net self {name}: address, vlan or traffic-group missing")
+                try:
+                    address = normalize_self_address(address)
+                except ValueError as exc:
+                    raise ValueError(f"net self {name}: invalid address {address!r}") from exc
+                result[name] = {"address": address, "vlan": vlan, "traffic_group": group,
+                                "floating": not group.rsplit("/", 1)[-1].lower() == "traffic-group-local-only"}
+        return result, None
+    except ValueError as exc:
+        return None, str(exc)
+
+
+def tmsh_objects_from_block(block: str) -> list[tuple[str, str]]:
+    """Parse interface member names and their nested properties."""
+    members: list[tuple[str, str]] = []
+    offset = 0
+    while match := re.search(r"([^\s{}]+)\s*\{", block[offset:]):
+        body_start = offset + match.end()
+        depth = 1
+        pos = body_start
+        while pos < len(block) and depth:
+            if block[pos] == "{":
+                depth += 1
+            elif block[pos] == "}":
+                depth -= 1
+            pos += 1
+        if depth:
+            raise ValueError(f"Incomplete interface member {match.group(1)!r}")
+        members.append((match.group(1), block[body_start:pos - 1]))
+        offset = pos
+    return members
+
+
 def parse_f5os_tenant(output: str) -> dict | None:
     if ERROR_TEXT.search(output):
         return None
@@ -485,10 +617,44 @@ def compare_platform(reporter: Reporter, side: str, expected: dict, observed: di
         reporter.add("SKIP", f"{prefix} FIPS", "Not applicable for this host model")
 
 
+def compare_network(reporter: Reporter, side: str, source: dict | None,
+                    target: dict | None) -> None:
+    """Show source-to-target differences; a migration mapping is needed to adjudicate them."""
+    for kind in ("vlan", "self"):
+        label = f"{side.upper()} {kind.upper()} network inventory"
+        src, src_error = network_data(source, kind)
+        dst, dst_error = network_data(target, kind)
+        if src_error or dst_error:
+            for role, error in (("source", src_error), ("target", dst_error)):
+                if error:
+                    reporter.add("ERROR", f"{label} {role}", error)
+            continue
+        assert src is not None and dst is not None
+        differences = 0
+        for name in sorted(src.keys() | dst.keys()):
+            if name not in dst:
+                reporter.add("WARN", f"{side.upper()} {kind} {name}", "Present on source; absent from target")
+                differences += 1
+            elif name not in src:
+                reporter.add("WARN", f"{side.upper()} {kind} {name}", "Present on target; absent from source")
+                differences += 1
+            else:
+                fields = ("tag", "interfaces") if kind == "vlan" else (
+                    "address", "vlan", "traffic_group", "floating")
+                for field in fields:
+                    if src[name][field] != dst[name][field]:
+                        reporter.add("WARN", f"{side.upper()} {kind} {name} {field}",
+                                     f"source={src[name][field]!r} target={dst[name][field]!r}")
+                        differences += 1
+        reporter.add("PASS" if not differences else "INFO", label,
+                     f"source={len(src)} target={len(dst)} differences={differences}; "
+                     + ("matched" if not differences else "review migration mapping for WARN entries"))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("manifest", type=Path, help="JSON from Export-F5Migration.ps1")
-    ap.add_argument("--checks", default="basic,platform", help="basic,platform,all,!basic,!platform")
+    ap.add_argument("--checks", default="basic,platform", help="basic,platform,network,all,!basic,!platform,!network")
     ap.add_argument("--snapshot-dir", type=Path, help="write restricted raw SSH snapshots here")
     ap.add_argument("--from-snapshot", type=Path, help="compare previously saved snapshots offline")
     ap.add_argument("--collect-only", action="store_true")
@@ -513,7 +679,7 @@ def main() -> int:
 
     for side in ("a", "b"):
         device = manifest["devices"][side]
-        roles = (["source", "target"] if "basic" in checks else []) + (["rseries_host"] if "platform" in checks else [])
+        roles = (["source", "target"] if checks & {"basic", "network"} else []) + (["rseries_host"] if "platform" in checks else [])
         collected: dict[str, dict | None] = {}
         for role in roles:
             expected = device[role]
@@ -523,6 +689,8 @@ def main() -> int:
             if cli == "bigip":
                 commands = ["show sys version", "list sys global-settings hostname",
                             "list sys management-ip", "list sys management-route default"]
+                if "network" in checks:
+                    commands += list(NETWORK_COMMANDS.values())
             else:
                 commands = ["show system version | nomore", "show system state hostname",
                             "show system mgmt-ip", "show tenants | nomore", "show fips | nomore"]
@@ -557,6 +725,8 @@ def main() -> int:
             if record is not None and not record.get("error"):
                 compare_platform(reporter, side, device, f5os_data(
                     record, device["target"]["tenant_name_candidates"]))
+        if "network" in checks:
+            compare_network(reporter, side, collected.get("source"), collected.get("target"))
     return reporter.finish()
 
 
