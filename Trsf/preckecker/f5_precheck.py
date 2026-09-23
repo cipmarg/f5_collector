@@ -443,6 +443,19 @@ def tmsh_objects(output: str, kind: str) -> dict[str, str]:
     return objects
 
 
+def echoed_inventory(record: dict, command: str) -> str | None:
+    """Recover this command's output when the ordered transcript split missed its echo."""
+    lines = clean_transcript(record.get("raw", "")).splitlines()
+    positions = [i for i, line in enumerate(lines) if is_command_echo(line, command)]
+    if not positions:
+        return None
+    start = positions[-1] + 1
+    following = next((i for i in range(start, len(lines))
+                      if any(is_command_echo(lines[i], other)
+                             for other in record.get("commands", []) if other != command)), len(lines))
+    return "\n".join(lines[start:following]).strip()
+
+
 def inventory_section(record: dict | None, command: str) -> tuple[str | None, str | None]:
     """Read an inventory, rejecting missing commands and truncated terminal output."""
     if record is None:
@@ -460,7 +473,9 @@ def inventory_section(record: dict | None, command: str) -> tuple[str | None, st
             return None, error
         output, error = "", None
     if error:
-        output = clean_transcript(record.get("raw", ""))
+        output = echoed_inventory(record, command)
+        if output is None:
+            return None, error
     if re.search(r"(?i)Display all(?: \d+)? items\?|--More--|\(END\)",
                  clean_transcript(record.get("raw", ""))):
         return None, f"{command} stopped at a tmsh display prompt; inventory may be incomplete"
@@ -486,9 +501,9 @@ def route_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | None, 
     try:
         component = "route" if kind == "traffic" else "sys management-route"
         if not output or not output.strip():
-            raw = clean_transcript(record.get("raw", "")) if record else ""
-            if re.search(r"(?m)^\s*" + (r"net\s+route" if kind == "traffic" else r"sys\s+management-route") + r"\s+\S+\s*\{", raw):
-                output = raw
+            recovered = echoed_inventory(record, command) if record else None
+            if recovered and re.search(r"(?m)^\s*" + (r"net\s+route" if kind == "traffic" else r"sys\s+management-route") + r"\s+\S+\s*\{", recovered):
+                output = recovered
             elif not (record and re.search(r"(?i)no entries (?:found|to display)",
                                            record.get("sections", {}).get(command, ""))):
                 return None, f"{command} returned no parseable output; cannot verify empty inventory"
@@ -501,8 +516,6 @@ def route_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | None, 
             name_part = name.rsplit("/", 1)[-1]
             partition = name.rsplit("/", 1)[0] if "/" in name else "/Common"
             destination = canonical_route_network(str(fields.get("network") or name_part))
-            if kind == "management" and destination in ("0.0.0.0/0", "::/0"):
-                continue  # The manifest's target gateway is checked by `basic`.
             key = f"{partition}:{destination}"
             if key in routes:
                 raise ValueError(f"Multiple {kind} routes to {key}: {routes[key]['name']} and {name}")
@@ -544,9 +557,7 @@ def system_data(record: dict | None, kind: str) -> tuple[dict[str, object] | Non
         if kind == "dns":
             result["number-of-dots"] = tmsh_property(body, "number-of-dots")
         else:
-            if not (timezone := tmsh_property(body, "timezone")):
-                raise ValueError("sys ntp: timezone missing")
-            result["timezone"] = timezone
+            result["timezone"] = tmsh_property(body, "timezone")
         return result, None
     except ValueError as exc:
         return None, str(exc)
@@ -1107,7 +1118,7 @@ def compare_network(reporter: Reporter, side: str, source: dict | None,
 
 
 def compare_routes(reporter: Reporter, side: str, source: dict | None,
-                   target: dict | None) -> None:
+                   target: dict | None, target_management_gateway: str) -> None:
     for kind in ROUTE_COMMANDS:
         old, old_error = route_data(source, kind)
         new, new_error = route_data(target, kind)
@@ -1122,19 +1133,31 @@ def compare_routes(reporter: Reporter, side: str, source: dict | None,
         for destination, route in sorted(old.items()):
             label = f"{side.upper()} {kind} route {destination}"
             if destination not in new:
-                reporter.add("WARN", label, f"Source route {route['name']} missing from target; review route mapping")
+                reporter.add("FAIL", label, f"Source route {route['name']} missing from target")
                 continue
             migrated = new[destination]
             reporter.add("PASS", label, f"source={route['name']} target={migrated['name']}")
             for setting in sorted(route["settings"].keys() | migrated["settings"].keys()):
+                if kind == "management" and setting == "gateway":
+                    continue  # Every target gateway is checked against the manifest below.
                 original = route["settings"].get(setting)
                 actual = migrated["settings"].get(setting)
-                reporter.add("PASS" if original == actual else "WARN", f"{label} {setting}",
+                reporter.add("PASS" if original == actual else "FAIL" if kind == "traffic" else "WARN",
+                             f"{label} {setting}",
                              f"source={original!r} target={actual!r}")
         for destination, route in sorted(new.items()):
             if destination not in old:
-                reporter.add("WARN", f"{side.upper()} target {kind} route {destination}",
+                reporter.add("FAIL" if kind == "traffic" else "WARN",
+                             f"{side.upper()} target {kind} route {destination}",
                              f"No source route for {route['name']}; review route mapping")
+            if kind == "management":
+                gateway = route["settings"].get("gateway")
+                reporter.add("PASS" if gateway == target_management_gateway else "FAIL",
+                             f"{side.upper()} management route {destination} gateway",
+                             f"expected target management gateway={target_management_gateway!r} "
+                             f"actual={gateway!r}"
+                             + (f" source={old[destination]['settings'].get('gateway')!r}"
+                                if destination in old else ""))
 
 
 def compare_system(reporter: Reporter, side: str, source: dict | None,
@@ -1150,9 +1173,14 @@ def compare_system(reporter: Reporter, side: str, source: dict | None,
         assert old is not None and new is not None
         for setting in sorted(old.keys() | new.keys()):
             original, actual = old.get(setting), new.get(setting)
+            if kind == "ntp" and setting == "timezone":
+                reporter.add("PASS" if actual == "UTC" else "FAIL",
+                             f"{side.upper()} target ntp timezone",
+                             f"expected='UTC' actual={actual!r} source={original!r}")
+                continue
             if original is None and actual is None:
                 continue
-            status = "PASS" if original == actual else ("FAIL" if kind == "ntp" and setting == "timezone" else "WARN")
+            status = "PASS" if original == actual else "WARN"
             reporter.add(status,
                          f"{side.upper()} {kind} {setting}",
                          f"source={original!r} target={actual!r}")
@@ -1281,7 +1309,8 @@ def main() -> int:
             compare_network(reporter, side, collected.get("source"), collected.get("target"),
                             collected.get("rseries_host"), device["target"]["tenant_name_candidates"])
         if "routes" in checks:
-            compare_routes(reporter, side, collected.get("source"), collected.get("target"))
+            compare_routes(reporter, side, collected.get("source"), collected.get("target"),
+                           device["target"]["management_gateway"])
         if "system" in checks:
             compare_system(reporter, side, collected.get("source"), collected.get("target"))
             for role in ("source", "target"):
