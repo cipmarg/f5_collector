@@ -26,6 +26,9 @@ import time
 
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+STATUSES = ("PASS", "FAIL", "WARN", "ERROR", "SKIP", "INFO")
+STATUS_COLORS = {"PASS": "\x1b[32m", "FAIL": "\x1b[31m", "WARN": "\x1b[33m",
+                 "ERROR": "\x1b[35m", "SKIP": "\x1b[36m", "INFO": "\x1b[34m"}
 SAFE_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
 SAFE_TENANT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
 ERROR_TEXT = re.compile(r"(?im)^\s*(?:syntax error\b|%\s*(?:error|invalid|no entries)\b|error:|unknown command\b|permission denied\b)")
@@ -51,6 +54,15 @@ def parse_checks(spec: str) -> set[str]:
             raise ValueError(f"Unsupported check category: {token!r}; available: basic,platform,network")
     if not selected:
         raise ValueError("No checks selected")
+    return selected
+
+
+def parse_status_filter(spec: str | None) -> set[str] | None:
+    if spec is None or spec.strip().lower() == "all":
+        return None
+    selected = {item.strip().upper() for item in spec.split(",")}
+    if "" in selected or not selected <= set(STATUSES):
+        raise ValueError("--filter accepts comma-separated PASS,FAIL,WARN,ERROR,SKIP,INFO or all")
     return selected
 
 
@@ -553,12 +565,20 @@ def f5os_data(record: dict | None, candidates: list[str]) -> dict:
 
 
 class Reporter:
-    def __init__(self) -> None:
+    def __init__(self, status_filter: set[str] | None = None, color: bool = False) -> None:
         self.results: list[tuple[str, str, str]] = []
+        self.status_filter = status_filter
+        self.color = color
+        self.displayed = 0
 
     def add(self, status: str, label: str, detail: str) -> None:
         self.results.append((status, label, detail))
-        print(f"[{status:<5}] {label:<45} {detail}")
+        if self.status_filter is None or status in self.status_filter:
+            token = f"[{status:<5}]"
+            if self.color:
+                token = f"{STATUS_COLORS[status]}{token}\x1b[0m"
+            print(f"{token} {label:<45} {detail}")
+            self.displayed += 1
 
     def compare(self, label: str, expected: object, actual: object,
                 error: str | None = None, *, casefold: bool = False,
@@ -579,8 +599,11 @@ class Reporter:
 
     def finish(self) -> int:
         counts = {status: sum(1 for row in self.results if row[0] == status)
-                  for status in ("PASS", "FAIL", "WARN", "ERROR", "SKIP", "INFO")}
-        print("\n" + " ".join(f"{key}={value}" for key, value in counts.items()))
+                  for status in STATUSES}
+        summary = " ".join(f"{key}={value}" for key, value in counts.items())
+        if self.status_filter is not None:
+            summary += f" | displayed={self.displayed} filter={','.join(sorted(self.status_filter))}"
+        print("\n" + summary)
         return 2 if counts["ERROR"] else 1 if counts["FAIL"] else 0
 
 
@@ -863,6 +886,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("manifest", type=Path, help="JSON from Export-F5Migration.ps1")
     ap.add_argument("--checks", default="basic,platform", help="basic,platform,network,all,!basic,!platform,!network")
+    ap.add_argument("--filter", metavar="STATUSES", help="show only listed result labels, e.g. FAIL or FAIL,ERROR; summary still counts all")
+    ap.add_argument("--nocolor", action="store_true", help="disable colored status labels")
     ap.add_argument("--snapshot-dir", type=Path, help="write restricted raw SSH snapshots here")
     ap.add_argument("--from-snapshot", type=Path, help="compare previously saved snapshots offline")
     ap.add_argument("--collect-only", action="store_true")
@@ -881,8 +906,14 @@ def main() -> int:
     if not args.from_snapshot and not args.snapshot_dir:
         ap.error("A live run requires --snapshot-dir for raw CLI evidence")
     checks = parse_checks(args.checks)
+    try:
+        status_filter = parse_status_filter(args.filter)
+    except ValueError as exc:
+        ap.error(str(exc))
     manifest = load_manifest(args.manifest)
-    reporter = Reporter()
+    color = (not args.nocolor and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+             and "NO_COLOR" not in os.environ)
+    reporter = Reporter(status_filter=status_filter, color=color)
     print(f"Migration {manifest['migration_package']} | checks={','.join(sorted(checks))} | read-only")
 
     for side in ("a", "b"):
