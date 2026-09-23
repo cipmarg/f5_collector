@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read-only F5 migration validator (manifest schema 2).
 
-`basic`, `platform`, `network`, `routes`, and `system` are implemented. BIG-IP login lands in tmsh;
+`basic`, `platform`, `network`, `routes`, `system`, and `applications` are implemented. BIG-IP login lands in tmsh;
 F5OS login lands in the appliance CLI. One interactive SSH session is used
 per endpoint. Supply --snapshot-dir on the first live run so unexpected CLI
 output can be checked safely offline. Ctrl+C interrupts the current SSH
@@ -42,7 +42,7 @@ BIGIP_PROMPT = re.compile(r"(?im)^[^\n]{0,320}\(tmos\)#[ \t\n]*\Z")
 
 def parse_checks(spec: str) -> set[str]:
     selected: set[str] = set()
-    known = {"basic", "platform", "network", "routes", "system"}
+    known = {"basic", "platform", "network", "routes", "system", "applications"}
     for token in spec.split(","):
         token = token.strip().lower()
         if not token:
@@ -54,7 +54,7 @@ def parse_checks(spec: str) -> set[str]:
         elif token in known:
             selected.add(token)
         else:
-            raise ValueError(f"Unsupported check category: {token!r}; available: basic,platform,network,routes,system")
+            raise ValueError(f"Unsupported check category: {token!r}; available: basic,platform,network,routes,system,applications")
     if not selected:
         raise ValueError("No checks selected")
     return selected
@@ -440,6 +440,8 @@ NETWORK_COMMANDS = {"vlan": "list net vlan one-line", "self": "list net self one
 ROUTE_COMMANDS = {"traffic": "list net route one-line",
                   "management": "list sys management-route one-line"}
 SYSTEM_COMMANDS = {"dns": "list sys dns one-line", "ntp": "list sys ntp one-line"}
+APPLICATION_COMMANDS = {"virtual": "list ltm virtual one-line",
+                        "pool": "list ltm pool one-line"}
 NTP_SYNC_COMMAND = 'bash -c "ntpq -np"'
 
 
@@ -493,8 +495,8 @@ def inventory_section(record: dict | None, command: str) -> tuple[str | None, st
         return None, f"{command} absent from snapshot; collect a new snapshot for these checks"
     output, error = section(record, command)
     if error and not error.startswith("Command boundary missing:"):
-        # tmsh can report an empty route inventory as 'No entries found'.
-        if not (command in ROUTE_COMMANDS.values() and
+        # tmsh can report an empty object inventory as 'No entries found'.
+        if not (command in (*ROUTE_COMMANDS.values(), *APPLICATION_COMMANDS.values()) and
                 re.search(r"(?i)no entries (?:found|to display)",
                           record.get("sections", {}).get(command, ""))):
             return None, error
@@ -591,6 +593,56 @@ def system_data(record: dict | None, kind: str) -> tuple[dict[str, object] | Non
         else:
             result["timezone"] = tmsh_property(body, "timezone")
         return result, None
+    except ValueError as exc:
+        return None, str(exc)
+
+
+def application_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | None, str | None]:
+    """Collect configured LTM objects; never mistake an unsplit command for an empty list."""
+    command = APPLICATION_COMMANDS[kind]
+    output, error = inventory_section(record, command)
+    if error:
+        return None, error
+    try:
+        objects = tmsh_objects(output or "", f"ltm {kind}")
+        if not objects and record:
+            raw = clean_transcript(record.get("raw", ""))
+            if raw != output:
+                objects = tmsh_objects(raw, f"ltm {kind}")
+        if not objects:
+            evidence = (record or {}).get("sections", {}).get(command, "")
+            if not evidence:
+                evidence = output or ""
+            if re.search(r"(?i)no entries (?:found|to display)", evidence):
+                return {}, None
+            return None, f"{command} returned no parseable output; cannot verify empty inventory"
+        parsed: dict[str, dict] = {}
+        for name, body in objects.items():
+            fields = tmsh_fields(body)
+            entry: dict = {"fields": fields}
+            if kind == "virtual":
+                entry["destination"] = fields.get("destination")
+                entry["protocol"] = fields.get("ip-protocol", "tcp")
+                if not entry["destination"]:
+                    raise ValueError(f"ltm virtual {name}: destination missing")
+            else:
+                member_block = tmsh_block(body, "members")
+                members: dict[str, dict] = {}
+                for member, member_body in tmsh_objects_from_block(member_block or ""):
+                    properties = tmsh_fields(member_body)
+                    # The node name can change; an explicit address and service port
+                    # identify the actual backend more reliably.
+                    port = member.rsplit(":", 1)[-1] if ":" in member else ""
+                    address = properties.get("address") or member.rsplit(":", 1)[0]
+                    identity = f"{address}:{port}"
+                    if identity in members:
+                        raise ValueError(f"ltm pool {name}: repeated member endpoint {identity}")
+                    members[identity] = {"name": member, "fields": properties}
+                if member_block is None and fields.get("members") not in (None, "none"):
+                    raise ValueError(f"ltm pool {name}: unrecognized members value")
+                entry["members"] = members
+            parsed[name] = entry
+        return parsed, None
     except ValueError as exc:
         return None, str(exc)
 
@@ -1218,6 +1270,119 @@ def compare_system(reporter: Reporter, side: str, source: dict | None,
                          f"source={original!r} target={actual!r}")
 
 
+def object_path(name: str) -> str:
+    return name if name.startswith("/") else "/Common/" + name
+
+
+def virtual_endpoint(name: str, entry: dict) -> tuple[str, ...]:
+    fields = entry["fields"]
+    partition = object_path(name).rsplit("/", 1)[0]
+    return (partition, str(entry["destination"]), str(entry["protocol"]),
+            str(fields.get("source", "0.0.0.0/0")), str(fields.get("mask", "")))
+
+
+def compare_applications(reporter: Reporter, side: str, source: dict | None,
+                         target: dict | None) -> None:
+    inventories: dict[str, tuple[dict[str, dict], dict[str, dict]]] = {}
+    for kind in APPLICATION_COMMANDS:
+        old, old_error = application_data(source, kind)
+        new, new_error = application_data(target, kind)
+        for role, error in (("source", old_error), ("target", new_error)):
+            if error:
+                reporter.add("ERROR", f"{side.upper()} {role} {kind} inventory", error)
+        if old_error or new_error:
+            continue
+        assert old is not None and new is not None
+        inventories[kind] = (old, new)
+        if not old and not new:
+            reporter.add("PASS", f"{side.upper()} {kind} inventory", "No configured objects on either device")
+
+    if "virtual" in inventories:
+        old, new = inventories["virtual"]
+        by_endpoint: dict[tuple[str, ...], list[str]] = {}
+        for name, entry in new.items():
+            by_endpoint.setdefault(virtual_endpoint(name, entry), []).append(name)
+        matched: set[str] = set()
+        for name, entry in sorted(old.items()):
+            exact = next((candidate for candidate in new if object_path(candidate) == object_path(name)), None)
+            candidates = by_endpoint.get(virtual_endpoint(name, entry), [])
+            if exact:
+                target_name = exact
+            elif len(candidates) == 1 and candidates[0] not in matched:
+                target_name = candidates[0]
+            elif len(candidates) > 1:
+                reporter.add("ERROR", f"{side.upper()} virtual {name}",
+                             f"Ambiguous target endpoint: {candidates}")
+                continue
+            else:
+                reporter.add("FAIL", f"{side.upper()} virtual {name}",
+                             f"Missing from target; source destination={entry['destination']!r}")
+                continue
+            if target_name in matched:
+                reporter.add("ERROR", f"{side.upper()} virtual {name}",
+                             f"Target virtual {target_name} matched multiple source virtuals")
+                continue
+            matched.add(target_name)
+            label = f"{side.upper()} virtual {name}"
+            reporter.add("PASS" if object_path(name) == object_path(target_name) else "WARN",
+                         label, f"target={target_name} destination={entry['destination']}")
+            src_fields, dst_fields = entry["fields"], new[target_name]["fields"]
+            for field in ("destination", "ip-protocol", "source", "mask", "pool", "disabled", "enabled"):
+                before, after = src_fields.get(field), dst_fields.get(field)
+                if field == "pool":
+                    before = object_path(str(before)) if before not in (None, "none") else before
+                    after = object_path(str(after)) if after not in (None, "none") else after
+                if before != after:
+                    reporter.add("FAIL", f"{label} {field}", f"source={before!r} target={after!r}")
+            for field in ("profiles", "rules", "persist", "fallback-persistence",
+                          "source-address-translation", "vlans", "vlans-enabled"):
+                before, after = src_fields.get(field), dst_fields.get(field)
+                if before != after:
+                    reporter.add("WARN", f"{label} {field}", f"source={before!r} target={after!r}")
+        for name in sorted(new.keys() - matched):
+            reporter.add("WARN", f"{side.upper()} target virtual {name}",
+                         "No matching source virtual; review target-only configuration")
+
+    if "pool" in inventories:
+        old, new = inventories["pool"]
+        by_path = {object_path(name): name for name in new}
+        matched = set()
+        for name, entry in sorted(old.items()):
+            target_name = by_path.get(object_path(name))
+            label = f"{side.upper()} pool {name}"
+            if target_name is None:
+                reporter.add("FAIL", label, "Source pool missing from target")
+                continue
+            matched.add(target_name)
+            reporter.add("PASS", label, f"target={target_name}")
+            migrated = new[target_name]
+            src_members, dst_members = entry["members"], migrated["members"]
+            for identity, member in sorted(src_members.items()):
+                target_member = dst_members.get(identity)
+                if target_member is None:
+                    reporter.add("FAIL", f"{label} member {identity}",
+                                 f"Source member {member['name']} absent from target")
+                    continue
+                reporter.add("PASS", f"{label} member {identity}",
+                             f"source={member['name']} target={target_member['name']}")
+                for field in ("monitor", "session", "ratio", "priority-group"):
+                    before = member["fields"].get(field)
+                    after = target_member["fields"].get(field)
+                    if before != after:
+                        reporter.add("WARN", f"{label} member {identity} {field}",
+                                     f"source={before!r} target={after!r}")
+            for identity in sorted(dst_members.keys() - src_members.keys()):
+                reporter.add("WARN", f"{label} target member {identity}",
+                             "No source member at this address and port")
+            for field in ("monitor", "load-balancing-mode", "min-active-members"):
+                before, after = entry["fields"].get(field), migrated["fields"].get(field)
+                if before != after:
+                    reporter.add("WARN", f"{label} {field}", f"source={before!r} target={after!r}")
+        for name in sorted(new.keys() - matched):
+            reporter.add("WARN", f"{side.upper()} target pool {name}",
+                         "No matching source pool; review target-only configuration")
+
+
 def compare_ntp_sync(reporter: Reporter, side: str, role: str, record: dict | None) -> None:
     ntp_record = record.get("privileged_ntp") if record else None
     if ntp_record is None:
@@ -1246,7 +1411,7 @@ def compare_ntp_sync(reporter: Reporter, side: str, role: str, record: dict | No
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("manifest", type=Path, help="JSON from Export-F5Migration.ps1")
-    ap.add_argument("--checks", default="basic,platform", help="basic,platform,network,routes,system,all and !category exclusions")
+    ap.add_argument("--checks", default="basic,platform", help="basic,platform,network,routes,system,applications,all and !category exclusions")
     ap.add_argument("--filter", metavar="STATUSES", help="show only listed result labels, e.g. FAIL or FAIL,ERROR; summary still counts all")
     ap.add_argument("--nocolor", action="store_true", help="disable colored status labels")
     ap.add_argument("--ntp-sync", action="store_true", help="compatibility option; NTP sync runs automatically for system checks when SSHPASSNET is set")
@@ -1279,11 +1444,11 @@ def main() -> int:
     print(f"Migration {manifest['migration_package']} | checks={','.join(sorted(checks))} | read-only")
     check_permissions(reporter, manifest, args.host_key_mode,
                       offline=bool(args.from_snapshot), check_system="system" in checks,
-                      check_bigip=bool(checks & {"basic", "network", "routes", "system"}))
+                      check_bigip=bool(checks & {"basic", "network", "routes", "system", "applications"}))
 
     for side in ("a", "b"):
         device = manifest["devices"][side]
-        roles = (["source", "target"] if checks & {"basic", "network", "routes", "system"} else []) + (["rseries_host"] if checks & {"platform", "network"} else [])
+        roles = (["source", "target"] if checks & {"basic", "network", "routes", "system", "applications"} else []) + (["rseries_host"] if checks & {"platform", "network"} else [])
         collected: dict[str, dict | None] = {}
         for role in roles:
             expected = device[role]
@@ -1299,6 +1464,8 @@ def main() -> int:
                     commands += list(ROUTE_COMMANDS.values())
                 if "system" in checks:
                     commands += list(SYSTEM_COMMANDS.values())
+                if "applications" in checks:
+                    commands += list(APPLICATION_COMMANDS.values())
             else:
                 commands = ["show system version | nomore", "show system state hostname",
                             "show system mgmt-ip", "show tenants | nomore", "show fips | nomore"]
@@ -1347,6 +1514,8 @@ def main() -> int:
             compare_system(reporter, side, collected.get("source"), collected.get("target"))
             for role in ("source", "target"):
                 compare_ntp_sync(reporter, side, role, collected.get(role))
+        if "applications" in checks:
+            compare_applications(reporter, side, collected.get("source"), collected.get("target"))
     return reporter.finish()
 
 
