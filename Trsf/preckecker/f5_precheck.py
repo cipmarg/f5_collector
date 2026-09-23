@@ -35,6 +35,7 @@ BIGIP_RESPONSES = (
     re.compile(r"(?ims)^\s*Version\s+\d+(?:\.\d+){2,4}\s*$.*?^\s*Build\s+[\d.]+\s*$"),
     re.compile(r"(?im)\bhostname[ \t]+[A-Za-z0-9][A-Za-z0-9._-]+\b"),
     re.compile(r"(?im)\bsys\s+management-ip\s+(?:\d{1,3}\.){3}\d{1,3}"),
+    re.compile(r"(?is)\bsys[ \t]+management-route[ \t]+default[ \t]*\{[^}]*\bgateway[ \t]+(?:\d{1,3}\.){3}\d{1,3}"),
 )
 
 
@@ -335,9 +336,20 @@ def bigip_data(record: dict | None) -> dict:
     output, error = bigip_section("list sys management-ip")
     if error:
         values["management_ip_error"] = error
+        values["management_prefix_length_error"] = error
     else:
-        match = re.search(r"(?im)^\s*sys\s+management-ip\s+((?:\d{1,3}\.){3}\d{1,3})(?:/\d+)?\b", output)
+        match = re.search(r"(?im)^\s*sys\s+management-ip\s+((?:\d{1,3}\.){3}\d{1,3})(?:/(\d+))?\b", output)
         values["management_ip"] = match.group(1) if match else None
+        values["management_prefix_length"] = match.group(2) if match else None
+    if record and "list sys management-route" not in record.get("commands", []):
+        values["gateway_skipped"] = True  # Older snapshots did not collect this.
+    else:
+        output, error = bigip_section("list sys management-route")
+        if error:
+            values["management_gateway_error"] = error
+        else:
+            match = re.search(r"(?is)\bsys[ \t]+management-route[ \t]+default[ \t]*\{[^}]*\bgateway[ \t]+((?:\d{1,3}\.){3}\d{1,3})\b", output)
+            values["management_gateway"] = match.group(1) if match else None
     return values
 
 
@@ -430,7 +442,8 @@ class Reporter:
         print(f"[{status:<5}] {label:<45} {detail}")
 
     def compare(self, label: str, expected: object, actual: object,
-                error: str | None = None, *, casefold: bool = False) -> None:
+                error: str | None = None, *, casefold: bool = False,
+                hostname_suffix: str | None = None) -> None:
         if error:
             self.add("ERROR", label, error)
         elif actual is None or str(actual).strip() == "":
@@ -439,6 +452,8 @@ class Reporter:
             self.add("SKIP", label, "No expected value in manifest")
         else:
             a, b = str(actual).strip(), str(expected).strip()
+            if hostname_suffix and not b.casefold().endswith(hostname_suffix.casefold()):
+                b += hostname_suffix
             matches = a.casefold() == b.casefold() if casefold else a == b
             self.add("PASS" if matches else "FAIL", label,
                      f"expected={b!r} actual={a!r}")
@@ -454,7 +469,8 @@ def compare_bigip(reporter: Reporter, side: str, role: str, expected: dict,
                   observed: dict) -> None:
     prefix = f"{side.upper()} {role} BIG-IP"
     reporter.compare(f"{prefix} hostname", expected["expected_hostname"],
-                     observed.get("hostname"), observed.get("hostname_error"), casefold=True)
+                     observed.get("hostname"), observed.get("hostname_error"),
+                     casefold=True, hostname_suffix=".net.global")
     reporter.compare(f"{prefix} management IP", expected["management_ip"],
                      observed.get("management_ip"), observed.get("management_ip_error"))
     if role == "source":
@@ -469,6 +485,13 @@ def compare_bigip(reporter: Reporter, side: str, role: str, expected: dict,
                          observed.get("version"), observed.get("version_error"))
         reporter.compare(f"{prefix} build", expected_software["build"],
                          observed.get("build"), observed.get("version_error"))
+        reporter.compare(f"{prefix} management prefix", expected["management_prefix_length"],
+                         observed.get("management_prefix_length"), observed.get("management_prefix_length_error"))
+        if observed.get("gateway_skipped"):
+            reporter.add("SKIP", f"{prefix} management gateway", "Command absent from older snapshot")
+        else:
+            reporter.compare(f"{prefix} management gateway", expected["management_gateway"],
+                             observed.get("management_gateway"), observed.get("management_gateway_error"))
 
 
 def compare_platform(reporter: Reporter, side: str, expected: dict, observed: dict) -> None:
@@ -548,7 +571,8 @@ def main() -> int:
             cli = "f5os" if role == "rseries_host" else "bigip"
             account = args.f5os_account if cli == "f5os" else "regular"
             if cli == "bigip":
-                commands = ["show sys version", "list sys global-settings hostname", "list sys management-ip"]
+                commands = ["show sys version", "list sys global-settings hostname",
+                            "list sys management-ip", "list sys management-route"]
             else:
                 commands = ["show system version | nomore", "show system state hostname",
                             "show system mgmt-ip", "show tenants | nomore", "show fips | nomore"]
