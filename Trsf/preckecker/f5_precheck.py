@@ -825,18 +825,20 @@ def compare_network(reporter: Reporter, side: str, source: dict | None,
             reporter.add("FAIL" if match else "PASS", f"{label} HSM exclusion",
                          f"HSM address present on target as {match}" if match else "HSM address absent from target")
             continue
-        if peer:
-            reporter.add("FAIL" if match else "PASS", f"{label} PEER exclusion",
-                         f"PEER address present on target as {match}" if match else "PEER self IP replaced")
-            continue
         if not match:
-            reporter.add("FAIL", label, "Source self IP address absent from target")
+            reporter.add("FAIL", label, "PEER self IP address absent from target SYNC VLAN"
+                         if peer else "Source self IP address absent from target")
             continue
         reporter.add("PASS", label, f"matched target self IP {match}")
         dst_entry = dst_self[match]
         dst_vlan = vlan_reference(dst_vlans, dst_entry["vlan"])
         if dst_vlan is None:
             reporter.add("ERROR", f"{label} VLAN", f"Target VLAN {dst_entry['vlan']!r} missing")
+        elif peer:
+            on_sync = any(dst_vlan is dst_vlans[sync_name] for sync_name in sync_names)
+            reporter.add("PASS" if on_sync else "FAIL", f"{label} PEER to SYNC VLAN",
+                         f"target={dst_entry['vlan']!r} tag={dst_vlan['tag']}"
+                         + ("" if on_sync else "; address must be on the target SYNC VLAN"))
         else:
             reporter.compare(f"{label} VLAN tag", tag, dst_vlan["tag"])
         original = entry["properties"]
