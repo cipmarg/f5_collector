@@ -1,7 +1,7 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-  Export one A/B migration package from the LB_List Excel table to a JSON manifest.
+  Export one A/B migration package from LB_List and Pack_List to a JSON manifest.
 .EXAMPLE
   .\Export-F5Migration.ps1 -Workbook 'C:\Work\EdgeConnect - Migration plan 2026.xlsx' -MigrationPackage SLO-0705 -Output '.\migration_SLO-0705.json'
 .NOTES
@@ -13,7 +13,8 @@ param(
     [Parameter(Mandatory=$true)][string]$Workbook,
     [Parameter(Mandatory=$true)][string]$MigrationPackage,
     [Parameter(Mandatory=$true)][string]$Output,
-    [string]$TableName = 'LB_List'
+    [string]$TableName = 'LB_List',
+    [string]$NetworkMap
 )
 
 Set-StrictMode -Version Latest
@@ -47,7 +48,7 @@ function Read-IPv4([string]$Value, [string]$Field) {
     if (-not [System.Net.IPAddress]::TryParse($Value, [ref]$address) -or
         $address.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
         $Value -notmatch '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$') {
-        throw "Invalid IPv4 address for $Field: '$Value'."
+        throw "Invalid IPv4 address for ${Field}: '$Value'."
     }
     return $address.ToString()
 }
@@ -59,7 +60,124 @@ function Parse-Software([string]$Value) {
     $version = $matchesFound[0].Value
     $build = $null
     if ($matchesFound.Count -ge 2) { $build = $matchesFound[1].Value }
-    return [ordered]@{ version = $version; build = $build; edition = $null; hotfix_id = $null; workbook_value = $Value }
+    if ($null -eq $build) { throw "Cannot parse target BIG-IP build from '$Value'." }
+    return [ordered]@{ version = $version; build = $build; workbook_value = $Value }
+}
+
+function Find-ExcelTable($Book, [string]$Name) {
+    foreach ($sheet in $Book.Worksheets) {
+        try {
+            foreach ($candidate in $sheet.ListObjects) {
+                if ($candidate.Name -eq $Name) { return $candidate }
+                [void][Runtime.InteropServices.Marshal]::ReleaseComObject($candidate)
+            }
+        } finally {
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($sheet)
+        }
+    }
+    throw "Excel table '$Name' was not found."
+}
+
+function Get-FieldIndexes($Table, $Aliases, [string[]]$RequiredFields) {
+    $headers = $Table.HeaderRowRange.Value2
+    $headerIndex = @{}
+    for ($c = 1; $c -le [int]$Table.ListColumns.Count; $c++) {
+        $header = ([string](Read-MatrixCell $headers 1 $c)).Trim()
+        $key = Normalize-Header $header
+        if ($headerIndex.ContainsKey($key)) { throw "Ambiguous column headers after normalization: '$header'." }
+        $headerIndex[$key] = $c
+    }
+    $result = @{}
+    foreach ($field in $Aliases.Keys) {
+        foreach ($alias in $Aliases[$field]) {
+            $key = Normalize-Header $alias
+            if ($headerIndex.ContainsKey($key)) { $result[$field] = $headerIndex[$key]; break }
+        }
+    }
+    foreach ($field in $RequiredFields) {
+        if (-not $result.ContainsKey($field)) {
+            throw "Missing required column '$($Aliases[$field][0])' in table '$($Table.Name)'."
+        }
+    }
+    return $result
+}
+
+function Find-PackageRow($Table, $Indexes, [string]$Package) {
+    if ($null -eq $Table.DataBodyRange) { throw "Table '$($Table.Name)' has no rows." }
+    $data = $Table.DataBodyRange.Value2
+    $found = @()
+    for ($r = 1; $r -le [int]$Table.DataBodyRange.Rows.Count; $r++) {
+        $value = [string](Read-MatrixCell $data $r $Indexes['package'])
+        if ($value.Trim() -ine $Package.Trim()) { continue }
+        $entry = @{ _table_row = $r }
+        foreach ($field in $Indexes.Keys) { $entry[$field] = Read-MatrixCell $data $r $Indexes[$field] }
+        $found += ,$entry
+    }
+    if ($found.Count -ne 1) {
+        throw "Expected one Pack_List row for '$Package'; found $($found.Count)."
+    }
+    return $found[0]
+}
+
+function Read-VipCount($Row) {
+    $value = Read-Field $Row 'vip_count' $true
+    $count = 0
+    if (-not [int]::TryParse($value, [ref]$count) -or $count -lt 0) {
+        throw "Invalid Number of VIPs '$value' for table row $($Row['_table_row'])."
+    }
+    return $count
+}
+
+function Get-NetworkAddress([string]$Address, [int]$Prefix) {
+    $bytes = [System.Net.IPAddress]::Parse($Address).GetAddressBytes()
+    for ($i = 0; $i -lt 4; $i++) {
+        $bits = [Math]::Min(8, [Math]::Max(0, $Prefix - 8 * $i))
+        $mask = if ($bits -eq 0) { 0 } else { 256 - (1 -shl (8 - $bits)) }
+        $bytes[$i] = [byte]($bytes[$i] -band $mask)
+    }
+    return ([System.Net.IPAddress]::new($bytes)).ToString()
+}
+
+function Get-NetworkSettings([string]$Address, [string]$Package, $Rules) {
+    if ($Package -notmatch '^([a-zA-Z]{3})-') {
+        throw "Cannot derive management environment from migration package '$Package'."
+    }
+    $site = $Matches[1].ToUpperInvariant()
+    $matchingRules = @($Rules | Where-Object { ([string]$_.prefix).ToUpperInvariant() -eq $site })
+    if ($matchingRules.Count -ne 1) {
+        throw "Expected one management network rule for '$site'; found $($matchingRules.Count)."
+    }
+    foreach ($rule in $matchingRules) {
+        $subnet = [string]$rule.subnet
+        $gateway = Read-IPv4 ([string]$rule.gateway) 'management_gateway'
+        if ($subnet -notmatch '^((?:[0-9]{1,3}\.){3}[0-9]{1,3})/(\d{1,2})$') {
+            throw "Invalid management subnet '$subnet'."
+        }
+        $network = Read-IPv4 $Matches[1] 'management_subnet'
+        $prefix = [int]$Matches[2]
+        if ($prefix -lt 1 -or $prefix -gt 30) { throw "Invalid management prefix length in '$subnet'." }
+        if ((Get-NetworkAddress $network $prefix) -ne $network) {
+            throw "'$subnet' is not a canonical network address."
+        }
+        if ((Get-NetworkAddress $gateway $prefix) -ne $network) {
+            throw "Gateway '$gateway' is outside '$subnet'."
+        }
+        if ((Get-NetworkAddress $Address $prefix) -ne $network) {
+            throw "Target management IP '$Address' is outside the $site network '$subnet'."
+        }
+        if ($Address -eq $gateway -or $Address -eq $network) {
+            throw "Invalid tenant management IP '$Address' within '$subnet'."
+        }
+        return [ordered]@{ subnet = $subnet; prefix_length = $prefix; gateway = $gateway }
+    }
+}
+
+function Get-FipsSizing([string]$HostModel, [int]$Vcpu) {
+    switch ($HostModel.ToUpperInvariant()) {
+        'R10920-DF' { return [ordered]@{ accelerator_devices = [int]($Vcpu * 1.5); keys = 10000 } }
+        'R5920-DF'  { return [ordered]@{ accelerator_devices = $Vcpu; keys = 4000 } }
+        default     { return [ordered]@{ accelerator_devices = $null; keys = $null } }
+    }
 }
 
 # Header aliases are intentionally narrow. A renamed required column should stop the export.
@@ -78,57 +196,54 @@ $aliases = [ordered]@{
     vip_count            = @('Number of VIPs')
     cert_count           = @('Number of Certificates')
     fips_partition_size  = @('FIPS Partition Size')
-    tenant_vcpu          = @('Target Tenant vCPUs', 'Target Tenant vCPU')
     tenant_memory_gb     = @('Target Tenant Memory GB')
 }
 $requiredColumns = @('package','source_hostname','source_management_ip',
     'target_hostname','target_management_ip','host_hostname','host_management_ip',
-    'host_model','target_software')
+    'host_model','target_software','vip_count')
 
-$excel = $book = $table = $null
+$packAliases = [ordered]@{
+    package            = @('Migration Package')
+    migration_type     = @('Migration Type')
+    silo               = @('Silo')
+    purpose            = @('Purpose')
+    environment        = @('Environment')
+    environment_1      = @('Environment_1', 'Environment 1')
+    environment_2      = @('Environment_2', 'Environment 2')
+    project_manager    = @('Project Manager')
+    technical_lead     = @('Technical Lead')
+    migration_engineer = @('Migration Engineer')
+    aci_engineer       = @('ACI Engineer')
+}
+
+$excel = $book = $table = $packTable = $null
 try {
+    # Source: workbook Management subnet SWITCH(LEFT(Migration_Package, 3), ...).
+    $networkRules = @(
+        [pscustomobject]@{ prefix = 'SLO'; subnet = '10.235.248.128/25'; gateway = '10.235.248.254' }
+        [pscustomobject]@{ prefix = 'GLO'; subnet = '10.233.215.0/25';   gateway = '10.233.215.126' }
+        [pscustomobject]@{ prefix = 'PIL'; subnet = '10.129.200.0/23';   gateway = '10.129.201.254' }
+        [pscustomobject]@{ prefix = 'CQG'; subnet = '10.131.200.0/23';   gateway = '10.131.201.254' }
+    )
+    if ($NetworkMap) {
+        $networkRules += @(ConvertFrom-Json -InputObject ([IO.File]::ReadAllText((Resolve-Path -LiteralPath $NetworkMap).Path)))
+    }
     $resolvedWorkbook = (Resolve-Path -LiteralPath $Workbook).Path
     $excel = New-Object -ComObject Excel.Application
     $excel.Visible = $false
     $excel.DisplayAlerts = $false
     $excel.AskToUpdateLinks = $false
     $book = $excel.Workbooks.Open($resolvedWorkbook, 0, $true)
-    foreach ($sheet in $book.Worksheets) {
-        try {
-            foreach ($candidate in $sheet.ListObjects) {
-                if ($candidate.Name -eq $TableName) { $table = $candidate; break }
-            }
-            if ($null -ne $table) { break }
-        } finally {
-            if ($null -ne $sheet) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($sheet) }
-        }
-    }
-    if ($null -eq $table) { throw "Excel table '$TableName' was not found." }
+    $table = Find-ExcelTable $book $TableName
+    $packTable = Find-ExcelTable $book 'Pack_List'
     if ($null -eq $table.DataBodyRange) { throw "Excel table '$TableName' has no rows." }
 
-    $headers = $table.HeaderRowRange.Value2
     $cells = $table.DataBodyRange.Value2
-    $columnCount = [int]$table.ListColumns.Count
     $rowCount = [int]$table.DataBodyRange.Rows.Count
-    $headerIndex = @{}
-    for ($c = 1; $c -le $columnCount; $c++) {
-        $header = ([string](Read-MatrixCell $headers 1 $c)).Trim()
-        $key = Normalize-Header $header
-        if ($headerIndex.ContainsKey($key)) { throw "Ambiguous column headers after normalization: '$header'." }
-        $headerIndex[$key] = $c
-    }
-    $fieldIndex = @{}
-    foreach ($field in $aliases.Keys) {
-        foreach ($alias in $aliases[$field]) {
-            $key = Normalize-Header $alias
-            if ($headerIndex.ContainsKey($key)) { $fieldIndex[$field] = $headerIndex[$key]; break }
-        }
-    }
-    foreach ($field in $requiredColumns) {
-        if (-not $fieldIndex.ContainsKey($field)) {
-            throw "Missing required column '$($aliases[$field][0])' in Excel table '$TableName'."
-        }
-    }
+    $fieldIndex = Get-FieldIndexes $table $aliases $requiredColumns
+    # Normalize-Header removes embedded CR/LF from 'Migration<newline>type'.
+    $packIndexes = Get-FieldIndexes $packTable $packAliases @($packAliases.Keys)
+    $packRow = Find-PackageRow $packTable $packIndexes $MigrationPackage
 
     $selected = @()
     for ($r = 1; $r -le $rowCount; $r++) {
@@ -154,8 +269,19 @@ try {
         $side = $sourceName.Substring($sourceName.Length - 1).ToUpperInvariant()
         $targetSide = $targetName.Substring($targetName.Length - 1).ToUpperInvariant()
         if ($side -ne $targetSide) { throw "A/B side mismatch: '$sourceName' -> '$targetName'." }
-        if ($devices.Contains($side)) { throw "Duplicate $side row in '$MigrationPackage'." }
+        if ($devices.Contains($side.ToLowerInvariant())) { throw "Duplicate $side row in '$MigrationPackage'." }
         $software = Parse-Software (Read-Field $row 'target_software' $true)
+        $vipCount = Read-VipCount $row
+        # Exactly 1000 VIPs is assigned 8 CPUs as the conservative boundary.
+        $vcpu = if ($vipCount -lt 1000) { 4 } else { 8 }
+        $model = Read-Field $row 'host_model' $true
+        $targetManagementIp = Read-IPv4 (Read-Field $row 'target_management_ip' $true) 'target_management_ip'
+        $network = Get-NetworkSettings $targetManagementIp $MigrationPackage $networkRules
+        $fips = Get-FipsSizing $model $vcpu
+        if ($targetName -notmatch '-([^-]+-[^-]+)$') {
+            throw "Cannot derive FIPS partition from target hostname '$targetName'."
+        }
+        $partitionName = $Matches[1].ToUpperInvariant()
         $device = [ordered]@{
             source = [ordered]@{
                 ssh_host = $sourceName
@@ -165,19 +291,28 @@ try {
             target = [ordered]@{
                 ssh_host = $targetName
                 expected_hostname = $targetName
-                management_ip = Read-IPv4 (Read-Field $row 'target_management_ip' $true) 'target_management_ip'
+                tenant_name = $targetName.ToLowerInvariant()
+                tenant_name_candidates = @($targetName.ToLowerInvariant(), $targetName.ToUpperInvariant())
+                management_ip = $targetManagementIp
+                management_subnet = $network.subnet
+                management_prefix_length = $network.prefix_length
+                management_gateway = $network.gateway
                 software = $software
                 tenant = [ordered]@{
-                    vcpu = Read-Field $row 'tenant_vcpu'
+                    vip_count = $vipCount
+                    vcpu = $vcpu
                     memory_gb = Read-Field $row 'tenant_memory_gb'
                     fips_partition_size = Read-Field $row 'fips_partition_size'
+                    fips_partition_name = $partitionName
+                    fips_accelerator_devices = $fips.accelerator_devices
+                    fips_keys = $fips.keys
                 }
             }
             rseries_host = [ordered]@{
                 ssh_host = Read-Field $row 'host_hostname' $true
                 expected_hostname = Read-Field $row 'host_hostname' $true
                 management_ip = Read-IPv4 (Read-Field $row 'host_management_ip' $true) 'host_management_ip'
-                model = Read-Field $row 'host_model' $true
+                model = $model
             }
         }
         $devices[$side.ToLowerInvariant()] = $device
@@ -198,9 +333,21 @@ try {
         }
     }
     $manifest = [ordered]@{
-        schema_version = 1
+        schema_version = 2
         migration_package = $MigrationPackage.Trim()
         migration_date = $date
+        package_details = [ordered]@{
+            migration_type = Read-Field $packRow 'migration_type'
+            silo = Read-Field $packRow 'silo'
+            purpose = Read-Field $packRow 'purpose'
+            environment = Read-Field $packRow 'environment'
+            environment_1 = Read-Field $packRow 'environment_1'
+            environment_2 = Read-Field $packRow 'environment_2'
+            project_manager = Read-Field $packRow 'project_manager'
+            technical_lead = Read-Field $packRow 'technical_lead'
+            migration_engineer = Read-Field $packRow 'migration_engineer'
+            aci_engineer = Read-Field $packRow 'aci_engineer'
+        }
         devices = $devices
     }
     $json = ConvertTo-Json -InputObject $manifest -Depth 12
@@ -221,11 +368,12 @@ try {
         if ([IO.File]::Exists($tempPath)) { [IO.File]::Delete($tempPath) }
     }
     Write-Host "Exported $MigrationPackage (A/B) to $outputPath"
-    Write-Host "Target software: A=$($devices['a']['target']['software']['version']); B=$($devices['b']['target']['software']['version'])"
-    Write-Host 'Source software version, hotfix ID, VLANs, self IPs, and certificates are collected from the devices; they are not inferred from workbook statistics.'
+    Write-Host "Target software: A=$($devices['a']['target']['software']['version'])/$($devices['a']['target']['software']['build']); B=$($devices['b']['target']['software']['version'])/$($devices['b']['target']['software']['build'])"
+    Write-Host 'Source software version, VLANs, self IPs, and certificates are collected from the devices.'
 } finally {
-    if ($null -ne $book) { $book.Close($false); [void][Runtime.InteropServices.Marshal]::ReleaseComObject($book) }
     if ($null -ne $table) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($table) }
+    if ($null -ne $packTable) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($packTable) }
+    if ($null -ne $book) { $book.Close($false); [void][Runtime.InteropServices.Marshal]::ReleaseComObject($book) }
     if ($null -ne $excel) { $excel.Quit(); [void][Runtime.InteropServices.Marshal]::ReleaseComObject($excel) }
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
