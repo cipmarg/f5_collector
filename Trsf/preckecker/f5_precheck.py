@@ -38,6 +38,8 @@ VERSION_TEXT = re.compile(r"\b(\d+(?:\.\d+){2,4})\s+([0-9]+(?:\.[0-9]+){2,4})\b"
 F5OS_READY = re.compile(r"(?m)^\s*system\s+version\s+os-version\s+\S+")
 BIGIP_READY = re.compile(r"(?im)^\s*Version\s+\d+(?:\.\d+){2,4}\s*$")
 BIGIP_PROMPT = re.compile(r"(?im)^[^\n]{0,320}\(tmos\)#[ \t\n]*\Z")
+DISPLAY_CONFIRM = re.compile(r"(?i)Display all\s+\d+\s+items\?\s*\(y/n\)[ \t\n]*\Z")
+DISPLAY_PROMPT = re.compile(r"(?i)Display all\s+\d+\s+items\?")
 
 
 def parse_checks(spec: str) -> set[str]:
@@ -256,6 +258,7 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
     ready_pattern = BIGIP_READY if cli == "bigip" else F5OS_READY
     collected = bytearray()
     sections: dict[str, str] = {}
+    confirmed_display_prompts: dict[str, int] = {}
     error = None
     proc = None
     try:
@@ -271,6 +274,7 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
         eof = False
         next_command = 1
         segment_start = 0
+        last_display_response = 0
         exit_sent = False
         try:
             while time.monotonic() < deadline:
@@ -302,6 +306,18 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
                             except BrokenPipeError:
                                 break
                     if ready and cli == "bigip" and not exit_sent:
+                        pending_display = DISPLAY_CONFIRM.search(cleaned[segment_start:])
+                        if pending_display and segment_start + pending_display.end() > last_display_response:
+                            # tmsh asks for confirmation before printing large
+                            # one-line inventories. A newline alone may decline.
+                            try:
+                                proc.stdin.write(b"y\n")
+                                proc.stdin.flush()
+                                command = commands[next_command - 1]
+                                confirmed_display_prompts[command] = confirmed_display_prompts.get(command, 0) + 1
+                                last_display_response = segment_start + pending_display.end()
+                            except BrokenPipeError:
+                                break
                         prompt = BIGIP_PROMPT.search(cleaned)
                         if prompt and prompt.end() > segment_start:
                             sections[commands[next_command - 1]] = cleaned[segment_start:prompt.start()].strip()
@@ -340,7 +356,8 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
         password = ""  # Never save credentials to the snapshot.
     return {"host": host, "cli": cli, "account": account, "commands": commands,
             "returncode": proc.returncode, "error": error, "raw": raw,
-            "sections": sections if cli == "bigip" else split_transcript(raw, commands)}
+            "sections": sections if cli == "bigip" else split_transcript(raw, commands),
+            "confirmed_display_prompts": confirmed_display_prompts}
 
 
 def snapshot_path(directory: Path, side: str, role: str) -> Path:
@@ -485,6 +502,14 @@ def echoed_inventory(record: dict, command: str) -> str | None:
     return "\n".join(lines[start:following]).strip()
 
 
+def inventory_pager_error(record: dict, command: str, output: str) -> str | None:
+    count = len(DISPLAY_PROMPT.findall(output))
+    confirmed = record.get("confirmed_display_prompts", {}).get(command, 0)
+    if count > confirmed or re.search(r"(?i)--More--|\(END\)", output):
+        return f"{command} stopped at a tmsh display prompt; inventory may be incomplete"
+    return None
+
+
 def inventory_section(record: dict | None, command: str) -> tuple[str | None, str | None]:
     """Read an inventory, rejecting missing commands and truncated terminal output."""
     if record is None:
@@ -507,9 +532,8 @@ def inventory_section(record: dict | None, command: str) -> tuple[str | None, st
             # Older snapshots have interleaved command echoes such as "l ist".
             # Recover from object headers; each parser still validates its object.
             output = clean_transcript(record.get("raw", ""))
-    if re.search(r"(?i)Display all(?: \d+)? items\?|--More--|\(END\)",
-                 clean_transcript(record.get("raw", ""))):
-        return None, f"{command} stopped at a tmsh display prompt; inventory may be incomplete"
+    if pager_error := inventory_pager_error(record, command, output or ""):
+        return None, pager_error
     return output or "", None
 
 
@@ -722,8 +746,8 @@ def network_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | None
         return None, error
     if error:
         output = raw
-    if re.search(r"(?i)Display all(?: \d+)? items\?|--More--|\(END\)", raw):
-        return None, f"{command} stopped at a tmsh display prompt; inventory may be incomplete"
+    if pager_error := inventory_pager_error(record, command, output or ""):
+        return None, pager_error
     try:
         objects = tmsh_objects(output or "", kind)
         if not objects and raw and raw != output:
