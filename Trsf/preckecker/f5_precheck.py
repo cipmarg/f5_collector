@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read-only F5 migration validator (manifest schema 2).
 
-`basic`, `platform`, `network`, `routes`, `system`, and `applications` are implemented. BIG-IP
+`permissions`, `basic`, `platform`, `network`, `routes`, `system`, and `applications` are implemented. BIG-IP
 uses separate tmsh commands over one multiplexed SSH connection per endpoint;
 F5OS uses one interactive appliance CLI session. Supply --snapshot-dir so unexpected CLI
 output can be checked safely offline. Ctrl+C interrupts the current SSH
@@ -44,7 +44,7 @@ DISPLAY_ACCEPTED = re.compile(r"(?i)Display all\s+\d+\s+items\?\s*\(y/n\)\s*y\b"
 
 def parse_checks(spec: str) -> set[str]:
     selected: set[str] = set()
-    known = {"basic", "platform", "network", "routes", "system", "applications"}
+    known = {"permissions", "basic", "platform", "network", "routes", "system", "applications"}
     for token in spec.split(","):
         token = token.strip().lower()
         if not token:
@@ -56,7 +56,7 @@ def parse_checks(spec: str) -> set[str]:
         elif token in known:
             selected.add(token)
         else:
-            raise ValueError(f"Unsupported check category: {token!r}; available: basic,platform,network,routes,system,applications")
+            raise ValueError(f"Unsupported check category: {token!r}; available: permissions,basic,platform,network,routes,system,applications")
     if not selected:
         raise ValueError("No checks selected")
     return selected
@@ -1360,6 +1360,26 @@ def virtual_endpoint(name: str, entry: dict) -> tuple[str, ...]:
             str(fields.get("source", "0.0.0.0/0")), str(fields.get("mask", "")))
 
 
+def virtual_vlan_tags(name: str, fields: dict, vlans: dict[str, dict]) -> tuple[str, ...]:
+    """Resolve a virtual's VLAN list to tags, preserving duplicate references."""
+    references = fields.get("vlans")
+    if not references or references in ("none", "default"):
+        return ()
+    if not isinstance(references, tuple):
+        raise ValueError(f"Unrecognized VLAN list {references!r}")
+    partition = object_path(name).rsplit("/", 1)[0]
+    tags = []
+    for reference in references:
+        if reference in ("none", "default"):
+            continue
+        vlan = (vlans.get(reference) or vlans.get(f"{partition}/{reference}")
+                or vlan_reference(vlans, reference))
+        if vlan is None:
+            raise ValueError(f"Referenced VLAN {reference!r} absent from VLAN inventory")
+        tags.append(str(vlan["tag"]))
+    return tuple(sorted(tags, key=lambda tag: (int(tag) if tag.isdigit() else -1, tag)))
+
+
 def compare_applications(reporter: Reporter, side: str, source: dict | None,
                          target: dict | None) -> None:
     inventories: dict[str, tuple[dict[str, dict], dict[str, dict]]] = {}
@@ -1378,6 +1398,17 @@ def compare_applications(reporter: Reporter, side: str, source: dict | None,
 
     if "virtual" in inventories:
         old, new = inventories["virtual"]
+        vlan_inventories: tuple[dict[str, dict], dict[str, dict]] | None = None
+        if any(isinstance(entry["fields"].get("vlans"), tuple)
+               and entry["fields"]["vlans"] for entry in (*old.values(), *new.values())):
+            src_vlans, src_error = network_data(source, "vlan")
+            dst_vlans, dst_error = network_data(target, "vlan")
+            for role, error in (("source", src_error), ("target", dst_error)):
+                if error:
+                    reporter.add("ERROR", f"{side.upper()} {role} virtual VLAN inventory", error)
+            if not src_error and not dst_error:
+                assert src_vlans is not None and dst_vlans is not None
+                vlan_inventories = src_vlans, dst_vlans
         by_endpoint: dict[tuple[str, ...], list[str]] = {}
         for name, entry in new.items():
             by_endpoint.setdefault(virtual_endpoint(name, entry), []).append(name)
@@ -1407,15 +1438,25 @@ def compare_applications(reporter: Reporter, side: str, source: dict | None,
                          label, f"target={target_name} destination={entry['destination']}")
             src_fields, dst_fields = entry["fields"], new[target_name]["fields"]
             for field in ("destination", "ip-protocol", "source", "mask", "pool", "disabled", "enabled",
-                          "dhcp-relay", "ip-forward", "internal", "l2-forward", "reject"):
+                          "dhcp-relay", "ip-forward", "internal", "l2-forward", "reject",
+                          "policies", "translate-address", "translate-port"):
                 before, after = src_fields.get(field), dst_fields.get(field)
                 if field == "pool":
                     before = object_path(str(before)) if before not in (None, "none") else before
                     after = object_path(str(after)) if after not in (None, "none") else after
                 if before != after:
                     reporter.add("FAIL", f"{label} {field}", f"source={before!r} target={after!r}")
+            if vlan_inventories is not None and ("vlans" in src_fields or "vlans" in dst_fields):
+                try:
+                    before_tags = virtual_vlan_tags(name, src_fields, vlan_inventories[0])
+                    after_tags = virtual_vlan_tags(target_name, dst_fields, vlan_inventories[1])
+                    reporter.add("PASS" if before_tags == after_tags else "FAIL",
+                                 f"{label} VLAN tags",
+                                 f"source={before_tags!r} target={after_tags!r}")
+                except ValueError as exc:
+                    reporter.add("ERROR", f"{label} VLAN tags", str(exc))
             for field in ("profiles", "rules", "persist", "fallback-persistence",
-                          "source-address-translation", "vlans", "vlans-enabled"):
+                          "source-address-translation", "vlans-enabled", "vlans-disabled"):
                 before, after = src_fields.get(field), dst_fields.get(field)
                 if before != after:
                     reporter.add("WARN", f"{label} {field}", f"source={before!r} target={after!r}")
@@ -1491,7 +1532,7 @@ def compare_ntp_sync(reporter: Reporter, side: str, role: str, record: dict | No
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("manifest", type=Path, help="JSON from Export-F5Migration.ps1")
-    ap.add_argument("--checks", default="basic,platform", help="basic,platform,network,routes,system,applications,all and !category exclusions")
+    ap.add_argument("--checks", default="permissions,basic,platform", help="permissions,basic,platform,network,routes,system,applications,all and !category exclusions")
     ap.add_argument("--filter", metavar="STATUSES", help="show only listed result labels, e.g. FAIL or FAIL,ERROR; summary still counts all")
     ap.add_argument("--nocolor", action="store_true", help="disable colored status labels")
     ap.add_argument("--ntp-sync", action="store_true", help="compatibility option; NTP sync runs automatically for system checks when SSHPASSNET is set")
@@ -1510,9 +1551,9 @@ def main() -> int:
         ap.error("--timeout must be at least 10 seconds")
     if args.cli_ready_timeout < 1 or args.cli_ready_timeout > args.timeout:
         ap.error("--cli-ready-timeout must be between 1 and --timeout")
-    if not args.from_snapshot and not args.snapshot_dir:
-        ap.error("A live run requires --snapshot-dir for raw CLI evidence")
     checks = parse_checks(args.checks)
+    if checks != {"permissions"} and not args.from_snapshot and not args.snapshot_dir:
+        ap.error("A live run requires --snapshot-dir for raw CLI evidence")
     try:
         status_filter = parse_status_filter(args.filter)
     except ValueError as exc:
@@ -1522,9 +1563,10 @@ def main() -> int:
              and "NO_COLOR" not in os.environ)
     reporter = Reporter(status_filter=status_filter, color=color)
     print(f"Migration {manifest['migration_package']} | checks={','.join(sorted(checks))} | read-only")
-    check_permissions(reporter, manifest, args.host_key_mode,
-                      offline=bool(args.from_snapshot), check_system="system" in checks,
-                      check_bigip=bool(checks & {"basic", "network", "routes", "system", "applications"}))
+    if "permissions" in checks:
+        check_permissions(reporter, manifest, args.host_key_mode,
+                          offline=bool(args.from_snapshot), check_system="system" in checks,
+                          check_bigip=True)
 
     for side in ("a", "b"):
         device = manifest["devices"][side]
@@ -1540,6 +1582,8 @@ def main() -> int:
                             "list sys management-ip", "list sys management-route default"]
                 if "network" in checks:
                     commands += list(NETWORK_COMMANDS.values())
+                elif "applications" in checks:
+                    commands.append(NETWORK_COMMANDS["vlan"])
                 if "routes" in checks:
                     commands += list(ROUTE_COMMANDS.values())
                 if "system" in checks:
