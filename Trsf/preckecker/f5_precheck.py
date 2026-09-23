@@ -351,6 +351,36 @@ def tmsh_property(body: str, name: str) -> str | None:
     return match.group(1).strip('"') if match else None
 
 
+def tmsh_fields(body: str) -> dict[str, str | tuple[str, ...]]:
+    """Read every top-level property, preserving nested properties as tokens."""
+    tokens = re.findall(r'"(?:\\.|[^"\\])*"|[{}]|[^\s{}"]+', body)
+    fields: dict[str, str | tuple[str, ...]] = {}
+    index = 0
+    while index < len(tokens):
+        key = tokens[index]
+        if key in ("{", "}") or index + 1 >= len(tokens):
+            raise ValueError(f"Malformed tmsh property near {key!r}")
+        index += 1
+        if tokens[index] == "{":
+            index += 1
+            depth = 1
+            contents: list[str] = []
+            while index < len(tokens) and depth:
+                token = tokens[index]
+                depth += (token == "{") - (token == "}")
+                if depth:
+                    contents.append(token)
+                index += 1
+            if depth:
+                raise ValueError(f"Incomplete tmsh property {key!r}")
+            # Service order does not affect the port-lockdown policy.
+            fields[key] = tuple(sorted(contents)) if key == "allow-service" else tuple(contents)
+        else:
+            fields[key] = tokens[index].strip('"')
+            index += 1
+    return fields
+
+
 def normalize_self_address(address: str) -> str:
     """Normalize masks while keeping BIG-IP route-domain suffixes such as %1."""
     match = re.fullmatch(r"([^/%]+)(%\d+)?/(.+)", address)
@@ -385,6 +415,7 @@ def network_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | None
             return None, f"No net {kind} objects found; inspect raw snapshot for pager or CLI errors"
         result: dict[str, dict] = {}
         for name, body in objects.items():
+            fields = tmsh_fields(body)
             if kind == "vlan":
                 interfaces = tmsh_block(body, "interfaces")
                 members = []
@@ -396,7 +427,9 @@ def network_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | None
                 tag = tmsh_property(body, "tag")
                 if tag is None:
                     raise ValueError(f"net vlan {name}: tag missing")
-                result[name] = {"tag": tag, "interfaces": sorted(members)}
+                result[name] = {"tag": tag, "interfaces": sorted(members),
+                                "failsafe": {key: value for key, value in fields.items()
+                                             if key == "failsafe" or key.startswith("failsafe-")}}
             else:
                 address = tmsh_property(body, "address")
                 vlan = tmsh_property(body, "vlan")
@@ -407,8 +440,9 @@ def network_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | None
                     address = normalize_self_address(address)
                 except ValueError as exc:
                     raise ValueError(f"net self {name}: invalid address {address!r}") from exc
-                result[name] = {"address": address, "vlan": vlan, "traffic_group": group,
-                                "floating": not group.rsplit("/", 1)[-1].lower() == "traffic-group-local-only"}
+                fields["address"] = address
+                result[name] = {"address": address, "vlan": vlan,
+                                "properties": fields}
         return result, None
     except ValueError as exc:
         return None, str(exc)
@@ -444,6 +478,9 @@ def parse_f5os_tenant(output: str) -> dict | None:
     state: dict[str, str] = {"name": name.group(1)}
     for key, value in re.findall(r"(?im)^\s*state\s+([\w-]+)\s+(.+?)\s*$", output):
         state[key.lower()] = value.strip().strip('"')
+    mac = re.search(r"(?im)^\s*(?:state\s+)?mac-data\s+base-mac\s+([0-9a-f:.-]+)\s*$", output)
+    if mac:
+        state["base_mac"] = mac.group(1)
     # `state image` is the deployment image. Only image-version reflects the
     # version currently running inside the tenant.
     running = VERSION_TEXT.search(state.get("image-version", ""))
@@ -617,38 +654,209 @@ def compare_platform(reporter: Reporter, side: str, expected: dict, observed: di
         reporter.add("SKIP", f"{prefix} FIPS", "Not applicable for this host model")
 
 
-def compare_network(reporter: Reporter, side: str, source: dict | None,
-                    target: dict | None) -> None:
-    """Show source-to-target differences; a migration mapping is needed to adjudicate them."""
-    for kind in ("vlan", "self"):
-        label = f"{side.upper()} {kind.upper()} network inventory"
-        src, src_error = network_data(source, kind)
-        dst, dst_error = network_data(target, kind)
-        if src_error or dst_error:
-            for role, error in (("source", src_error), ("target", dst_error)):
-                if error:
-                    reporter.add("ERROR", f"{label} {role}", error)
+def network_name(name: str) -> str:
+    return name.rsplit("/", 1)[-1]
+
+
+def named_network(name: str, marker: str) -> bool:
+    return bool(re.search(r"(?:^|[-_])" + marker + r"(?:[-_]|$)", network_name(name), re.I))
+
+
+def vlan_reference(vlans: dict[str, dict], name: str) -> dict | None:
+    return vlans.get(name) or vlans.get("/Common/" + name)
+
+
+def self_identity(entry: dict) -> str:
+    return entry["address"].split("/", 1)[0]
+
+
+def sync_tag(record: dict | None, candidates: list[str]) -> tuple[int | None, str | None, str | None]:
+    """The lowest base MAC is the first currently deployed tenant on a host."""
+    output, error = section(record, "show tenants | nomore")
+    if error:
+        return None, error, None
+    tenants = f5os_tenants(output)
+    if not tenants:
+        return None, "No F5OS tenants found for SYNC VLAN ordering", None
+    macs: dict[str, int] = {}
+    for tenant in tenants:
+        if tenant.get("running-state", "deployed").casefold() != "deployed":
             continue
-        assert src is not None and dst is not None
-        differences = 0
-        for name in sorted(src.keys() | dst.keys()):
-            if name not in dst:
-                reporter.add("WARN", f"{side.upper()} {kind} {name}", "Present on source; absent from target")
-                differences += 1
-            elif name not in src:
-                reporter.add("WARN", f"{side.upper()} {kind} {name}", "Present on target; absent from source")
-                differences += 1
+        mac = tenant.get("base_mac")
+        normalized = re.sub(r"[:-]", "", mac or "")
+        if not re.fullmatch(r"[0-9A-Fa-f]{12}", normalized):
+            return None, f"F5OS base MAC missing or invalid for tenant {tenant['name']}; cannot assign SYNC tag", None
+        macs[tenant["name"].casefold()] = int(normalized, 16)
+    if len(set(macs.values())) != len(macs):
+        return None, "F5OS tenants have duplicate base MACs; deployment order is ambiguous", None
+    matching = [candidate.casefold() for candidate in candidates if candidate.casefold() in macs]
+    if not matching:
+        return None, "Manifest tenant not found in F5OS inventory for SYNC ordering", None
+    rank = sorted(macs.values()).index(macs[matching[0]]) + 1
+    return 4000 + rank, None, f"tenant={matching[0]} base-mac={macs[matching[0]]:012x} rank={rank}"
+
+
+def compare_network(reporter: Reporter, side: str, source: dict | None,
+                    target: dict | None, host: dict | None,
+                    candidates: list[str]) -> None:
+    src_vlans, src_vlan_error = network_data(source, "vlan")
+    dst_vlans, dst_vlan_error = network_data(target, "vlan")
+    src_self, src_self_error = network_data(source, "self")
+    dst_self, dst_self_error = network_data(target, "self")
+    for label, error in (("source VLAN", src_vlan_error), ("target VLAN", dst_vlan_error),
+                         ("source self IP", src_self_error), ("target self IP", dst_self_error)):
+        if error:
+            reporter.add("ERROR", f"{side.upper()} {label} inventory", error)
+    if any((src_vlan_error, dst_vlan_error, src_self_error, dst_self_error)):
+        return
+    assert src_vlans is not None and dst_vlans is not None
+    assert src_self is not None and dst_self is not None
+    src_tags: dict[str, str] = {}
+    dst_tags: dict[str, str] = {}
+    for role, vlans, by_tag in (("source", src_vlans, src_tags),
+                                ("target", dst_vlans, dst_tags)):
+        for name, vlan in vlans.items():
+            tag = vlan["tag"]
+            if tag in by_tag:
+                reporter.add("ERROR", f"{side.upper()} {role} VLAN tag {tag}",
+                             f"Ambiguous: {by_tag[tag]} and {name}")
+            by_tag[tag] = name
+    if len(src_tags) != len(src_vlans) or len(dst_tags) != len(dst_vlans):
+        return
+
+    hsm_tags = {entry["tag"] for name, entry in src_vlans.items() if named_network(name, "HSM")}
+    peer_tags = {entry["tag"] for name, entry in src_vlans.items() if named_network(name, "PEER")}
+    sync_names = [name for name in dst_vlans if named_network(name, "SYNC")]
+    expected_sync, sync_error, sync_basis = sync_tag(host, candidates) if peer_tags else (None, None, None)
+    if sync_error:
+        reporter.add("ERROR", f"{side.upper()} SYNC VLAN deployment order", sync_error)
+    elif sync_basis:
+        reporter.add("INFO", f"{side.upper()} SYNC VLAN deployment order", sync_basis)
+    for name, vlan in src_vlans.items():
+        tag = vlan["tag"]
+        label = f"{side.upper()} VLAN {name} tag {tag}"
+        match = dst_tags.get(tag)
+        if tag in hsm_tags:
+            reporter.add("FAIL" if match else "PASS", f"{label} HSM exclusion",
+                         f"HSM tag present on target as {match}" if match else "HSM tag absent from target")
+        elif tag in peer_tags:
+            reporter.add("FAIL" if match else "PASS", f"{label} PEER exclusion",
+                         f"PEER tag remains on target as {match}" if match else "PEER tag replaced")
+        elif not match:
+            reporter.add("FAIL", label, "Source VLAN tag absent from target")
+        else:
+            reporter.add("PASS", label, f"matched target VLAN {match}")
+            expected_name = f"{network_name(name)}-{tag}"
+            reporter.add("PASS" if network_name(match).casefold() == expected_name.casefold() else "WARN",
+                         f"{label} target name", f"expected={expected_name!r} actual={network_name(match)!r}")
+            for setting in sorted(vlan["failsafe"].keys() | dst_vlans[match]["failsafe"].keys()):
+                original = vlan["failsafe"].get(setting)
+                migrated = dst_vlans[match]["failsafe"].get(setting)
+                reporter.add("PASS" if original == migrated else "WARN", f"{label} {setting}",
+                             f"source={original!r} target={migrated!r}")
+    for name, vlan in dst_vlans.items():
+        tag = vlan["tag"]
+        if named_network(name, "HSM"):
+            reporter.add("FAIL", f"{side.upper()} target HSM VLAN {name}", "HSM VLAN must not be present")
+        elif named_network(name, "PEER"):
+            reporter.add("FAIL", f"{side.upper()} target PEER VLAN {name}", "PEER must be replaced with SYNC")
+        elif tag not in src_tags and name not in sync_names:
+            reporter.add("WARN", f"{side.upper()} target VLAN {name}", "No source VLAN with this tag")
+    if peer_tags:
+        if len(sync_names) != 1:
+            reporter.add("FAIL", f"{side.upper()} SYNC VLAN", f"Expected one SYNC VLAN, found {sync_names}")
+        elif expected_sync is not None:
+            name = sync_names[0]
+            reporter.compare(f"{side.upper()} SYNC VLAN tag (MAC rank)",
+                             expected_sync, dst_vlans[name]["tag"])
+            expected_name = f"SYNC-VLAN-{expected_sync}"
+            actual_name = network_name(name)
+            reporter.add("PASS" if expected_name.casefold() == actual_name.casefold() else "WARN",
+                         f"{side.upper()} SYNC VLAN name",
+                         f"expected={expected_name!r} actual={actual_name!r}")
+
+    src_ips: dict[str, str] = {}
+    dst_ips: dict[str, str] = {}
+    for role, entries, by_ip in (("source", src_self, src_ips), ("target", dst_self, dst_ips)):
+        for name, entry in entries.items():
+            key = self_identity(entry)
+            if key in by_ip:
+                reporter.add("ERROR", f"{side.upper()} {role} self IP {key}",
+                             f"Ambiguous: {by_ip[key]} and {name}")
+            by_ip[key] = name
+    if len(src_ips) != len(src_self) or len(dst_ips) != len(dst_self):
+        return
+    for name, entry in src_self.items():
+        ip = self_identity(entry)
+        vlan = vlan_reference(src_vlans, entry["vlan"])
+        if vlan is None:
+            reporter.add("ERROR", f"{side.upper()} source self {name}",
+                         f"Referenced VLAN {entry['vlan']!r} missing from inventory")
+            continue
+        tag = vlan["tag"]
+        peer = tag in peer_tags
+        hsm = tag in hsm_tags or named_network(name, "HSM")
+        match = dst_ips.get(ip)
+        label = f"{side.upper()} self {ip} ({name})"
+        if hsm:
+            reporter.add("FAIL" if match else "PASS", f"{label} HSM exclusion",
+                         f"HSM address present on target as {match}" if match else "HSM address absent from target")
+            continue
+        if peer:
+            reporter.add("FAIL" if match else "PASS", f"{label} PEER exclusion",
+                         f"PEER address present on target as {match}" if match else "PEER self IP replaced")
+            continue
+        if not match:
+            reporter.add("FAIL", label, "Source self IP address absent from target")
+            continue
+        reporter.add("PASS", label, f"matched target self IP {match}")
+        dst_entry = dst_self[match]
+        dst_vlan = vlan_reference(dst_vlans, dst_entry["vlan"])
+        if dst_vlan is None:
+            reporter.add("ERROR", f"{label} VLAN", f"Target VLAN {dst_entry['vlan']!r} missing")
+        else:
+            reporter.compare(f"{label} VLAN tag", tag, dst_vlan["tag"])
+        original = entry["properties"]
+        migrated = dst_entry["properties"]
+        for field in sorted(original):
+            if field == "vlan":
+                continue  # The VLAN is compared by numeric tag above.
+            old = original[field]
+            new = migrated.get(field)
+            if field == "traffic-group":
+                old = network_name(str(old))
+                new = network_name(str(new)) if new is not None else None
+            if new is None:
+                reporter.add("FAIL", f"{label} {field}", f"Source property {old!r} absent from target")
             else:
-                fields = ("tag", "interfaces") if kind == "vlan" else (
-                    "address", "vlan", "traffic_group", "floating")
-                for field in fields:
-                    if src[name][field] != dst[name][field]:
-                        reporter.add("WARN", f"{side.upper()} {kind} {name} {field}",
-                                     f"source={src[name][field]!r} target={dst[name][field]!r}")
-                        differences += 1
-        reporter.add("PASS" if not differences else "INFO", label,
-                     f"source={len(src)} target={len(dst)} differences={differences}; "
-                     + ("matched" if not differences else "review migration mapping for WARN entries"))
+                reporter.compare(f"{label} {field}", old, new)
+        # A floating self IP can be represented by either the explicit flag
+        # or its traffic group; check the effective state even if the flag is omitted.
+        for role, properties in (("source", original), ("target", migrated)):
+            if properties.get("floating") not in (None, "enabled", "disabled"):
+                reporter.add("ERROR", f"{label} {role} floating", "Unrecognized floating value")
+        old_floating = original.get("floating", "disabled") == "enabled" or (
+            network_name(str(original.get("traffic-group", ""))) != "traffic-group-local-only")
+        new_floating = migrated.get("floating", "disabled") == "enabled" or (
+            network_name(str(migrated.get("traffic-group", ""))) != "traffic-group-local-only")
+        reporter.compare(f"{label} effective floating", old_floating, new_floating)
+    sync_vlan_tags = {dst_vlans[name]["tag"] for name in sync_names}
+    for name, entry in dst_self.items():
+        ip = self_identity(entry)
+        vlan = vlan_reference(dst_vlans, entry["vlan"])
+        if vlan is None:
+            reporter.add("ERROR", f"{side.upper()} target self {name}",
+                         f"Referenced VLAN {entry['vlan']!r} missing from inventory")
+        elif named_network(name, "HSM") or named_network(entry["vlan"], "HSM") or vlan["tag"] in hsm_tags:
+            reporter.add("FAIL", f"{side.upper()} target HSM self {name}", "HSM self IP must not be present")
+        elif ip not in src_ips and vlan["tag"] not in sync_vlan_tags:
+            reporter.add("WARN", f"{side.upper()} target self {name}", "No source self IP with this address")
+    if peer_tags and len(sync_names) == 1:
+        sync_vlan_tag = dst_vlans[sync_names[0]]["tag"]
+        sync_ips = [name for name, entry in dst_self.items()
+                    if (vlan := vlan_reference(dst_vlans, entry["vlan"])) and vlan["tag"] == sync_vlan_tag]
+        reporter.add("PASS" if sync_ips else "FAIL", f"{side.upper()} SYNC self IP",
+                     f"target={sync_ips}" if sync_ips else "No target self IP on SYNC VLAN")
 
 
 def main() -> int:
@@ -679,7 +887,7 @@ def main() -> int:
 
     for side in ("a", "b"):
         device = manifest["devices"][side]
-        roles = (["source", "target"] if checks & {"basic", "network"} else []) + (["rseries_host"] if "platform" in checks else [])
+        roles = (["source", "target"] if checks & {"basic", "network"} else []) + (["rseries_host"] if checks & {"platform", "network"} else [])
         collected: dict[str, dict | None] = {}
         for role in roles:
             expected = device[role]
@@ -726,7 +934,8 @@ def main() -> int:
                 compare_platform(reporter, side, device, f5os_data(
                     record, device["target"]["tenant_name_candidates"]))
         if "network" in checks:
-            compare_network(reporter, side, collected.get("source"), collected.get("target"))
+            compare_network(reporter, side, collected.get("source"), collected.get("target"),
+                            collected.get("rseries_host"), device["target"]["tenant_name_candidates"])
     return reporter.finish()
 
 
