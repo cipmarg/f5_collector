@@ -500,6 +500,10 @@ ROUTE_COMMANDS = {"traffic": "list net route one-line",
 SYSTEM_COMMANDS = {"dns": "list sys dns one-line", "ntp": "list sys ntp one-line"}
 APPLICATION_COMMANDS = {"virtual": "list ltm virtual one-line",
                         "pool": "list ltm pool one-line"}
+# In `list ltm virtual one-line`, these switches stand alone without a value.
+VIRTUAL_BARE_FLAGS = frozenset({"dhcp-relay", "ip-forward", "internal", "l2-forward",
+                                "reject", "enabled", "disabled", "vlans-enabled",
+                                "vlans-disabled"})
 NTP_SYNC_COMMAND = 'bash -c "ntpq -np"'
 
 
@@ -685,7 +689,10 @@ def application_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | 
             return None, f"{command} returned no parseable output; cannot verify empty inventory"
         parsed: dict[str, dict] = {}
         for name, body in objects.items():
-            fields = tmsh_fields(body)
+            try:
+                fields = tmsh_fields(body, bare_flags=VIRTUAL_BARE_FLAGS if kind == "virtual" else ())
+            except ValueError as exc:
+                raise ValueError(f"ltm {kind} {name}: {exc}") from exc
             entry: dict = {"fields": fields}
             if kind == "virtual":
                 entry["destination"] = fields.get("destination")
@@ -735,16 +742,21 @@ def tmsh_property(body: str, name: str) -> str | None:
     return match.group(1).strip('"') if match else None
 
 
-def tmsh_fields(body: str) -> dict[str, str | tuple[str, ...]]:
+def tmsh_fields(body: str, *, bare_flags: frozenset[str] | tuple = ()) -> dict[str, str | tuple[str, ...]]:
     """Read every top-level property, preserving nested properties as tokens."""
     tokens = re.findall(r'"(?:\\.|[^"\\])*"|[{}]|[^\s{}"]+', body)
     fields: dict[str, str | tuple[str, ...]] = {}
     index = 0
     while index < len(tokens):
         key = tokens[index]
-        if key in ("{", "}") or index + 1 >= len(tokens):
+        if key in ("{", "}"):
             raise ValueError(f"Malformed tmsh property near {key!r}")
         index += 1
+        if key in bare_flags:
+            fields[key] = "present"
+            continue
+        if index >= len(tokens):
+            raise ValueError(f"Malformed tmsh property near {key!r}")
         if tokens[index] == "{":
             index += 1
             depth = 1
@@ -1394,7 +1406,8 @@ def compare_applications(reporter: Reporter, side: str, source: dict | None,
             reporter.add("PASS" if object_path(name) == object_path(target_name) else "WARN",
                          label, f"target={target_name} destination={entry['destination']}")
             src_fields, dst_fields = entry["fields"], new[target_name]["fields"]
-            for field in ("destination", "ip-protocol", "source", "mask", "pool", "disabled", "enabled"):
+            for field in ("destination", "ip-protocol", "source", "mask", "pool", "disabled", "enabled",
+                          "dhcp-relay", "ip-forward", "internal", "l2-forward", "reject"):
                 before, after = src_fields.get(field), dst_fields.get(field)
                 if field == "pool":
                     before = object_path(str(before)) if before not in (None, "none") else before
