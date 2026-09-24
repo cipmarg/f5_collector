@@ -14,6 +14,7 @@ when SSHPASSNET is set.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from datetime import datetime, timezone
 import getpass
 import hashlib
@@ -875,6 +876,50 @@ def rule_digest(body: str) -> str:
     return hashlib.md5(body.encode("utf-8")).hexdigest()
 
 
+def tcl_command_words(text: str) -> list[str]:
+    """Split Tcl words while preserving bracketed values with embedded spaces."""
+    words: list[str] = []
+    current: list[str] = []
+    brackets = braces = 0
+    quoted = escaped = False
+    for char in text:
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\":
+            current.append(char)
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+            current.append(char)
+        elif not quoted and char == "[":
+            brackets += 1
+            current.append(char)
+        elif not quoted and char == "]" and brackets:
+            brackets -= 1
+            current.append(char)
+        elif not quoted and char == "{":
+            braces += 1
+            current.append(char)
+        elif not quoted and char == "}" and braces:
+            braces -= 1
+            current.append(char)
+        elif not quoted and not brackets and not braces and char in ";\n":
+            if current:
+                words.append("".join(current))
+            break
+        elif not quoted and not brackets and not braces and char.isspace():
+            if current:
+                words.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+    else:
+        if current:
+            words.append("".join(current))
+    return words
+
+
 def data_group_inventory(record: dict | None) -> tuple[dict[str, dict] | None, str | None]:
     command = REFERENCE_COMMANDS["data_group"]
     output, error = inventory_section(record, command)
@@ -918,26 +963,36 @@ def rule_dependencies(body: str) -> tuple[set[str], set[str], set[str]]:
             rules.add(ref.rsplit("::", 1)[0])
         else:
             unresolved.add(f"unrecognized iRule call {ref}")
-    for match in re.finditer(r"\bclass\s+(match|lookup|names|exists|size|element)\s+([^\n;]+)", code):
-        operation, rest = match.groups()
-        tokens = rest.split()
+    def add_group(raw: str, operation: str) -> None:
+        # The closing ] belongs to the enclosing Tcl command, not the name.
+        if raw.lstrip().startswith("[") or "$" in raw:
+            unresolved.add(f"dynamic data-group in {operation}")
+            return
+        ref = raw.strip(' \t\r\n\"\'{}[]();,')
+        if re.fullmatch(r"(?:/[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+", ref):
+            groups.add(ref)
+        else:
+            unresolved.add(f"unparsed data-group in {operation}: {raw[:80]}")
+
+    for match in re.finditer(r"\bclass\s+(match|lookup|names|exists|size|element)\s+", code):
+        operation = match.group(1)
+        tokens = tcl_command_words(code[match.end():])
         position = 2 if operation == "match" else 1 if operation == "lookup" else 0
         if len(tokens) <= position:
             unresolved.add(f"unparsed class {operation}")
-            continue
-        ref = tokens[position].strip('"{}[]')
-        if "$" in ref or "[" in ref or not ref:
-            unresolved.add(f"dynamic data-group in class {operation}")
+        elif operation == "match" and tokens[1] not in {
+                "equals", "starts_with", "ends_with", "contains", "matches_regex", "eq", "ne"}:
+            unresolved.add(f"unparsed class match operator {tokens[1][:40]}")
         else:
-            groups.add(ref)
-    for match in re.finditer(r"\b(?:matchclass|findclass)\s+([^\n;]+)", code):
-        operation = match.group(0).split()[0]
-        tokens = match.group(1).split()
+            add_group(tokens[position], f"class {operation}")
+    for match in re.finditer(r"\b(matchclass|findclass)\s+", code):
+        operation = match.group(1)
+        tokens = tcl_command_words(code[match.end():])
         position = 2 if operation == "matchclass" else 1
-        if len(tokens) <= position or "$" in tokens[position] or "[" in tokens[position]:
-            unresolved.add(f"dynamic {operation} data-group")
+        if len(tokens) <= position:
+            unresolved.add(f"unparsed {operation} data-group")
         else:
-            groups.add(tokens[position].strip('"{}[]'))
+            add_group(tokens[position], operation)
     return rules, groups, unresolved
 
 
@@ -1009,27 +1064,25 @@ def network_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | None
 
 
 def tmsh_objects_from_block(block: str) -> list[tuple[str, str]]:
-    """Read named nested objects, including data-group keys with quoted spaces."""
-    tokens = re.findall(r'"(?:\\.|[^"\\])*"|[{}]|[^\s{}"]+', block)
+    """Read nested objects, including unquoted cert-key-chain slot names with spaces."""
     members: list[tuple[str, str]] = []
     index = 0
-    while index < len(tokens):
-        name = tokens[index].strip('"')
-        index += 1
-        if index >= len(tokens) or tokens[index] != "{":
-            raise ValueError(f"Expected a named nested block after {name!r}")
-        index += 1
-        depth = 1
-        body: list[str] = []
-        while index < len(tokens) and depth:
-            token = tokens[index]
-            depth += (token == "{") - (token == "}")
-            if depth:
-                body.append(token)
+    while index < len(block):
+        while index < len(block) and block[index].isspace():
             index += 1
-        if depth:
+        if index == len(block):
+            break
+        opening = block.find("{", index)
+        if opening < 0:
+            raise ValueError(f"Expected a named nested block after {block[index:].strip()!r}")
+        name = block[index:opening].strip().strip('"')
+        if not name or "}" in name:
+            raise ValueError(f"Invalid nested object name {name!r}")
+        closing = closing_tmsh_brace(block, opening + 1)
+        if closing is None:
             raise ValueError(f"Incomplete nested block {name!r}")
-        members.append((name, " ".join(body)))
+        members.append((name, block[opening + 1:closing]))
+        index = closing + 1
     return members
 
 
@@ -1136,9 +1189,9 @@ class Reporter:
         self.color = color
         self.displayed = 0
 
-    def add(self, status: str, label: str, detail: str) -> None:
+    def add(self, status: str, label: str, detail: str, *, force: bool = False) -> None:
         self.results.append((status, label, detail))
-        if self.status_filter is None or status in self.status_filter:
+        if force or self.status_filter is None or status in self.status_filter:
             token = f"[{status:<5}]"
             if self.color:
                 token = f"{STATUS_COLORS[status]}{token}\x1b[0m"
@@ -1859,9 +1912,11 @@ def compare_references(reporter: Reporter, side: str, source: dict | None,
             reporter.add("ERROR", label, "Data-group inventory unavailable")
             return
         before, after = source_groups.get(old_name), target_groups.get(new_name)
-        if before is None or after is None:
-            reporter.add("FAIL", label, f"source={'present' if before else 'missing'} "
-                         f"target={'present' if after else 'missing'}")
+        if before is None:
+            reporter.add("WARN", label,
+                         "Referenced name absent from source data-group inventory; verify iRule syntax or inventory")
+        elif after is None:
+            reporter.add("FAIL", label, "Source data group absent on target")
         else:
             reporter.add("PASS" if before == after else "FAIL", label,
                          f"source={before!r} target={after!r}" if before != after else f"target={new_name} records match")
@@ -1947,16 +2002,23 @@ def compare_references(reporter: Reporter, side: str, source: dict | None,
 
 def profile_cert_slots(body: str) -> list[dict]:
     block = tmsh_block(body, "cert-key-chain")
+    slots: list[dict] = []
     if block is not None:
-        return [{"slot": slot, "cert": tmsh_property(contents, "cert"),
-                 "key": tmsh_property(contents, "key"),
-                 "chain": tmsh_property(contents, "chain"),
-                 "attributes": {field: value for field, value in tmsh_fields(contents).items()
-                                if field not in {"cert", "key", "chain"}}}
-                for slot, contents in tmsh_objects_from_block(block)]
-    cert, key = tmsh_property(body, "cert"), tmsh_property(body, "key")
-    return ([{"slot": "default", "cert": cert, "key": key,
-              "chain": tmsh_property(body, "chain"), "attributes": {}}] if cert or key else [])
+        slots = [{"slot": slot, "cert": tmsh_property(contents, "cert"),
+                  "key": tmsh_property(contents, "key"),
+                  "chain": tmsh_property(contents, "chain"),
+                  "attributes": {field: value for field, value in tmsh_fields(contents).items()
+                                 if field not in {"cert", "key", "chain"}}}
+                 for slot, contents in tmsh_objects_from_block(block)]
+    # Top-level cert/key/chain fields often mirror a cert-key-chain slot. They
+    # may also be independent references and must not disappear in that case.
+    fields = tmsh_fields(body)
+    standalone = {field: fields.get(field) for field in ("cert", "key", "chain")}
+    supplied = {field: value for field, value in standalone.items() if value not in (None, "none")}
+    if supplied and not any(all(slot[field] == value for field, value in supplied.items()) for slot in slots):
+        slots.append({"slot": "top-level" if slots else "default", **standalone,
+                      "attributes": {}})
+    return slots
 
 
 def certificate_properties(body: str) -> dict[str, str | None]:
@@ -2037,7 +2099,8 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
         return
 
     visited_profiles: set[tuple[str, str, str]] = set()
-    visited_certs: set[tuple[str, str, str]] = set()
+    visited_certs: set[tuple[str, str]] = set()
+    visited_server_eku: set[tuple[str, str]] = set()
     visited_bundles: set[tuple[str, str]] = set()
 
     def compare_ciphers(old_ref: str | None, new_ref: str | None,
@@ -2121,8 +2184,17 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
         if not old_members or not new_members or any(not member for member in (*old_members, *new_members)):
             reporter.add("WARN", label, "Bundle membership/fingerprint unavailable; unverified")
         else:
-            reporter.add("PASS" if old_members == new_members else "FAIL", label,
-                         f"source fingerprints={old_members} target fingerprints={new_members}")
+            source_counts, target_counts = Counter(old_members), Counter(new_members)
+            matched = sum((source_counts & target_counts).values())
+            missing, extra = source_counts - target_counts, target_counts - source_counts
+            if not missing and not extra:
+                reporter.add("PASS", label, f"{matched}/{len(old_members)} fingerprints match")
+            else:
+                missing_list = [fingerprint for fingerprint, count in sorted(missing.items())
+                                for _ in range(count)]
+                reporter.add("FAIL", label, f"matched={matched}/{len(old_members)} source fingerprints; "
+                             f"missing={sum(missing.values())} {missing_list}; "
+                             f"extra on target={sum(extra.values())}")
 
     def compare_certificate(old_ref: str | None, new_ref: str | None, kind: str,
                             old_owner: str, new_owner: str) -> None:
@@ -2139,9 +2211,12 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
             reporter.add("ERROR", label, "Certificate inventory unavailable")
             return
         old_name, new_name = scoped_name(old_ref, old_owner), scoped_name(new_ref, new_owner)
-        if (kind, old_name, new_name) in visited_certs:
+        if kind == "server_ssl" and (old_name, new_name) not in visited_server_eku:
+            visited_server_eku.add((old_name, new_name))
+            reporter.add("WARN", f"{label} EKU", "Not exposed by validated tmsh output; unverified")
+        if (old_name, new_name) in visited_certs:
             return
-        visited_certs.add((kind, old_name, new_name))
+        visited_certs.add((old_name, new_name))
         old_certs, new_certs = inventories["cert"]
         before, after = old_certs.get(old_name), new_certs.get(new_name)
         if before is None or after is None:
@@ -2161,7 +2236,7 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                          f"source={old_value!r} target={new_value!r}")
         for field in ("key-type", "certificate-key-size", "certificate-key-curve-name"):
             old_value, new_value = old_props[field], new_props[field]
-            if old_value != new_value or old_value is None:
+            if old_value != new_value:
                 reporter.add("WARN" if old_value is None or new_value is None else "FAIL",
                              f"{label} {field}", f"source={old_value!r} target={new_value!r}")
         expires = certificate_expiry(new_props["expiration-string"])
@@ -2172,8 +2247,6 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
         elif old_cn and old_cn == new_cn and (old_props["issuer"] and old_props["issuer"] == new_props["issuer"]
                                              and old_props["subject-alternative-name"] == new_props["subject-alternative-name"]):
             reporter.add("INFO", label, f"Valid replacement {new_name}; expires {expires:%d %b %Y %H:%M UTC}")
-        if kind == "server_ssl":
-            reporter.add("WARN", f"{label} EKU", "Not exposed by validated tmsh output; unverified")
         reporter.add("WARN", f"{label} signature/key usage",
                      "Complete X.509 extensions not exposed by validated tmsh output; unverified")
 
@@ -2207,43 +2280,76 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                         tmsh_property(after, "cipher-group"), old_name, new_name)
         for field in ("ca-file", "trusted-cert-authority"):
             compare_bundle(tmsh_property(before, field), tmsh_property(after, field), old_name, new_name)
-        old_slots, new_slots = profile_cert_slots(before), profile_cert_slots(after)
+        try:
+            old_slots, new_slots = profile_cert_slots(before), profile_cert_slots(after)
+        except ValueError as exc:
+            reporter.add("ERROR", f"{label} cert-key-chain", str(exc))
+            return
         if len(old_slots) != len(new_slots):
             reporter.add("FAIL", f"{label} cert-key-chain", f"source slots={len(old_slots)} target={len(new_slots)}")
-        new_slots_by_name = {slot["slot"]: slot for slot in new_slots}
-        for index, old_slot in enumerate(old_slots):
-            new_slot = new_slots_by_name.get(old_slot["slot"])
-            if new_slot is None:
-                if index >= len(new_slots):
-                    reporter.add("FAIL", f"{label} slot {old_slot['slot']}", "Certificate slot missing")
-                    continue
-                new_slot = new_slots[index]
-                reporter.add("WARN", f"{label} slot {old_slot['slot']}",
-                             f"Slot renamed to {new_slot['slot']}; verify SNI and algorithm association")
-            if old_slot["slot"] != new_slot["slot"]:
-                reporter.add("WARN", f"{label} slot identity", "Certificate/key slot name changed")
-            for field, old_value in old_slot["attributes"].items():
-                new_value = new_slot["attributes"].get(field)
-                reporter.add("PASS" if old_value == new_value else "FAIL",
-                             f"{label} slot {old_slot['slot']} {field}",
-                             f"source={old_value!r} target={new_value!r}")
+        remaining = list(new_slots)
+
+        def certificate_identity(slot: dict, owner: str, role: int) -> tuple | None:
+            ref = slot["cert"]
+            inventory = inventories.get("cert", ({}, {}))[role]
+            body = inventory.get(scoped_name(ref, owner)) if ref and ref != "none" else None
+            if body is None:
+                return None
+            props = certificate_properties(body)
+            cn = certificate_cn(props["subject"])
+            return (cn, props["issuer"], props["subject-alternative-name"]) if cn else None
+
+        for old_slot in old_slots:
+            identity = certificate_identity(old_slot, old_name, 0)
+            semantic = ([slot for slot in remaining
+                         if certificate_identity(slot, new_name, 1) == identity]
+                        if identity else [])
+            by_name = [slot for slot in remaining if slot["slot"] == old_slot["slot"]]
+            if len(semantic) == 1:
+                new_slot = semantic[0]
+            elif len(by_name) == 1:
+                new_slot = by_name[0]
+            elif len(remaining) == 1:
+                new_slot = remaining[0]
+            else:
+                reporter.add("ERROR" if remaining else "FAIL", f"{label} slot {old_slot['slot']}",
+                             f"No unique matching target cert-key-chain slot; candidates={len(remaining)}")
+                continue
+            remaining.remove(new_slot)
+            matches = []
+            for field in sorted(old_slot["attributes"].keys() | new_slot["attributes"].keys()):
+                old_value, new_value = old_slot["attributes"].get(field), new_slot["attributes"].get(field)
+                if old_value == new_value:
+                    matches.append(field)
+                else:
+                    reporter.add("FAIL", f"{label} slot {old_slot['slot']} {field}",
+                                 f"source={old_value!r} target={new_value!r}")
+            if matches:
+                reporter.add("PASS", f"{label} slot {old_slot['slot']} attributes",
+                             f"Identical: {', '.join(matches)}")
             compare_certificate(old_slot["cert"], new_slot["cert"], kind, old_name, new_name)
             compare_bundle(old_slot["chain"], new_slot["chain"], old_name, new_name)
             key_name = new_slot["key"]
-            if is_default_file(key_name, "key") and not is_default_file(old_slot["key"], "key"):
+            old_key = old_slot["key"]
+            old_has_key = old_key not in (None, "none")
+            new_has_key = key_name not in (None, "none")
+            if old_has_key != new_has_key:
+                reporter.add("FAIL", f"{label} key {old_slot['slot']}",
+                             "Key missing on target" if old_has_key else "Unexpected target key")
+                continue
+            if not new_has_key:
+                continue
+            if is_default_file(key_name, "key") and old_key not in (None, "none") and not is_default_file(old_key, "key"):
                 reporter.add("FAIL", f"{label} key {old_slot['slot']}",
                              "Replacement key missing: target still uses default.key")
                 continue
-            if bool(old_slot["key"] and old_slot["key"] != "none") != bool(key_name and key_name != "none"):
-                reporter.add("FAIL", f"{label} key {old_slot['slot']}",
-                             "Cert/key slot presence differs across devices")
-            if old_slot["key"] and not key_name:
-                reporter.add("FAIL", f"{label} key {old_slot['slot']}", "Key missing on target")
-            elif key_name:
-                target_keys = inventories.get("key", ({}, {}))[1]
-                present = scoped_name(key_name, new_name) in target_keys
-                reporter.add("WARN" if present else "FAIL", f"{label} key {new_slot['slot']}",
-                             "Key exists; target-only public-key match unverified" if present else "Key file missing on target")
+            target_keys = inventories.get("key", ({}, {}))[1]
+            present = scoped_name(key_name, new_name) in target_keys
+            reporter.add("WARN" if present else "FAIL", f"{label} key {new_slot['slot']}",
+                         "Key exists; target-only public-key match unverified" if present else "Key file missing on target")
+        for extra in remaining:
+            reporter.add("WARN", f"{label} target slot {extra['slot']}",
+                         "No corresponding source cert-key-chain entry")
         parent_old = tmsh_property(before, "defaults-from")
         parent_new = tmsh_property(after, "defaults-from")
         if parent_old and parent_new and scoped_name(parent_old, old_name) != old_name:
@@ -2296,12 +2402,13 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
             return
         try:
             old_fields, new_fields = tmsh_fields(src_body), tmsh_fields(dst_body)
-            for field, old_value in old_fields.items():
+            for field in sorted(old_fields.keys() | new_fields.keys()):
                 if field in {"cert", "key", "ca-file", "chain", "cert-key-chain", "ssl-profile"}:
                     continue
-                if old_value != new_fields.get(field):
+                old_value, new_value = old_fields.get(field), new_fields.get(field)
+                if old_value != new_value:
                     reporter.add("FAIL", f"{label} {field}",
-                                 f"source={old_value!r} target={new_fields.get(field)!r}")
+                                 f"source={old_value!r} target={new_value!r}")
         except ValueError as exc:
             reporter.add("ERROR", label, str(exc))
         compare_certificate(tmsh_property(src_body, "cert"), tmsh_property(dst_body, "cert"),
@@ -2439,7 +2546,16 @@ def main() -> int:
              and "NO_COLOR" not in os.environ)
     reporter = Reporter(status_filter=status_filter, color=color)
     members = (args.member,) if args.member else ("a", "b")
-    print(f"Migration {manifest['migration_package']} | members={','.join(members)} | checks={','.join(sorted(checks))} | read-only")
+    package = manifest.get("package_details") or {}
+    metadata = (("package", manifest.get("migration_package")),
+                ("date", manifest.get("migration_date")),
+                ("migration engineer", package.get("migration_engineer")),
+                ("project manager", package.get("project_manager")),
+                ("technical lead", package.get("technical_lead")),
+                ("ACI engineer", package.get("aci_engineer")))
+    reporter.add("INFO", "Migration", " | ".join(
+        f"{name}={re.sub(r'\s+', ' ', str(value)).strip() if value not in (None, '') else '(missing)'}"
+        for name, value in metadata), force=True)
     if "permissions" in checks:
         check_permissions(reporter, manifest, args.host_key_mode,
                           offline=bool(args.from_snapshot), check_system="system" in checks,
