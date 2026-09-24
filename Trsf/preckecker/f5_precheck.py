@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import getpass
 import hashlib
 import ipaddress
@@ -977,6 +977,12 @@ def rule_dependencies(body: str) -> tuple[set[str], set[str], set[str]]:
     for match in re.finditer(r"\bclass\s+(match|lookup|names|exists|size|element)\s+", code):
         operation = match.group(1)
         tokens = tcl_command_words(code[match.end():])
+        if operation == "match":
+            # Tcl's -- ends the option list; it is not the match operator.
+            if tokens and tokens[0] == "-value":
+                tokens = tokens[1:]
+            if tokens and tokens[0] == "--":
+                tokens = tokens[1:]
         position = 2 if operation == "match" else 1 if operation == "lookup" else 0
         if len(tokens) <= position:
             unresolved.add(f"unparsed class {operation}")
@@ -1189,13 +1195,14 @@ class Reporter:
         self.color = color
         self.displayed = 0
 
-    def add(self, status: str, label: str, detail: str, *, force: bool = False) -> None:
+    def add(self, status: str, label: str, detail: str, *, force: bool = False,
+            inline: bool = False) -> None:
         self.results.append((status, label, detail))
         if force or self.status_filter is None or status in self.status_filter:
             token = f"[{status:<5}]"
             if self.color:
                 token = f"{STATUS_COLORS[status]}{token}\x1b[0m"
-            print(f"{token} {label:<45} {detail}")
+            print(f"{token} {detail}" if inline else f"{token} {label:<45} {detail}")
             self.displayed += 1
 
     def compare(self, label: str, expected: object, actual: object,
@@ -1226,11 +1233,11 @@ class Reporter:
 
 
 def compare_bigip(reporter: Reporter, side: str, role: str, expected: dict,
-                  observed: dict) -> None:
+                  observed: dict, hostname_suffix: str) -> None:
     prefix = f"{side.upper()} {role} BIG-IP"
     reporter.compare(f"{prefix} hostname", expected["expected_hostname"],
                      observed.get("hostname"), observed.get("hostname_error"),
-                     casefold=True, hostname_suffix=".net.global")
+                     casefold=True, hostname_suffix=hostname_suffix)
     reporter.compare(f"{prefix} management IP", expected["management_ip"],
                      observed.get("management_ip"), observed.get("management_ip_error"))
     if role == "source":
@@ -2044,23 +2051,61 @@ def certificate_expiry(value: str | None) -> datetime | None:
         return None
 
 
+def parse_migration_date(value: str | None) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    for format_string in ("%Y-%m-%d", "%d-%B-%Y", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(value.strip(), format_string).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def load_issuer_upgrades(path: Path | None) -> set[tuple[str, str]]:
+    """Load approved CA renewals from a local, untracked JSON file."""
+    if path is None:
+        return set()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list) or not all(
+            isinstance(entry, dict) and isinstance(entry.get("source_cn"), str)
+            and isinstance(entry.get("target_cn"), str) and entry["source_cn"].strip()
+            and entry["target_cn"].strip() for entry in data):
+        raise ValueError("Issuer upgrade map must be a JSON array of source_cn/target_cn pairs")
+    return {(entry["source_cn"].strip(), entry["target_cn"].strip()) for entry in data}
+
+
+def allowed_issuer_upgrade(source: str | None, target: str | None,
+                           approved: set[tuple[str, str]]) -> bool:
+    old_cn, new_cn = certificate_cn(source), certificate_cn(target)
+    if (old_cn, new_cn) not in approved:
+        return False
+    def without_cn(dn: str) -> str:
+        return re.sub(r"(?:^|,)\s*CN\s*=\s*[^,]+", "", dn, count=1, flags=re.I).strip(" ,")
+    return without_cn(source or "") == without_cn(target or "")
+
+
 def is_default_file(ref: str | None, suffix: str) -> bool:
     return bool(ref and ref.rsplit("/", 1)[-1].casefold() == "default." + suffix)
 
 
-def bundle_fingerprints(body: str) -> tuple[str, ...] | None:
+def bundle_members(body: str) -> tuple[tuple[str, str | None], ...] | None:
     block = tmsh_block(body, "bundle-certificates")
     if block is None:
         return None
-    fingerprints = [tmsh_property(row, "fingerprint") for _, row in tmsh_objects_from_block(block)]
-    if not fingerprints or any(not fingerprint for fingerprint in fingerprints):
+    members = [(tmsh_property(row, "fingerprint"), certificate_cn(tmsh_property(row, "subject")))
+               for _, row in tmsh_objects_from_block(block)]
+    if not members or any(not fingerprint for fingerprint, _ in members):
         return None
-    return tuple(sorted(fingerprints))
+    return tuple(sorted(members, key=lambda member: member[0]))
 
 
 def compare_certificates(reporter: Reporter, side: str, source: dict | None,
-                         target: dict | None) -> None:
+                         target: dict | None, migration_date: str | None = None,
+                         issuer_upgrades: set[tuple[str, str]] | None = None) -> None:
     """Trace only SSL on migrated VIPs and HTTPS monitors attached to their pools."""
+    migrated_at = parse_migration_date(migration_date)
+    issuer_upgrades = issuer_upgrades or set()
     inventories: dict[str, tuple[dict[str, str], dict[str, str]]] = {}
     kinds = {
         "client_ssl": (CERTIFICATE_COMMANDS["client_ssl"], "ltm profile client-ssl"),
@@ -2168,7 +2213,7 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
             reporter.add("FAIL", label, f"source={'present' if old_body else 'missing'} "
                          f"target={'present' if new_body else 'missing'}")
             return
-        old_members, new_members = bundle_fingerprints(old_body), bundle_fingerprints(new_body)
+        old_members, new_members = bundle_members(old_body), bundle_members(new_body)
         if (old_members is None) != (new_members is None):
             reporter.add("FAIL", label, "Bundle membership exists on only one device")
             return
@@ -2179,50 +2224,68 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                     re.search(r"\bbundle-certificates\s+(?!none\b)", new_body)):
                 reporter.add("WARN", label, "Bundle member fingerprints not available; unverified")
                 return
-            old_members = (tmsh_property(old_body, "fingerprint") or "",)
-            new_members = (tmsh_property(new_body, "fingerprint") or "",)
-        if not old_members or not new_members or any(not member for member in (*old_members, *new_members)):
+            old_members = ((tmsh_property(old_body, "fingerprint") or "",
+                            certificate_cn(tmsh_property(old_body, "subject"))),)
+            new_members = ((tmsh_property(new_body, "fingerprint") or "",
+                            certificate_cn(tmsh_property(new_body, "subject"))),)
+        if not old_members or not new_members or any(not fingerprint for fingerprint, _ in (*old_members, *new_members)):
             reporter.add("WARN", label, "Bundle membership/fingerprint unavailable; unverified")
         else:
-            source_counts, target_counts = Counter(old_members), Counter(new_members)
+            source_counts = Counter(fingerprint for fingerprint, _ in old_members)
+            target_counts = Counter(fingerprint for fingerprint, _ in new_members)
             matched = sum((source_counts & target_counts).values())
             missing, extra = source_counts - target_counts, target_counts - source_counts
             if not missing and not extra:
                 reporter.add("PASS", label, f"{matched}/{len(old_members)} fingerprints match")
             else:
-                missing_list = [fingerprint for fingerprint, count in sorted(missing.items())
-                                for _ in range(count)]
+                source_cn = {fingerprint: cn for fingerprint, cn in old_members}
+                missing_list = [f"CN={source_cn.get(fingerprint) or '(unavailable)'} "
+                                f"fingerprint={fingerprint}"
+                                for fingerprint, count in sorted(missing.items()) for _ in range(count)]
                 reporter.add("FAIL", label, f"matched={matched}/{len(old_members)} source fingerprints; "
                              f"missing={sum(missing.values())} {missing_list}; "
                              f"extra on target={sum(extra.values())}")
 
     def compare_certificate(old_ref: str | None, new_ref: str | None, kind: str,
-                            old_owner: str, new_owner: str) -> None:
+                            old_owner: str, new_owner: str) -> bool:
+        """Return true for an intentionally unrenewed, long expired certificate."""
         label = f"{side.upper()} {kind} certificate {old_ref}"
         if not old_ref or old_ref == "none":
-            return
+            return False
         if not new_ref or new_ref == "none":
             reporter.add("FAIL", label, "Certificate missing from target profile")
-            return
+            return False
         if is_default_file(new_ref, "crt") and not is_default_file(old_ref, "crt"):
-            reporter.add("FAIL", label, "Replacement certificate missing: target still uses default.crt")
-            return
+            old_inventory = inventories.get("cert", ({}, {}))[0]
+            source_body = old_inventory.get(scoped_name(old_ref, old_owner))
+            source_expiry = certificate_expiry(tmsh_property(source_body, "expiration-string")) if source_body else None
+            if migrated_at and source_expiry and source_expiry < migrated_at - timedelta(days=30):
+                reporter.add("WARN", label,
+                             f"Target uses default.crt: source certificate expired "
+                             f"{source_expiry:%d %B %Y %H:%M UTC}, more than 30 days before "
+                             f"migration ({migrated_at:%d %B %Y}); replacement not expected")
+                return True
+            reason = ("migration date missing or unparseable" if not migrated_at else
+                      "source certificate expiration unavailable" if not source_expiry else
+                      "source certificate did not expire more than 30 days before migration")
+            reporter.add("FAIL", label, f"Replacement certificate missing: target still uses default.crt ({reason})")
+            return False
         if "cert" not in inventories:
             reporter.add("ERROR", label, "Certificate inventory unavailable")
-            return
+            return False
         old_name, new_name = scoped_name(old_ref, old_owner), scoped_name(new_ref, new_owner)
         if kind == "server_ssl" and (old_name, new_name) not in visited_server_eku:
             visited_server_eku.add((old_name, new_name))
             reporter.add("WARN", f"{label} EKU", "Not exposed by validated tmsh output; unverified")
         if (old_name, new_name) in visited_certs:
-            return
+            return False
         visited_certs.add((old_name, new_name))
         old_certs, new_certs = inventories["cert"]
         before, after = old_certs.get(old_name), new_certs.get(new_name)
         if before is None or after is None:
             reporter.add("FAIL", label, f"source={'present' if before else 'missing'} "
                          f"target={'present' if after else 'missing'}")
-            return
+            return False
         old_props, new_props = certificate_properties(before), certificate_properties(after)
         old_cn, new_cn = certificate_cn(old_props["subject"]), certificate_cn(new_props["subject"])
         subject_status = ("WARN" if not old_cn or not new_cn else "FAIL" if old_cn != new_cn
@@ -2231,7 +2294,9 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                      f"source={old_props['subject']!r} target={new_props['subject']!r}")
         for field in ("issuer", "subject-alternative-name"):
             old_value, new_value = old_props[field], new_props[field]
-            status = "PASS" if old_value == new_value else "FAIL"
+            status = ("PASS" if old_value == new_value else
+                      "WARN" if field == "issuer" and allowed_issuer_upgrade(
+                          old_value, new_value, issuer_upgrades) else "FAIL")
             reporter.add(status, f"{label} {field}",
                          f"source={old_value!r} target={new_value!r}")
         for field in ("key-type", "certificate-key-size", "certificate-key-curve-name"):
@@ -2244,11 +2309,15 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
             reporter.add("WARN", f"{label} expiration", "Target expiration-string missing or unparseable")
         elif expires <= datetime.now(timezone.utc):
             reporter.add("FAIL", f"{label} expiration", f"Target expired {expires:%d %b %Y %H:%M UTC}")
-        elif old_cn and old_cn == new_cn and (old_props["issuer"] and old_props["issuer"] == new_props["issuer"]
+        elif old_cn and old_cn == new_cn and (old_props["issuer"] and
+                                             (old_props["issuer"] == new_props["issuer"] or
+                                              allowed_issuer_upgrade(old_props["issuer"], new_props["issuer"],
+                                                                     issuer_upgrades))
                                              and old_props["subject-alternative-name"] == new_props["subject-alternative-name"]):
             reporter.add("INFO", label, f"Valid replacement {new_name}; expires {expires:%d %b %Y %H:%M UTC}")
         reporter.add("WARN", f"{label} signature/key usage",
                      "Complete X.509 extensions not exposed by validated tmsh output; unverified")
+        return False
 
     def compare_ssl(kind: str, old_ref: str, new_ref: str, old_owner: str, new_owner: str) -> None:
         old_name, new_name = scoped_name(old_ref, old_owner), scoped_name(new_ref, new_owner)
@@ -2327,7 +2396,10 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
             if matches:
                 reporter.add("PASS", f"{label} slot {old_slot['slot']} attributes",
                              f"Identical: {', '.join(matches)}")
-            compare_certificate(old_slot["cert"], new_slot["cert"], kind, old_name, new_name)
+            if compare_certificate(old_slot["cert"], new_slot["cert"], kind, old_name, new_name):
+                # The external renewal process intentionally leaves this slot at
+                # default.crt/default.key; dependent chain/key checks are irrelevant.
+                continue
             compare_bundle(old_slot["chain"], new_slot["chain"], old_name, new_name)
             key_name = new_slot["key"]
             old_key = old_slot["key"]
@@ -2411,12 +2483,13 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                                  f"source={old_value!r} target={new_value!r}")
         except ValueError as exc:
             reporter.add("ERROR", label, str(exc))
-        compare_certificate(tmsh_property(src_body, "cert"), tmsh_property(dst_body, "cert"),
-                            "https_monitor", source_name, target_name)
+        expired_default = compare_certificate(tmsh_property(src_body, "cert"),
+                                              tmsh_property(dst_body, "cert"),
+                                              "https_monitor", source_name, target_name)
         compare_bundle(tmsh_property(src_body, "ca-file"), tmsh_property(dst_body, "ca-file"),
                        source_name, target_name)
         old_key, new_key = tmsh_property(src_body, "key"), tmsh_property(dst_body, "key")
-        if old_key and old_key != "none":
+        if old_key and old_key != "none" and not expired_default:
             if is_default_file(new_key, "key") and not is_default_file(old_key, "key"):
                 reporter.add("FAIL", f"{label} key", "Replacement key missing: target still uses default.key")
             else:
@@ -2518,6 +2591,9 @@ def main() -> int:
     ap.add_argument("--filter", metavar="STATUSES", help="show only listed result labels, e.g. FAIL or FAIL,ERROR; summary still counts all")
     ap.add_argument("--nocolor", action="store_true", help="disable colored status labels")
     ap.add_argument("--member", choices=("a", "b"), help="check only this cluster member (default: both)")
+    ap.add_argument("--issuer-upgrades", type=Path,
+                    help="private JSON list of approved source_cn/target_cn issuer renewals")
+    ap.add_argument("--hostname-suffix", help="private BIG-IP hostname DNS suffix for comparison")
     ap.add_argument("--ntp-sync", action="store_true", help="compatibility option; NTP sync runs automatically for system checks when SSHPASSNET is set")
     ap.add_argument("--snapshot-dir", type=Path, help="write restricted raw SSH snapshots here")
     ap.add_argument("--from-snapshot", type=Path, help="compare previously saved snapshots offline")
@@ -2535,6 +2611,17 @@ def main() -> int:
     if args.cli_ready_timeout < 1 or args.cli_ready_timeout > args.timeout:
         ap.error("--cli-ready-timeout must be between 1 and --timeout")
     checks = parse_checks(args.checks)
+    hostname_suffix = args.hostname_suffix or os.environ.get("F5_HOSTNAME_SUFFIX")
+    if not hostname_suffix:
+        suffix_file = Path(__file__).resolve().parent / ".private" / "hostname-suffix.txt"
+        hostname_suffix = suffix_file.read_text(encoding="utf-8").strip() if suffix_file.is_file() else ""
+    if "basic" in checks and (not hostname_suffix or not re.fullmatch(r"\.[A-Za-z0-9.-]+", hostname_suffix)):
+        ap.error("Basic hostname check requires --hostname-suffix, F5_HOSTNAME_SUFFIX, or a private hostname-suffix.txt")
+    issuer_map_path = args.issuer_upgrades
+    if issuer_map_path is None:
+        default_map_path = Path(__file__).resolve().parent / ".private" / "issuer-upgrades.json"
+        issuer_map_path = default_map_path if default_map_path.is_file() else None
+    issuer_upgrades = load_issuer_upgrades(issuer_map_path) if "certificates" in checks else set()
     if checks != {"permissions"} and not args.from_snapshot and not args.snapshot_dir:
         ap.error("A live run requires --snapshot-dir for raw CLI evidence")
     try:
@@ -2545,17 +2632,22 @@ def main() -> int:
     color = (not args.nocolor and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
              and "NO_COLOR" not in os.environ)
     reporter = Reporter(status_filter=status_filter, color=color)
+    if "certificates" in checks and issuer_map_path is None:
+        reporter.add("WARN", "Issuer renewal mapping",
+                     "Private issuer upgrade map missing; any changed issuer will fail")
     members = (args.member,) if args.member else ("a", "b")
     package = manifest.get("package_details") or {}
-    metadata = (("package", manifest.get("migration_package")),
-                ("date", manifest.get("migration_date")),
-                ("migration engineer", package.get("migration_engineer")),
-                ("project manager", package.get("project_manager")),
-                ("technical lead", package.get("technical_lead")),
+    parsed_date = parse_migration_date(manifest.get("migration_date"))
+    date_label = (parsed_date.strftime("%d-%B-%Y") if parsed_date else manifest.get("migration_date"))
+    metadata = (("Migration package", manifest.get("migration_package")),
+                ("Migration date", date_label),
+                ("F5 engineer", package.get("migration_engineer")),
+                ("PM", package.get("project_manager")),
+                ("TL", package.get("technical_lead")),
                 ("ACI engineer", package.get("aci_engineer")))
-    reporter.add("INFO", "Migration", " | ".join(
-        f"{name}={re.sub(r'\s+', ' ', str(value)).strip() if value not in (None, '') else '(missing)'}"
-        for name, value in metadata), force=True)
+    reporter.add("INFO", "Migration", "\t".join(
+        f"{name}: {re.sub(r'\s+', ' ', str(value)).strip() if value not in (None, '') else '(missing)'}"
+        for name, value in metadata), force=True, inline=True)
     if "permissions" in checks:
         check_permissions(reporter, manifest, args.host_key_mode,
                           offline=bool(args.from_snapshot), check_system="system" in checks,
@@ -2621,7 +2713,7 @@ def main() -> int:
             for role in ("source", "target"):
                 record = collected.get(role)
                 if record is not None and not record.get("error"):
-                    compare_bigip(reporter, side, role, device[role], bigip_data(record))
+                    compare_bigip(reporter, side, role, device[role], bigip_data(record), hostname_suffix)
         if "platform" in checks:
             record = collected.get("rseries_host")
             if record is not None and not record.get("error"):
@@ -2642,7 +2734,8 @@ def main() -> int:
         if "references" in checks:
             compare_references(reporter, side, collected.get("source"), collected.get("target"))
         if "certificates" in checks:
-            compare_certificates(reporter, side, collected.get("source"), collected.get("target"))
+            compare_certificates(reporter, side, collected.get("source"), collected.get("target"),
+                                 manifest.get("migration_date"), issuer_upgrades)
     return reporter.finish()
 
 
