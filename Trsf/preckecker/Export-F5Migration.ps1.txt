@@ -3,7 +3,7 @@
 .SYNOPSIS
   Export one A/B migration package from LB_List and Pack_List to a JSON manifest.
 .EXAMPLE
-  .\Export-F5Migration.ps1 -Workbook 'C:\Work\EdgeConnect - Migration plan 2026.xlsx' -MigrationPackage SLO-0705 -Output '.\migration_SLO-0705.json'
+  .\Export-F5Migration.ps1 -Workbook 'C:\Work\Migration plan 2026.xlsx' -MigrationPackage SLO-XXXX -Output '.\migration_SLO-XXXX.json'
 .NOTES
   Run on Windows with desktop Excel installed. The workbook is opened read-only.
   Source BIG-IP version and live configuration are intentionally collected by the validator.
