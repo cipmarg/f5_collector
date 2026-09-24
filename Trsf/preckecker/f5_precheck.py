@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Read-only F5 migration validator (manifest schema 2).
 
-`permissions`, `basic`, `platform`, `network`, `routes`, `system`, and `applications` are implemented. BIG-IP
+`permissions`, `basic`, `platform`, `network`, `routes`, `system`, `applications`,
+`references`, and `certificates` are implemented. BIG-IP
 uses separate tmsh commands over one multiplexed SSH connection per endpoint;
 F5OS uses one interactive appliance CLI session. Supply --snapshot-dir so unexpected CLI
 output can be checked safely offline. Ctrl+C interrupts the current SSH
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import ipaddress
 import json
 import os
@@ -44,7 +46,8 @@ DISPLAY_ACCEPTED = re.compile(r"(?i)Display all\s+\d+\s+items\?\s*\(y/n\)\s*y\b"
 
 def parse_checks(spec: str) -> set[str]:
     selected: set[str] = set()
-    known = {"permissions", "basic", "platform", "network", "routes", "system", "applications"}
+    known = {"permissions", "basic", "platform", "network", "routes", "system", "applications",
+             "references", "certificates"}
     for token in spec.split(","):
         token = token.strip().lower()
         if not token:
@@ -56,7 +59,7 @@ def parse_checks(spec: str) -> set[str]:
         elif token in known:
             selected.add(token)
         else:
-            raise ValueError(f"Unsupported check category: {token!r}; available: permissions,basic,platform,network,routes,system,applications")
+            raise ValueError(f"Unsupported check category: {token!r}; available: {','.join(sorted(known))}")
     if not selected:
         raise ValueError("No checks selected")
     return selected
@@ -99,8 +102,12 @@ def clean_transcript(raw: str) -> str:
 
 
 def redact_transcript(raw: str) -> str:
-    """F5OS licensing displays a registration key; omit it from snapshots."""
-    return re.sub(r"(?im)^(\s*Registration key\s+)\S+", r"\g<1>[REDACTED]", raw)
+    """Omit registration keys and key-file secrets from retained SSH snapshots."""
+    raw = re.sub(r"(?im)^(\s*Registration key\s+)\S+", r"\g<1>[REDACTED]", raw)
+    raw = re.sub(r"(?im)^(\s*passphrase\s+)(?:\"(?:\\.|[^\"\\])*\"|\S+)",
+                 r"\g<1>[REDACTED]", raw)
+    return re.sub(r"(?ms)^\s*-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
+                  "[REDACTED PRIVATE KEY]", raw)
 
 
 def is_command_echo(line: str, command: str) -> bool:
@@ -500,6 +507,24 @@ ROUTE_COMMANDS = {"traffic": "list net route one-line",
 SYSTEM_COMMANDS = {"dns": "list sys dns one-line", "ntp": "list sys ntp one-line"}
 APPLICATION_COMMANDS = {"virtual": "list ltm virtual one-line",
                         "pool": "list ltm pool one-line"}
+REFERENCE_COMMANDS = {
+    "http": "cd /Common; list ltm profile http one-line",
+    "snatpool": "cd /Common; list ltm snatpool one-line",
+    "rule": "cd /Common; list ltm rule",
+    "policy": "cd /Common; list ltm policy one-line",
+    "data_group": "cd /Common; list ltm data-group one-line",
+    "cipher_group": "cd /Common; list ltm cipher group one-line",
+    "cipher_rule": "cd /Common; list ltm cipher rule one-line",
+}
+CERTIFICATE_COMMANDS = {
+    "client_ssl": "cd /Common; list ltm profile client-ssl",
+    "server_ssl": "cd /Common; list ltm profile server-ssl",
+    "virtual_profiles": "cd /Common; list ltm virtual profiles",
+    "https_monitor": "cd /Common; list ltm monitor https",
+    "cert": "cd /Common; list sys file ssl-cert all-properties",
+    "key": "cd /Common; list sys file ssl-key all-properties",
+    "bundle": "cd /Common; list sys file ssl-cert bundle-certificates",
+}
 # In `list ltm virtual one-line`, these switches stand alone without a value.
 VIRTUAL_BARE_FLAGS = frozenset({"dhcp-relay", "ip-forward", "internal", "l2-forward",
                                 "reject", "enabled", "disabled", "vlans-enabled",
@@ -514,24 +539,39 @@ def tmsh_objects(output: str, kind: str, *, allow_identical_duplicates: bool = F
     header = re.compile(r"(?m)^\s*" + re.escape(component).replace(r"\ ", r"\s+")
                         + r"\s+(\S+)\s*\{")
     for match in header.finditer(output):
-        depth = 1
         start = match.end()
-        end = start
-        while end < len(output) and depth:
-            if output[end] == "{":
-                depth += 1
-            elif output[end] == "}":
-                depth -= 1
-            end += 1
-        if depth:
-            raise ValueError(f"Incomplete net {kind} object {match.group(1)!r}")
+        end = closing_tmsh_brace(output, start)
+        if end is None:
+            raise ValueError(f"Incomplete {kind} object {match.group(1)!r}")
         name = match.group(1)
         if name in objects:
-            if allow_identical_duplicates and tmsh_fields(objects[name]) == tmsh_fields(output[start:end - 1]):
+            if allow_identical_duplicates and tmsh_fields(objects[name]) == tmsh_fields(output[start:end]):
                 continue  # A legacy snapshot may contain both the default query and the full listing.
-            raise ValueError(f"Repeated net {kind} object {name!r}")
-        objects[name] = output[start:end - 1]
+            raise ValueError(f"Repeated {kind} object {name!r}")
+        objects[name] = output[start:end]
     return objects
+
+
+def closing_tmsh_brace(text: str, after_open: int) -> int | None:
+    """Index of the matching closing brace, ignoring braces in quoted values."""
+    depth = 1
+    quoted = False
+    escaped = False
+    for index in range(after_open, len(text)):
+        char = text[index]
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif not quoted and char == "{":
+            depth += 1
+        elif not quoted and char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
 
 
 def echoed_inventory(record: dict, command: str) -> str | None:
@@ -568,7 +608,8 @@ def inventory_section(record: dict | None, command: str) -> tuple[str | None, st
     output, error = section(record, command)
     if error and not error.startswith("Command boundary missing:"):
         # tmsh can report an empty object inventory as 'No entries found'.
-        if not (command in (*ROUTE_COMMANDS.values(), *APPLICATION_COMMANDS.values()) and
+        if not (command in (*ROUTE_COMMANDS.values(), *APPLICATION_COMMANDS.values(),
+                            *REFERENCE_COMMANDS.values(), *CERTIFICATE_COMMANDS.values()) and
                 re.search(r"(?i)no entries (?:found|to display)",
                           record.get("sections", {}).get(command, ""))):
             return None, error
@@ -726,15 +767,10 @@ def tmsh_block(body: str, property_name: str) -> str | None:
     if not match:
         return None
     start = match.end()
-    depth = 1
-    for pos in range(start, len(body)):
-        if body[pos] == "{":
-            depth += 1
-        elif body[pos] == "}":
-            depth -= 1
-            if not depth:
-                return body[start:pos]
-    raise ValueError(f"Incomplete {property_name} block")
+    end = closing_tmsh_brace(body, start)
+    if end is None:
+        raise ValueError(f"Incomplete {property_name} block")
+    return body[start:end]
 
 
 def tmsh_property(body: str, name: str) -> str | None:
@@ -775,6 +811,128 @@ def tmsh_fields(body: str, *, bare_flags: frozenset[str] | tuple = ()) -> dict[s
             fields[key] = tokens[index].strip('"')
             index += 1
     return fields
+
+
+def scoped_name(name: str, owner: str = "/Common/example") -> str:
+    """Resolve a tmsh reference in the referencing object's partition."""
+    return name if name.startswith("/") else object_path(owner).rsplit("/", 1)[0] + "/" + name
+
+
+def object_inventory(record: dict | None, command: str, kind: str) -> tuple[dict[str, str] | None, str | None]:
+    output, error = inventory_section(record, command)
+    if error:
+        return None, error
+    try:
+        objects = tmsh_objects(output or "", kind)
+        if objects:
+            return {object_path(name): body for name, body in objects.items()}, None
+        if re.search(r"(?i)no entries (?:found|to display)", output or ""):
+            return {}, None
+        return None, f"{command}: no parseable objects; cannot verify an empty inventory"
+    except ValueError as exc:
+        return None, str(exc)
+
+
+def rule_inventory(record: dict | None) -> tuple[dict[str, str] | None, str | None]:
+    """tmsh prints Tcl iRules multiline; do not count braces in quoted Tcl or comments."""
+    command = REFERENCE_COMMANDS["rule"]
+    output, error = inventory_section(record, command)
+    if error:
+        return None, error
+    headers = list(re.finditer(r"(?m)^ltm\s+rule\s+(\S+)\s+\{[ \t]*$", output or ""))
+    if not headers:
+        if re.search(r"(?i)no entries (?:found|to display)", output or ""):
+            return {}, None
+        return None, f"{command}: no rule headers; cannot verify empty inventory"
+    rules: dict[str, str] = {}
+    for index, header in enumerate(headers):
+        stop = headers[index + 1].start() if index + 1 < len(headers) else len(output or "")
+        segment = (output or "")[header.end():stop]
+        # The last column-zero closing brace before the next tmsh object ends
+        # this rule; Tcl's own closing braces may also be in column zero.
+        closings = list(re.finditer(r"(?m)^\}[ \t]*(?:\n|$)", segment))
+        if not closings:
+            return None, f"ltm rule {header.group(1)}: closing brace missing"
+        closing = closings[-1]
+        if index + 1 < len(headers) and segment[closing.end():].strip():
+            return None, f"ltm rule {header.group(1)}: unexpected text after closing brace"
+        name = object_path(header.group(1))
+        if name in rules:
+            return None, f"ltm rule {name}: duplicate object"
+        body = segment[:closing.start()].replace("\r\n", "\n").strip("\n")
+        body = re.sub(r"(?m)^\s*(?:last-modified|verification-status)\s+[^\n]*\n?", "", body)
+        rules[name] = body
+    return rules, None
+
+
+def rule_digest(body: str) -> str:
+    return hashlib.md5(body.encode("utf-8")).hexdigest()
+
+
+def data_group_inventory(record: dict | None) -> tuple[dict[str, dict] | None, str | None]:
+    command = REFERENCE_COMMANDS["data_group"]
+    output, error = inventory_section(record, command)
+    if error:
+        return None, error
+    try:
+        groups: dict[str, dict] = {}
+        for subtype in ("internal", "external"):
+            for name, body in tmsh_objects(output or "", f"ltm data-group {subtype}").items():
+                key = object_path(name)
+                if key in groups:
+                    raise ValueError(f"Repeated data-group {key}")
+                fields = tmsh_fields(body)
+                if subtype == "internal" and (records := tmsh_block(body, "records")) is not None:
+                    entries = {record_name: tmsh_fields(record_body)
+                               for record_name, record_body in tmsh_objects_from_block(records)}
+                    fields["records"] = tuple(sorted((name, tuple(sorted(row.items())))
+                                                     for name, row in entries.items()))
+                groups[key] = {"subtype": subtype, "fields": fields}
+        if groups:
+            return groups, None
+        if re.search(r"(?i)no entries (?:found|to display)", output or ""):
+            return {}, None
+        return None, f"{command}: no parseable data groups"
+    except ValueError as exc:
+        return None, str(exc)
+
+
+def rule_dependencies(body: str) -> tuple[set[str], set[str], set[str]]:
+    """Extract literal cross-rule calls and common class/legacy data-group uses."""
+    rules: set[str] = set()
+    groups: set[str] = set()
+    unresolved: set[str] = set()
+    # A comment at the beginning of a Tcl line is not executable.
+    code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("#"))
+    for match in re.finditer(r"\bcall\s+([^\s;{}\[\]]+)", code):
+        ref = match.group(1).strip('"')
+        if "$" in ref or "[" in ref:
+            unresolved.add(f"dynamic iRule call {ref}")
+        elif "::" in ref:
+            rules.add(ref.rsplit("::", 1)[0])
+        else:
+            unresolved.add(f"unrecognized iRule call {ref}")
+    for match in re.finditer(r"\bclass\s+(match|lookup|names|exists|size|element)\s+([^\n;]+)", code):
+        operation, rest = match.groups()
+        tokens = rest.split()
+        position = 2 if operation == "match" else 1 if operation == "lookup" else 0
+        if len(tokens) <= position:
+            unresolved.add(f"unparsed class {operation}")
+            continue
+        ref = tokens[position].strip('"{}]')
+        if "$" in ref or "[" in ref or not ref:
+            unresolved.add(f"dynamic data-group in class {operation}")
+        else:
+            groups.add(ref)
+    for match in re.finditer(r"\b(?:matchclass|findclass)\s+([^\n;]+)", code):
+        operation = match.group(0).split()[0]
+        tokens = match.group(1).split()
+        position = 2 if operation == "matchclass" else 1
+        if len(tokens) <= position or "$" in tokens[position] or "[" in tokens[position]:
+            unresolved.add(f"dynamic {operation} data-group")
+        else:
+            groups.add(tokens[position].strip('"{}]'))
+    return rules, groups, unresolved
 
 
 def normalize_self_address(address: str) -> str:
@@ -845,23 +1003,27 @@ def network_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | None
 
 
 def tmsh_objects_from_block(block: str) -> list[tuple[str, str]]:
-    """Parse interface member names and their nested properties."""
+    """Read named nested objects, including data-group keys with quoted spaces."""
+    tokens = re.findall(r'"(?:\\.|[^"\\])*"|[{}]|[^\s{}"]+', block)
     members: list[tuple[str, str]] = []
-    offset = 0
-    while match := re.search(r"([^\s{}]+)\s*\{", block[offset:]):
-        body_start = offset + match.end()
+    index = 0
+    while index < len(tokens):
+        name = tokens[index].strip('"')
+        index += 1
+        if index >= len(tokens) or tokens[index] != "{":
+            raise ValueError(f"Expected a named nested block after {name!r}")
+        index += 1
         depth = 1
-        pos = body_start
-        while pos < len(block) and depth:
-            if block[pos] == "{":
-                depth += 1
-            elif block[pos] == "}":
-                depth -= 1
-            pos += 1
+        body: list[str] = []
+        while index < len(tokens) and depth:
+            token = tokens[index]
+            depth += (token == "{") - (token == "}")
+            if depth:
+                body.append(token)
+            index += 1
         if depth:
-            raise ValueError(f"Incomplete interface member {match.group(1)!r}")
-        members.append((match.group(1), block[body_start:pos - 1]))
-        offset = pos
+            raise ValueError(f"Incomplete nested block {name!r}")
+        members.append((name, " ".join(body)))
     return members
 
 
@@ -1504,6 +1666,601 @@ def compare_applications(reporter: Reporter, side: str, source: dict | None,
                          "No matching source pool; review target-only configuration")
 
 
+REFERENCE_KINDS = {
+    "http": (REFERENCE_COMMANDS["http"], "ltm profile http"),
+    "snatpool": (REFERENCE_COMMANDS["snatpool"], "ltm snatpool"),
+    "policy": (REFERENCE_COMMANDS["policy"], "ltm policy"),
+    "cipher_group": (REFERENCE_COMMANDS["cipher_group"], "ltm cipher group"),
+    "cipher_rule": (REFERENCE_COMMANDS["cipher_rule"], "ltm cipher rule"),
+    "client_ssl": (CERTIFICATE_COMMANDS["client_ssl"], "ltm profile client-ssl"),
+    "server_ssl": (CERTIFICATE_COMMANDS["server_ssl"], "ltm profile server-ssl"),
+    "https_monitor": (CERTIFICATE_COMMANDS["https_monitor"], "ltm monitor https"),
+}
+
+
+def named_references(body: str, field: str) -> list[str]:
+    block = tmsh_block(body, field)
+    if block is None:
+        value = tmsh_property(body, field)
+        return [value] if value and value != "none" else []
+    nested = tmsh_objects_from_block(block) if "{" in block else []
+    if nested:
+        return [name for name, _ in nested]
+    return [token.strip('"') for token in re.findall(r'"(?:\\.|[^"\\])*"|[^\s{}]+', block)
+            if token.strip('"') not in ("none", "default")]
+
+
+def paired_references(old_refs: list[str], new_refs: list[str], old_owner: str,
+                      new_owner: str) -> list[tuple[str, str]]:
+    """Prefer exact object identities, then match remaining intentional renames by position."""
+    remaining = list(new_refs)
+    pairs: list[tuple[str, str]] = []
+    renamed: list[str] = []
+    for old in old_refs:
+        match = next((candidate for candidate in remaining
+                      if scoped_name(candidate, new_owner) == scoped_name(old, old_owner)), None)
+        if match is not None:
+            pairs.append((old, match))
+            remaining.remove(match)
+        else:
+            renamed.append(old)
+    pairs.extend(zip(renamed, remaining))
+    return pairs
+
+
+def virtual_pairs(source: dict | None, target: dict | None,
+                  reporter: Reporter, side: str) -> list[tuple[str, str]]:
+    old, old_error = application_data(source, "virtual")
+    new, new_error = application_data(target, "virtual")
+    for role, error in (("source", old_error), ("target", new_error)):
+        if error:
+            reporter.add("ERROR", f"{side.upper()} {role} referenced VIP inventory", error)
+    if old_error or new_error:
+        return []
+    assert old is not None and new is not None
+    endpoints: dict[tuple[str, ...], list[str]] = {}
+    for name, entry in new.items():
+        endpoints.setdefault(virtual_endpoint(name, entry), []).append(name)
+    pairs = []
+    used = set()
+    for name, entry in sorted(old.items()):
+        exact = next((n for n in new if object_path(n) == object_path(name)), None)
+        candidates = endpoints.get(virtual_endpoint(name, entry), [])
+        partner = exact or (candidates[0] if len(candidates) == 1 else None)
+        if partner is None or partner in used:
+            reporter.add("ERROR" if len(candidates) > 1 else "FAIL",
+                         f"{side.upper()} VIP references {name}",
+                         f"No unique target VIP: {candidates}")
+            continue
+        used.add(partner)
+        pairs.append((object_path(name), object_path(partner)))
+    return pairs
+
+
+def compare_references(reporter: Reporter, side: str, source: dict | None,
+                       target: dict | None) -> None:
+    """Compare the statically reachable configuration of migrated VIPs."""
+    inventories: dict[str, tuple[dict, dict]] = {}
+    for kind, (command, header) in REFERENCE_KINDS.items():
+        old, old_error = object_inventory(source, command, header)
+        new, new_error = object_inventory(target, command, header)
+        for role, error in (("source", old_error), ("target", new_error)):
+            if error:
+                reporter.add("ERROR", f"{side.upper()} {role} {kind} inventory", error)
+        if old is not None and new is not None:
+            inventories[kind] = (old, new)
+    source_rules, source_error = rule_inventory(source)
+    target_rules, target_error = rule_inventory(target)
+    source_groups, group_error = data_group_inventory(source)
+    target_groups, target_group_error = data_group_inventory(target)
+    for label, error in (("source iRules", source_error), ("target iRules", target_error),
+                         ("source data groups", group_error), ("target data groups", target_group_error)):
+        if error:
+            reporter.add("ERROR", f"{side.upper()} {label} inventory", error)
+
+    visited_objects: set[tuple[str, str]] = set()
+    visited_rules: set[tuple[str, str]] = set()
+    visited_groups: set[tuple[str, str]] = set()
+
+    def compare_object(kind: str, old_ref: str, new_ref: str, owner_old: str,
+                       owner_new: str) -> tuple[str | None, str | None]:
+        old_name = scoped_name(old_ref, owner_old)
+        new_name = scoped_name(new_ref, owner_new)
+        label = f"{side.upper()} {kind} {old_name}"
+        if kind not in inventories:
+            reporter.add("ERROR", label, "Inventory unavailable")
+            return None, None
+        old_objects, new_objects = inventories[kind]
+        before, after = old_objects.get(old_name), new_objects.get(new_name)
+        if before is None or after is None:
+            reporter.add("FAIL", label, f"source={'present' if before is not None else 'missing'} "
+                         f"target={'present' if after is not None else 'missing'} ({new_name})")
+            return None, None
+        if (kind, old_name) not in visited_objects:
+            visited_objects.add((kind, old_name))
+            if old_name != new_name:
+                reporter.add("WARN", label, f"Renamed to {new_name}; checking attributes")
+            try:
+                # A certificate renewal can replace cert/key/chain identifiers.
+                # Certificate semantics are compared separately below.
+                old_fields = tmsh_fields(re.sub(r"\blast-modified\s+(?:\"[^\"]*\"|\S+)", "", before))
+                new_fields = tmsh_fields(re.sub(r"\blast-modified\s+(?:\"[^\"]*\"|\S+)", "", after))
+                for field, value in sorted(old_fields.items()):
+                    if kind in ("client_ssl", "server_ssl") and field in {
+                            "cert", "key", "chain", "cert-key-chain", "ca-file", "trusted-cert-authority",
+                            "crl-file", "cipher-group"}:
+                        continue
+                    if value != new_fields.get(field):
+                        reporter.add("FAIL", f"{label} {field}",
+                                     f"source={value!r} target={new_fields.get(field)!r}")
+                if not any(status == "FAIL" and entry.startswith(label + " ")
+                           for status, entry, _ in reporter.results):
+                    reporter.add("PASS", label, f"Target {new_name}: source attributes match")
+            except ValueError as exc:
+                reporter.add("ERROR", label, str(exc))
+            if kind in ("http", "client_ssl", "server_ssl"):
+                parent_old, parent_new = tmsh_property(before, "defaults-from"), tmsh_property(after, "defaults-from")
+                if parent_old and parent_new and scoped_name(parent_old, old_name) != old_name:
+                    if scoped_name(parent_old, old_name) in inventories[kind][0]:
+                        compare_object(kind, parent_old, parent_new, old_name, new_name)
+                    else:
+                        reporter.add("WARN", f"{label} defaults-from",
+                                     "Parent profile not in collected family; inherited settings unverified")
+            if kind in ("client_ssl", "server_ssl"):
+                old_cipher = tmsh_property(before, "cipher-group")
+                new_cipher = tmsh_property(after, "cipher-group")
+                if old_cipher and old_cipher != "none":
+                    if new_cipher and new_cipher != "none":
+                        compare_object("cipher_group", old_cipher, new_cipher, old_name, new_name)
+                    else:
+                        reporter.add("FAIL", f"{label} cipher-group", "Cipher group missing from target")
+                reporter.add("WARN", f"{label} certificate dependencies",
+                             "Use --checks certificates to verify certs, keys, chains and CA bundles")
+            if kind == "cipher_group":
+                for field in ("allow", "exclude", "require"):
+                    old_refs, new_refs = named_references(before, field), named_references(after, field)
+                    if len(old_refs) != len(new_refs):
+                        reporter.add("FAIL", f"{label} {field}",
+                                     f"source={old_refs} target={new_refs}")
+                    for old_rule, new_rule in paired_references(old_refs, new_refs, old_name, new_name):
+                        compare_object("cipher_rule", old_rule, new_rule, old_name, new_name)
+        return before, after
+
+    def compare_group(old_ref: str, new_ref: str, old_owner: str, new_owner: str) -> None:
+        old_name, new_name = scoped_name(old_ref, old_owner), scoped_name(new_ref, new_owner)
+        if (old_name, new_name) in visited_groups:
+            return
+        visited_groups.add((old_name, new_name))
+        label = f"{side.upper()} data-group {old_name}"
+        if source_groups is None or target_groups is None:
+            reporter.add("ERROR", label, "Data-group inventory unavailable")
+            return
+        before, after = source_groups.get(old_name), target_groups.get(new_name)
+        if before is None or after is None:
+            reporter.add("FAIL", label, f"source={'present' if before else 'missing'} "
+                         f"target={'present' if after else 'missing'}")
+        else:
+            reporter.add("PASS" if before == after else "FAIL", label,
+                         f"source={before!r} target={after!r}" if before != after else f"target={new_name} records match")
+
+    def compare_rule(old_ref: str, new_ref: str, old_owner: str, new_owner: str,
+                     depth: int = 0) -> None:
+        old_name, new_name = scoped_name(old_ref, old_owner), scoped_name(new_ref, new_owner)
+        label = f"{side.upper()} iRule {old_name}"
+        if (old_name, new_name) in visited_rules:
+            return
+        visited_rules.add((old_name, new_name))
+        if source_rules is None or target_rules is None:
+            reporter.add("ERROR", label, "iRule inventory unavailable")
+            return
+        before, after = source_rules.get(old_name), target_rules.get(new_name)
+        if before is None or after is None:
+            reporter.add("FAIL", label, f"source={'present' if before is not None else 'missing'} "
+                         f"target={'present' if after is not None else 'missing'} ({new_name})")
+            return
+        old_hash, new_hash = rule_digest(before), rule_digest(after)
+        reporter.add("PASS" if old_hash == new_hash else "FAIL", label,
+                     f"source MD5={old_hash} target MD5={new_hash}" +
+                     (f" target={new_name}" if old_name != new_name else ""))
+        old_rules, old_groups, old_unresolved = rule_dependencies(before)
+        new_rules, new_groups, new_unresolved = rule_dependencies(after)
+        for item in sorted(old_unresolved | new_unresolved):
+            reporter.add("WARN", f"{label} dependency", f"Cannot resolve {item}")
+        for group in sorted(old_groups | new_groups):
+            if group not in old_groups or group not in new_groups:
+                reporter.add("FAIL", f"{label} data-group {group}", "Reference differs across devices")
+            else:
+                compare_group(group, group, old_name, new_name)
+        for dependency in sorted(old_rules | new_rules):
+            if dependency not in old_rules or dependency not in new_rules:
+                reporter.add("FAIL", f"{label} call {dependency}", "Reference differs across devices")
+            elif depth >= 10:
+                reporter.add("WARN", f"{label} call {dependency}", "Unverified: iRule depth limit (10)")
+            else:
+                compare_rule(dependency, dependency, old_name, new_name, depth + 1)
+
+    pairs = virtual_pairs(source, target, reporter, side)
+    if not pairs:
+        return
+    old_vips, old_error = object_inventory(source, APPLICATION_COMMANDS["virtual"], "ltm virtual")
+    new_vips, new_error = object_inventory(target, APPLICATION_COMMANDS["virtual"], "ltm virtual")
+    if old_error or new_error:
+        reporter.add("ERROR", f"{side.upper()} VIP references", old_error or new_error or "")
+        return
+    assert old_vips is not None and new_vips is not None
+    for old_vip, new_vip in pairs:
+        old_body, new_body = old_vips[old_vip], new_vips[new_vip]
+        for kind, property_name in (("profile", "profiles"), ("policy", "policies"), ("rule", "rules")):
+            old_refs = named_references(old_body, property_name)
+            new_refs = named_references(new_body, property_name)
+            if len(old_refs) != len(new_refs):
+                reporter.add("FAIL", f"{side.upper()} VIP {old_vip} {property_name}",
+                             f"source={old_refs} target={new_refs}")
+            for old_ref, new_ref in paired_references(old_refs, new_refs, old_vip, new_vip):
+                if kind == "rule":
+                    compare_rule(old_ref, new_ref, old_vip, new_vip)
+                elif kind == "policy":
+                    compare_object("policy", old_ref, new_ref, old_vip, new_vip)
+                else:
+                    profile_kind = next((candidate for candidate in ("http", "client_ssl", "server_ssl")
+                                         if candidate in inventories and
+                                         scoped_name(old_ref, old_vip) in inventories[candidate][0]), None)
+                    if profile_kind:
+                        compare_object(profile_kind, old_ref, new_ref, old_vip, new_vip)
+                    else:
+                        reporter.add("WARN", f"{side.upper()} VIP {old_vip} profile {old_ref}",
+                                     "Profile family not collected; attributes unverified")
+        old_sat = tmsh_block(old_body, "source-address-translation")
+        new_sat = tmsh_block(new_body, "source-address-translation")
+        old_pool = tmsh_property(old_sat or "", "pool")
+        new_pool = tmsh_property(new_sat or "", "pool")
+        if old_pool or new_pool:
+            if not old_pool or not new_pool:
+                reporter.add("FAIL", f"{side.upper()} VIP {old_vip} SNAT pool",
+                             f"source={old_pool!r} target={new_pool!r}")
+            else:
+                compare_object("snatpool", old_pool, new_pool, old_vip, new_vip)
+
+
+def profile_cert_slots(body: str) -> list[dict]:
+    block = tmsh_block(body, "cert-key-chain")
+    if block is not None:
+        return [{"slot": slot, "cert": tmsh_property(contents, "cert"),
+                 "key": tmsh_property(contents, "key"),
+                 "chain": tmsh_property(contents, "chain"),
+                 "attributes": {field: value for field, value in tmsh_fields(contents).items()
+                                if field not in {"cert", "key", "chain"}}}
+                for slot, contents in tmsh_objects_from_block(block)]
+    cert, key = tmsh_property(body, "cert"), tmsh_property(body, "key")
+    return ([{"slot": "default", "cert": cert, "key": key,
+              "chain": tmsh_property(body, "chain"), "attributes": {}}] if cert or key else [])
+
+
+def certificate_properties(body: str) -> dict[str, str | None]:
+    names = ("subject", "issuer", "subject-alternative-name", "key-type",
+             "certificate-key-size", "certificate-key-curve-name", "cert-type",
+             "version", "expiration-date", "serial-number", "fingerprint")
+    return {name: tmsh_property(body, name) for name in names}
+
+
+def bundle_fingerprints(body: str) -> tuple[str, ...] | None:
+    block = tmsh_block(body, "bundle-certificates")
+    if block is None:
+        return None
+    fingerprints = [tmsh_property(row, "fingerprint") for _, row in tmsh_objects_from_block(block)]
+    if not fingerprints or any(not fingerprint for fingerprint in fingerprints):
+        return None
+    return tuple(sorted(fingerprints))
+
+
+def compare_certificates(reporter: Reporter, side: str, source: dict | None,
+                         target: dict | None) -> None:
+    """Trace only SSL on migrated VIPs and HTTPS monitors attached to their pools."""
+    inventories: dict[str, tuple[dict[str, str], dict[str, str]]] = {}
+    kinds = {
+        "client_ssl": (CERTIFICATE_COMMANDS["client_ssl"], "ltm profile client-ssl"),
+        "server_ssl": (CERTIFICATE_COMMANDS["server_ssl"], "ltm profile server-ssl"),
+        "https_monitor": (CERTIFICATE_COMMANDS["https_monitor"], "ltm monitor https"),
+        "cert": (CERTIFICATE_COMMANDS["cert"], "sys file ssl-cert"),
+        "key": (CERTIFICATE_COMMANDS["key"], "sys file ssl-key"),
+        "bundle": (CERTIFICATE_COMMANDS["bundle"], "sys file ssl-cert"),
+        "cipher_group": (REFERENCE_COMMANDS["cipher_group"], "ltm cipher group"),
+        "cipher_rule": (REFERENCE_COMMANDS["cipher_rule"], "ltm cipher rule"),
+    }
+    for kind, (command, header) in kinds.items():
+        old, old_error = object_inventory(source, command, header)
+        new, new_error = object_inventory(target, command, header)
+        for role, error in (("source", old_error), ("target", new_error)):
+            if error:
+                reporter.add("ERROR", f"{side.upper()} {role} {kind} inventory", error)
+        if old is not None and new is not None:
+            inventories[kind] = old, new
+    # The separately tested virtual profile listing validates the relationship
+    # collected by the full virtual inventory before we report attached certs.
+    profile_lists: list[dict[str, str]] = []
+    for role, record in (("source", source), ("target", target)):
+        objects, error = object_inventory(record, CERTIFICATE_COMMANDS["virtual_profiles"],
+                                          "ltm virtual")
+        if error:
+            reporter.add("ERROR", f"{side.upper()} {role} VIP SSL attachments", error)
+        profile_lists.append(objects or {})
+    pairs = virtual_pairs(source, target, reporter, side)
+    if not pairs:
+        return
+    old_vips, old_error = object_inventory(source, APPLICATION_COMMANDS["virtual"], "ltm virtual")
+    new_vips, new_error = object_inventory(target, APPLICATION_COMMANDS["virtual"], "ltm virtual")
+    if old_error or new_error or old_vips is None or new_vips is None:
+        reporter.add("ERROR", f"{side.upper()} VIP certificate graph", old_error or new_error or "Missing VIP inventory")
+        return
+
+    visited_profiles: set[tuple[str, str, str]] = set()
+    visited_certs: set[tuple[str, str, str]] = set()
+    visited_bundles: set[tuple[str, str]] = set()
+
+    def compare_ciphers(old_ref: str | None, new_ref: str | None,
+                        old_owner: str, new_owner: str) -> None:
+        if not old_ref or old_ref == "none":
+            return
+        label = f"{side.upper()} SSL cipher group {old_ref}"
+        if not new_ref or new_ref == "none":
+            reporter.add("FAIL", label, "Cipher group missing on target")
+            return
+        if "cipher_group" not in inventories or "cipher_rule" not in inventories:
+            reporter.add("ERROR", label, "Cipher group or rule inventory unavailable")
+            return
+        old_name, new_name = scoped_name(old_ref, old_owner), scoped_name(new_ref, new_owner)
+        old_groups, new_groups = inventories["cipher_group"]
+        before, after = old_groups.get(old_name), new_groups.get(new_name)
+        if before is None or after is None:
+            reporter.add("FAIL", label, f"source={'present' if before is not None else 'missing'} "
+                         f"target={'present' if after is not None else 'missing'}")
+            return
+        old_fields, new_fields = tmsh_fields(before), tmsh_fields(after)
+        reporter.add("PASS" if old_fields == new_fields else "FAIL", label,
+                     f"source={old_fields!r} target={new_fields!r}" if old_fields != new_fields
+                     else f"target={new_name} attributes match")
+        old_rules, new_rules = inventories["cipher_rule"]
+        for field in ("allow", "exclude", "require"):
+            src_refs, dst_refs = named_references(before, field), named_references(after, field)
+            if len(src_refs) != len(dst_refs):
+                reporter.add("FAIL", f"{label} {field}", f"source={src_refs} target={dst_refs}")
+            for src_ref, dst_ref in paired_references(src_refs, dst_refs, old_name, new_name):
+                src_rule = old_rules.get(scoped_name(src_ref, old_name))
+                dst_rule = new_rules.get(scoped_name(dst_ref, new_name))
+                rule_label = f"{label} rule {src_ref}"
+                if src_rule is None or dst_rule is None:
+                    reporter.add("FAIL", rule_label, "Cipher rule absent from source or target inventory")
+                else:
+                    src_fields, dst_fields = tmsh_fields(src_rule), tmsh_fields(dst_rule)
+                    reporter.add("PASS" if src_fields == dst_fields else "FAIL", rule_label,
+                                 f"source={src_fields!r} target={dst_fields!r}" if src_fields != dst_fields
+                                 else "Rule attributes match")
+
+    def compare_bundle(old_ref: str | None, new_ref: str | None,
+                       old_owner: str, new_owner: str) -> None:
+        if not old_ref or old_ref == "none":
+            if new_ref and new_ref != "none":
+                reporter.add("WARN", f"{side.upper()} CA/chain {new_ref}",
+                             "Target has an additional CA/chain reference; review")
+            return
+        label = f"{side.upper()} CA/chain {old_ref}"
+        if not new_ref or new_ref == "none":
+            reporter.add("FAIL", label, "CA/chain missing on target")
+            return
+        if "bundle" not in inventories or "cert" not in inventories:
+            reporter.add("ERROR", label, "Certificate or bundle inventory unavailable")
+            return
+        old_name, new_name = scoped_name(old_ref, old_owner), scoped_name(new_ref, new_owner)
+        if (old_name, new_name) in visited_bundles:
+            return
+        visited_bundles.add((old_name, new_name))
+        old_bundles, new_bundles = inventories["bundle"]
+        old_certs, new_certs = inventories["cert"]
+        old_body = old_bundles.get(old_name) or old_certs.get(old_name)
+        new_body = new_bundles.get(new_name) or new_certs.get(new_name)
+        if old_body is None or new_body is None:
+            reporter.add("FAIL", label, f"source={'present' if old_body else 'missing'} "
+                         f"target={'present' if new_body else 'missing'}")
+            return
+        old_members, new_members = bundle_fingerprints(old_body), bundle_fingerprints(new_body)
+        if (old_members is None) != (new_members is None):
+            reporter.add("FAIL", label, "Bundle membership exists on only one device")
+            return
+        if old_members is None and new_members is None:
+            # Only a single certificate may use its own fingerprint. A bundle
+            # with missing member metadata must never pass on the first cert.
+            if (re.search(r"\bbundle-certificates\s+(?!none\b)", old_body) or
+                    re.search(r"\bbundle-certificates\s+(?!none\b)", new_body)):
+                reporter.add("WARN", label, "Bundle member fingerprints not available; unverified")
+                return
+            old_members = (tmsh_property(old_body, "fingerprint") or "",)
+            new_members = (tmsh_property(new_body, "fingerprint") or "",)
+        if not old_members or not new_members or any(not member for member in (*old_members, *new_members)):
+            reporter.add("WARN", label, "Bundle membership/fingerprint unavailable; unverified")
+        else:
+            reporter.add("PASS" if old_members == new_members else "FAIL", label,
+                         f"source fingerprints={old_members} target fingerprints={new_members}")
+
+    def compare_certificate(old_ref: str | None, new_ref: str | None, kind: str,
+                            old_owner: str, new_owner: str) -> None:
+        label = f"{side.upper()} {kind} certificate {old_ref}"
+        if not old_ref or old_ref == "none":
+            return
+        if not new_ref or new_ref == "none":
+            reporter.add("FAIL", label, "Certificate missing from target profile")
+            return
+        if "cert" not in inventories:
+            reporter.add("ERROR", label, "Certificate inventory unavailable")
+            return
+        old_name, new_name = scoped_name(old_ref, old_owner), scoped_name(new_ref, new_owner)
+        if (kind, old_name, new_name) in visited_certs:
+            return
+        visited_certs.add((kind, old_name, new_name))
+        old_certs, new_certs = inventories["cert"]
+        before, after = old_certs.get(old_name), new_certs.get(new_name)
+        if before is None or after is None:
+            reporter.add("FAIL", label, f"source={'present' if before else 'missing'} "
+                         f"target={'present' if after else 'missing'}")
+            return
+        old_props, new_props = certificate_properties(before), certificate_properties(after)
+        for field in ("subject", "issuer", "subject-alternative-name", "key-type",
+                      "certificate-key-size", "certificate-key-curve-name", "cert-type", "version"):
+            old_value, new_value = old_props[field], new_props[field]
+            status = "WARN" if old_value is None or new_value is None else "PASS" if old_value == new_value else "FAIL"
+            reporter.add(status, f"{label} {field}",
+                         f"source={old_value!r} target={new_value!r}")
+        reporter.add("INFO", label, f"source={old_name} target={new_name} "
+                     f"serials={old_props['serial-number']!r}/{new_props['serial-number']!r} "
+                     f"expires={old_props['expiration-date']!r}/{new_props['expiration-date']!r}")
+        if kind == "server_ssl":
+            reporter.add("WARN", f"{label} EKU", "Not exposed by validated tmsh output; unverified")
+        reporter.add("WARN", f"{label} signature/key usage",
+                     "Complete X.509 extensions not exposed by validated tmsh output; unverified")
+
+    def compare_ssl(kind: str, old_ref: str, new_ref: str, old_owner: str, new_owner: str) -> None:
+        old_name, new_name = scoped_name(old_ref, old_owner), scoped_name(new_ref, new_owner)
+        label = f"{side.upper()} {kind} {old_name}"
+        if (kind, old_name, new_name) in visited_profiles:
+            return
+        visited_profiles.add((kind, old_name, new_name))
+        if kind not in inventories:
+            reporter.add("ERROR", label, "SSL profile inventory unavailable")
+            return
+        old_profiles, new_profiles = inventories[kind]
+        before, after = old_profiles.get(old_name), new_profiles.get(new_name)
+        if before is None or after is None:
+            reporter.add("FAIL", label, f"source={'present' if before else 'missing'} "
+                         f"target={'present' if after else 'missing'}")
+            return
+        for field in ("ciphers", "cipher-group", "authenticate", "authenticate-depth",
+                      "server-name", "sni-default", "sni-require", "peer-cert-mode"):
+            old_value, new_value = tmsh_property(before, field), tmsh_property(after, field)
+            if old_value is not None or new_value is not None:
+                reporter.add("PASS" if old_value == new_value else "FAIL", f"{label} {field}",
+                             f"source={old_value!r} target={new_value!r}")
+        compare_ciphers(tmsh_property(before, "cipher-group"),
+                        tmsh_property(after, "cipher-group"), old_name, new_name)
+        for field in ("ca-file", "trusted-cert-authority"):
+            compare_bundle(tmsh_property(before, field), tmsh_property(after, field), old_name, new_name)
+        old_slots, new_slots = profile_cert_slots(before), profile_cert_slots(after)
+        if len(old_slots) != len(new_slots):
+            reporter.add("FAIL", f"{label} cert-key-chain", f"source slots={len(old_slots)} target={len(new_slots)}")
+        new_slots_by_name = {slot["slot"]: slot for slot in new_slots}
+        for index, old_slot in enumerate(old_slots):
+            new_slot = new_slots_by_name.get(old_slot["slot"])
+            if new_slot is None:
+                if index >= len(new_slots):
+                    reporter.add("FAIL", f"{label} slot {old_slot['slot']}", "Certificate slot missing")
+                    continue
+                new_slot = new_slots[index]
+                reporter.add("WARN", f"{label} slot {old_slot['slot']}",
+                             f"Slot renamed to {new_slot['slot']}; verify SNI and algorithm association")
+            if old_slot["slot"] != new_slot["slot"]:
+                reporter.add("WARN", f"{label} slot identity", "Certificate/key slot name changed")
+            for field, old_value in old_slot["attributes"].items():
+                new_value = new_slot["attributes"].get(field)
+                reporter.add("PASS" if old_value == new_value else "FAIL",
+                             f"{label} slot {old_slot['slot']} {field}",
+                             f"source={old_value!r} target={new_value!r}")
+            compare_certificate(old_slot["cert"], new_slot["cert"], kind, old_name, new_name)
+            compare_bundle(old_slot["chain"], new_slot["chain"], old_name, new_name)
+            key_name = new_slot["key"]
+            if bool(old_slot["key"] and old_slot["key"] != "none") != bool(key_name and key_name != "none"):
+                reporter.add("FAIL", f"{label} key {old_slot['slot']}",
+                             "Cert/key slot presence differs across devices")
+            if old_slot["key"] and not key_name:
+                reporter.add("FAIL", f"{label} key {old_slot['slot']}", "Key missing on target")
+            elif key_name:
+                target_keys = inventories.get("key", ({}, {}))[1]
+                present = scoped_name(key_name, new_name) in target_keys
+                reporter.add("WARN" if present else "FAIL", f"{label} key {new_slot['slot']}",
+                             "Key exists; target-only public-key match unverified" if present else "Key file missing on target")
+        parent_old = tmsh_property(before, "defaults-from")
+        parent_new = tmsh_property(after, "defaults-from")
+        if parent_old and parent_new and scoped_name(parent_old, old_name) != old_name:
+            if scoped_name(parent_old, old_name) in old_profiles:
+                compare_ssl(kind, parent_old, parent_new, old_name, new_name)
+            else:
+                reporter.add("WARN", f"{label} defaults-from",
+                             "Parent SSL profile not collected; inherited certificate settings unverified")
+        elif not old_slots and not new_slots:
+            reporter.add("WARN", label, "No explicit cert/key slots; inherited or absent certificate unverified")
+
+    for old_vip, new_vip in pairs:
+        old_body, new_body = old_vips[old_vip], new_vips[new_vip]
+        old_profiles = named_references(profile_lists[0].get(old_vip, old_body), "profiles")
+        new_profiles = named_references(profile_lists[1].get(new_vip, new_body), "profiles")
+        if not old_profiles and named_references(old_body, "profiles"):
+            old_profiles = named_references(old_body, "profiles")
+        if not new_profiles and named_references(new_body, "profiles"):
+            new_profiles = named_references(new_body, "profiles")
+        if len(old_profiles) != len(new_profiles):
+            reporter.add("FAIL", f"{side.upper()} VIP {old_vip} SSL attachments",
+                         f"source={old_profiles} target={new_profiles}")
+        for old_ref, new_ref in paired_references(old_profiles, new_profiles, old_vip, new_vip):
+            kind = next((candidate for candidate in ("client_ssl", "server_ssl")
+                         if candidate in inventories and scoped_name(old_ref, old_vip) in inventories[candidate][0]), None)
+            if kind:
+                compare_ssl(kind, old_ref, new_ref, old_vip, new_vip)
+
+    # Only HTTPS monitors in the pools attached to matched VIPs are in scope.
+    old_pools, old_pool_error = application_data(source, "pool")
+    new_pools, new_pool_error = application_data(target, "pool")
+    if old_pool_error or new_pool_error or old_pools is None or new_pools is None:
+        reporter.add("ERROR", f"{side.upper()} HTTPS monitor graph",
+                     old_pool_error or new_pool_error or "Missing pool inventory")
+        return
+    if "https_monitor" not in inventories:
+        return
+    source_monitors, target_monitors = inventories["https_monitor"]
+    for old_vip, new_vip in pairs:
+        old_pool = tmsh_property(old_vips[old_vip], "pool")
+        new_pool = tmsh_property(new_vips[new_vip], "pool")
+        if not old_pool or old_pool == "none":
+            continue
+        if not new_pool or new_pool == "none":
+            reporter.add("FAIL", f"{side.upper()} VIP {old_vip} HTTPS monitors", "Target pool missing")
+            continue
+        src_pool = old_pools.get(old_pool) or old_pools.get(scoped_name(old_pool, old_vip))
+        dst_pool = new_pools.get(new_pool) or new_pools.get(scoped_name(new_pool, new_vip))
+        if not src_pool or not dst_pool:
+            reporter.add("ERROR", f"{side.upper()} VIP {old_vip} HTTPS monitors", "Pool inventory missing")
+            continue
+        src_expression = str(src_pool["fields"].get("monitor", ""))
+        dst_expression = str(dst_pool["fields"].get("monitor", ""))
+        for source_name in source_monitors:
+            if source_name not in src_expression and source_name.rsplit("/", 1)[-1] not in src_expression:
+                continue
+            target_name = next((name for name in target_monitors if name in dst_expression or
+                                name.rsplit("/", 1)[-1] in dst_expression), None)
+            label = f"{side.upper()} HTTPS monitor {source_name}"
+            if target_name is None:
+                reporter.add("FAIL", label, "Monitor not attached to target pool")
+                continue
+            src_body, dst_body = source_monitors[source_name], target_monitors[target_name]
+            try:
+                old_fields, new_fields = tmsh_fields(src_body), tmsh_fields(dst_body)
+                for field, old_value in old_fields.items():
+                    if field in {"cert", "key", "ca-file", "chain", "cert-key-chain"}:
+                        continue
+                    if old_value != new_fields.get(field):
+                        reporter.add("FAIL", f"{label} {field}",
+                                     f"source={old_value!r} target={new_fields.get(field)!r}")
+            except ValueError as exc:
+                reporter.add("ERROR", label, str(exc))
+            compare_certificate(tmsh_property(src_body, "cert"), tmsh_property(dst_body, "cert"),
+                                "https_monitor", source_name, target_name)
+            compare_bundle(tmsh_property(src_body, "ca-file"), tmsh_property(dst_body, "ca-file"),
+                           source_name, target_name)
+            old_key, new_key = tmsh_property(src_body, "key"), tmsh_property(dst_body, "key")
+            if old_key and old_key != "none":
+                target_keys = inventories.get("key", ({}, {}))[1]
+                present = bool(new_key and scoped_name(new_key, target_name) in target_keys)
+                reporter.add("WARN" if present else "FAIL", f"{label} key",
+                             "Key exists; target-only public-key match unverified" if present else
+                             "Target monitor key missing")
+
+
 def compare_ntp_sync(reporter: Reporter, side: str, role: str, record: dict | None) -> None:
     ntp_record = record.get("privileged_ntp") if record else None
     if ntp_record is None:
@@ -1532,7 +2289,7 @@ def compare_ntp_sync(reporter: Reporter, side: str, role: str, record: dict | No
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("manifest", type=Path, help="JSON from Export-F5Migration.ps1")
-    ap.add_argument("--checks", default="permissions,basic,platform", help="permissions,basic,platform,network,routes,system,applications,all and !category exclusions")
+    ap.add_argument("--checks", default="permissions,basic,platform", help="permissions,basic,platform,network,routes,system,applications,references,certificates,all and !category exclusions")
     ap.add_argument("--filter", metavar="STATUSES", help="show only listed result labels, e.g. FAIL or FAIL,ERROR; summary still counts all")
     ap.add_argument("--nocolor", action="store_true", help="disable colored status labels")
     ap.add_argument("--ntp-sync", action="store_true", help="compatibility option; NTP sync runs automatically for system checks when SSHPASSNET is set")
@@ -1570,7 +2327,7 @@ def main() -> int:
 
     for side in ("a", "b"):
         device = manifest["devices"][side]
-        roles = (["source", "target"] if checks & {"basic", "network", "routes", "system", "applications"} else []) + (["rseries_host"] if checks & {"platform", "network"} else [])
+        roles = (["source", "target"] if checks & {"basic", "network", "routes", "system", "applications", "references", "certificates"} else []) + (["rseries_host"] if checks & {"platform", "network"} else [])
         collected: dict[str, dict | None] = {}
         for role in roles:
             expected = device[role]
@@ -1582,14 +2339,20 @@ def main() -> int:
                             "list sys management-ip", "list sys management-route default"]
                 if "network" in checks:
                     commands += list(NETWORK_COMMANDS.values())
-                elif "applications" in checks:
+                elif checks & {"applications", "references", "certificates"}:
                     commands.append(NETWORK_COMMANDS["vlan"])
                 if "routes" in checks:
                     commands += list(ROUTE_COMMANDS.values())
                 if "system" in checks:
                     commands += list(SYSTEM_COMMANDS.values())
-                if "applications" in checks:
+                if checks & {"applications", "references", "certificates"}:
                     commands += list(APPLICATION_COMMANDS.values())
+                if "references" in checks:
+                    commands += list(REFERENCE_COMMANDS.values())
+                if checks & {"references", "certificates"}:
+                    commands += list(CERTIFICATE_COMMANDS.values())
+                if "certificates" in checks and "references" not in checks:
+                    commands += [REFERENCE_COMMANDS["cipher_group"], REFERENCE_COMMANDS["cipher_rule"]]
             else:
                 commands = ["show system version | nomore", "show system state hostname",
                             "show system mgmt-ip", "show tenants | nomore", "show fips | nomore"]
@@ -1640,6 +2403,10 @@ def main() -> int:
                 compare_ntp_sync(reporter, side, role, collected.get(role))
         if "applications" in checks:
             compare_applications(reporter, side, collected.get("source"), collected.get("target"))
+        if "references" in checks:
+            compare_references(reporter, side, collected.get("source"), collected.get("target"))
+        if "certificates" in checks:
+            compare_certificates(reporter, side, collected.get("source"), collected.get("target"))
     return reporter.finish()
 
 
