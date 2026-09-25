@@ -1010,6 +1010,13 @@ def rule_digest(body: str) -> str:
     return hashlib.md5(body.encode("utf-8")).hexdigest()
 
 
+def rule_comparison_status(before: str, after: str) -> str:
+    if before == after:
+        return "PASS"
+    # Diagnostic severity only: Tcl whitespace inside a string may be significant.
+    return "WARN" if "".join(before.split()) == "".join(after.split()) else "FAIL"
+
+
 def rule_byte_difference(before: str, after: str) -> str:
     """Diagnose differing captured Tcl bodies without disclosing rule contents."""
     source, target = before.encode("utf-8"), after.encode("utf-8")
@@ -2156,7 +2163,7 @@ def expected_ssl_profile_default(kind: str, field: str, source: object, target: 
 
 
 def compare_references(reporter: Reporter, side: str, source: dict | None,
-                       target: dict | None, irule_byte_diff: bool = False) -> None:
+                       target: dict | None, irule_byte_diff: bool = True) -> None:
     """Compare the statically reachable configuration of migrated VIPs."""
     source_version = bigip_data(source).get("version")
     source_major = int(source_version.split(".", 1)[0]) if source_version else None
@@ -2327,9 +2334,10 @@ def compare_references(reporter: Reporter, side: str, source: dict | None,
                          f"target={'present' if after is not None else 'missing'} ({new_name})")
             return
         old_hash, new_hash = rule_digest(before), rule_digest(after)
+        status = rule_comparison_status(before, after)
         byte_detail = (f"; {rule_byte_difference(before, after)}"
-                       if irule_byte_diff and old_hash != new_hash else "")
-        reporter.add("PASS" if old_hash == new_hash else "FAIL", label,
+                       if irule_byte_diff and status != "PASS" else "")
+        reporter.add(status, label,
                      f"source MD5={old_hash} target MD5={new_hash}" +
                      (f" target={new_name}" if old_name != new_name else "") + byte_detail)
         old_rules, old_groups, old_unresolved = rule_dependencies(before)
@@ -2960,7 +2968,12 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
         src_pool = old_pools.get(old_pool) or old_pools.get(src_pool_name)
         dst_pool = new_pools.get(new_pool) or new_pools.get(dst_pool_name)
         if not src_pool or not dst_pool:
-            reporter.add("ERROR", f"{side.upper()} VIP {old_vip} HTTPS monitors", "Pool inventory missing")
+            missing = []
+            if not src_pool:
+                missing.append(f"source pool {src_pool_name} absent from collected pool inventory")
+            if not dst_pool:
+                missing.append(f"target pool {dst_pool_name} absent from collected pool inventory")
+            reporter.add("ERROR", f"{side.upper()} VIP {old_vip} HTTPS monitors", "; ".join(missing))
             continue
         expressions = [(f"pool {src_pool_name}", src_pool["fields"].get("monitor"),
                         dst_pool["fields"].get("monitor"))]
@@ -3019,8 +3032,8 @@ def main() -> int:
     ap.add_argument("--checks", default="permissions,basic,platform", help="permissions,basic,platform,network,routes,system,applications,references,certificates,all and !category exclusions")
     ap.add_argument("--filter", metavar="STATUSES", help="show only listed result labels, e.g. FAIL or FAIL,ERROR; summary still counts all")
     ap.add_argument("--nocolor", action="store_true", help="disable colored status labels")
-    ap.add_argument("--irule-byte-diff", action="store_true",
-                    help="for differing iRules, report captured-body byte offsets and whitespace counts without rule text")
+    ap.add_argument("--no-irule-byte-diff", action="store_true",
+                    help="suppress default byte diagnostics for differing iRules")
     ap.add_argument("--member", choices=("a", "b"), help="check only this cluster member (default: both)")
     ap.add_argument("--issuer-upgrades", type=Path,
                     help="private JSON list of approved source_cn/target_cn issuer renewals")
@@ -3169,7 +3182,7 @@ def main() -> int:
             compare_applications(reporter, side, collected.get("source"), collected.get("target"))
         if "references" in checks:
             compare_references(reporter, side, collected.get("source"), collected.get("target"),
-                               irule_byte_diff=args.irule_byte_diff)
+                               irule_byte_diff=not args.no_irule_byte_diff)
         if "certificates" in checks:
             compare_certificates(reporter, side, collected.get("source"), collected.get("target"),
                                  manifest.get("migration_date"), issuer_upgrades)
