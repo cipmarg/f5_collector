@@ -1010,6 +1010,39 @@ def rule_digest(body: str) -> str:
     return hashlib.md5(body.encode("utf-8")).hexdigest()
 
 
+def rule_byte_difference(before: str, after: str) -> str:
+    """Diagnose differing captured Tcl bodies without disclosing rule contents."""
+    source, target = before.encode("utf-8"), after.encode("utf-8")
+    offset = next((index for index, (left, right) in enumerate(zip(source, target))
+                   if left != right), min(len(source), len(target)))
+
+    def location(data: bytes) -> str:
+        prefix = data[:offset]
+        return f"line {prefix.count(b'\n') + 1}, byte column {len(prefix.rsplit(b'\n', 1)[-1]) + 1}"
+
+    def describe(data: bytes) -> str:
+        if offset >= len(data):
+            return "EOF"
+        byte = data[offset]
+        special = {9: "TAB", 10: "LF", 13: "CR", 32: "SPACE"}.get(byte)
+        return f"0x{byte:02x}" + (f" ({special})" if special else "")
+
+    def counts(data: bytes, text: str) -> str:
+        trailing = sum(len(line) - len(line.rstrip(b" \t")) for line in data.split(b"\n"))
+        return (f"bytes={len(data)}, tabs={data.count(bytes([9]))}, "
+                f"spaces={data.count(bytes([32]))}, trailing-whitespace-bytes={trailing}, "
+                f"line-feeds={data.count(bytes([10]))}, CR={data.count(bytes([13]))}, "
+                f"non-ASCII-bytes={sum(byte >= 128 for byte in data)}, "
+                f"decode-replacements={text.count(chr(0xfffd))}")
+
+    whitespace_only = "yes" if "".join(before.split()) == "".join(after.split()) else "no"
+    return (f"first differing captured UTF-8 byte at {offset}: source {location(source)} "
+            f"{describe(source)}, target {location(target)} {describe(target)}; "
+            f"source [{counts(source, before)}]; target [{counts(target, after)}]; "
+            f"difference disappears when all whitespace is removed: {whitespace_only} "
+            "(diagnostic only, not functional equivalence)")
+
+
 def tcl_command_words(text: str) -> list[str]:
     """Split Tcl words while preserving bracketed values with embedded spaces."""
     words: list[str] = []
@@ -2123,7 +2156,7 @@ def expected_ssl_profile_default(kind: str, field: str, source: object, target: 
 
 
 def compare_references(reporter: Reporter, side: str, source: dict | None,
-                       target: dict | None) -> None:
+                       target: dict | None, irule_byte_diff: bool = False) -> None:
     """Compare the statically reachable configuration of migrated VIPs."""
     source_version = bigip_data(source).get("version")
     source_major = int(source_version.split(".", 1)[0]) if source_version else None
@@ -2294,9 +2327,11 @@ def compare_references(reporter: Reporter, side: str, source: dict | None,
                          f"target={'present' if after is not None else 'missing'} ({new_name})")
             return
         old_hash, new_hash = rule_digest(before), rule_digest(after)
+        byte_detail = (f"; {rule_byte_difference(before, after)}"
+                       if irule_byte_diff and old_hash != new_hash else "")
         reporter.add("PASS" if old_hash == new_hash else "FAIL", label,
                      f"source MD5={old_hash} target MD5={new_hash}" +
-                     (f" target={new_name}" if old_name != new_name else ""))
+                     (f" target={new_name}" if old_name != new_name else "") + byte_detail)
         old_rules, old_groups, old_unresolved = rule_dependencies(before)
         new_rules, new_groups, new_unresolved = rule_dependencies(after)
         for item in sorted(old_unresolved | new_unresolved):
@@ -2984,6 +3019,8 @@ def main() -> int:
     ap.add_argument("--checks", default="permissions,basic,platform", help="permissions,basic,platform,network,routes,system,applications,references,certificates,all and !category exclusions")
     ap.add_argument("--filter", metavar="STATUSES", help="show only listed result labels, e.g. FAIL or FAIL,ERROR; summary still counts all")
     ap.add_argument("--nocolor", action="store_true", help="disable colored status labels")
+    ap.add_argument("--irule-byte-diff", action="store_true",
+                    help="for differing iRules, report captured-body byte offsets and whitespace counts without rule text")
     ap.add_argument("--member", choices=("a", "b"), help="check only this cluster member (default: both)")
     ap.add_argument("--issuer-upgrades", type=Path,
                     help="private JSON list of approved source_cn/target_cn issuer renewals")
@@ -3131,7 +3168,8 @@ def main() -> int:
         if "applications" in checks:
             compare_applications(reporter, side, collected.get("source"), collected.get("target"))
         if "references" in checks:
-            compare_references(reporter, side, collected.get("source"), collected.get("target"))
+            compare_references(reporter, side, collected.get("source"), collected.get("target"),
+                               irule_byte_diff=args.irule_byte_diff)
         if "certificates" in checks:
             compare_certificates(reporter, side, collected.get("source"), collected.get("target"),
                                  manifest.get("migration_date"), issuer_upgrades)
