@@ -735,6 +735,89 @@ def system_data(record: dict | None, kind: str) -> tuple[dict[str, object] | Non
         return None, str(exc)
 
 
+def pool_members_by_endpoint(pool: str, configuration: str, status: str) -> dict[str, dict]:
+    """Pair config and status members before comparing their resolved endpoints."""
+    configured: list[dict] = []
+    for member_name, body in tmsh_objects_from_block(configuration):
+        fields = tmsh_fields(body, monitor_expressions=True)
+        address = fields.get("address")
+        configured.append({"name": member_name, "key": scoped_name(member_name, pool),
+                           "address": address, "fields": fields})
+    observed: list[dict] = []
+    for member_name, body in tmsh_objects_from_block(status):
+        port = tmsh_property(body, "port")
+        if port is None or not port.isdigit() or not 0 <= int(port) <= 65535:
+            raise ValueError(f"ltm pool {pool}: status member {member_name} has no valid numeric port")
+        observed.append({"key": scoped_name(member_name, pool),
+                         "address": tmsh_property(body, "addr"), "port": str(int(port))})
+    if len(configured) != len(observed):
+        raise ValueError(f"ltm pool {pool}: configured {len(configured)} members, "
+                         f"field-fmt reports {len(observed)}")
+    if len({item["key"] for item in configured}) != len(configured) or \
+            len({item["key"] for item in observed}) != len(observed):
+        raise ValueError(f"ltm pool {pool}: duplicate member names")
+
+    paired: dict[int, int] = {}
+    unused = set(range(len(observed)))
+
+    def assign(config_index: int, status_index: int) -> None:
+        before, after = configured[config_index], observed[status_index]
+        if before["address"] and after["address"] and before["address"] != after["address"]:
+            raise ValueError(f"ltm pool {pool}: member {before['name']} status address differs from configuration")
+        suffix = before["key"].rsplit(":", 1)[-1]
+        if suffix.isdigit() and str(int(suffix)) != after["port"]:
+            raise ValueError(f"ltm pool {pool}: member {before['name']} numeric port "
+                             "disagrees with field-fmt status")
+        paired[config_index] = status_index
+        unused.remove(status_index)
+
+    # tmsh sometimes displays the same member under its configured service name.
+    for index, member in enumerate(configured):
+        matches = [j for j in unused if observed[j]["key"] == member["key"]]
+        if matches:
+            assign(index, matches[0])
+
+    # Preserve a numeric port stated explicitly in the configured member name.
+    for index, member in enumerate(configured):
+        if index in paired:
+            continue
+        suffix = member["key"].rsplit(":", 1)[-1]
+        if not suffix.isdigit() or member["address"] is None:
+            continue
+        matches = [j for j in unused if observed[j]["address"] == member["address"]
+                   and observed[j]["port"] == str(int(suffix))]
+        if len(matches) != 1:
+            raise ValueError(f"ltm pool {pool}: member {member['name']} numeric port "
+                             "cannot be confirmed in field-fmt status")
+        assign(index, matches[0])
+
+    # A service alias cannot identify a port; pair only a unique remaining
+    # member at this address. Multiple unresolved ports must remain an error.
+    for index, member in enumerate(configured):
+        if index in paired:
+            continue
+        matches = [j for j in unused if member["address"] is not None
+                   and observed[j]["address"] == member["address"]]
+        if len(matches) != 1:
+            raise ValueError(f"ltm pool {pool}: member {member['name']} has "
+                             f"{len(matches)} possible field-fmt matches at its address")
+        assign(index, matches[0])
+    if unused:
+        raise ValueError(f"ltm pool {pool}: unmatched field-fmt members remain")
+
+    members: dict[str, dict] = {}
+    for index, member in enumerate(configured):
+        details = observed[paired[index]]
+        address = member["address"] or details["address"]
+        if not address:
+            raise ValueError(f"ltm pool {pool}: member {member['name']} has no resolved address")
+        endpoint = f"{address}:{details['port']}"
+        if endpoint in members:
+            raise ValueError(f"ltm pool {pool}: repeated member endpoint {endpoint}")
+        members[endpoint] = {"name": member["name"], "fields": member["fields"]}
+    return members
+
+
 def application_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | None, str | None]:
     """Collect configured LTM objects; never mistake an unsplit command for an empty list."""
     command = APPLICATION_COMMANDS[kind]
@@ -782,40 +865,11 @@ def application_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | 
                     raise ValueError(f"ltm virtual {name}: destination missing")
             else:
                 member_block = tmsh_block(body, "members")
-                members: dict[str, dict] = {}
                 status_body = status_pools.get(object_path(name))
                 status_block = tmsh_block(status_body, "members") if status_body is not None else None
-                status_members: dict[str, str] = {}
-                for status_member_name, status_member_body in tmsh_objects_from_block(status_block or ""):
-                    status_key = scoped_name(status_member_name, name)
-                    if status_key in status_members:
-                        raise ValueError(f"ltm pool {name}: ambiguous member status {status_key}")
-                    status_members[status_key] = status_member_body
-                for member, member_body in tmsh_objects_from_block(member_block or ""):
-                    properties = tmsh_fields(member_body, monitor_expressions=True)
-                    status_key = scoped_name(member, name)
-                    if status_key not in status_members:
-                        raise ValueError(f"ltm pool {name}: member {member} missing from field-fmt status")
-                    status_member = status_members.pop(status_key)
-                    port = tmsh_property(status_member, "port")
-                    if port is None or not port.isdigit() or not 0 <= int(port) <= 65535:
-                        raise ValueError(f"ltm pool {name}: member {member} has no valid numeric status port")
-                    address = properties.get("address") or tmsh_property(status_member, "addr")
-                    if not address:
-                        raise ValueError(f"ltm pool {name}: member {member} has no resolved address")
-                    status_address = tmsh_property(status_member, "addr")
-                    if status_address and status_address != address:
-                        raise ValueError(f"ltm pool {name}: member {member} status address differs from configuration")
-                    # Compare the actual endpoint even when a service alias changes.
-                    identity = f"{address}:{port}"
-                    if identity in members:
-                        raise ValueError(f"ltm pool {name}: repeated member endpoint {identity}")
-                    members[identity] = {"name": member, "fields": properties}
                 if member_block is None and fields.get("members") not in (None, "none"):
                     raise ValueError(f"ltm pool {name}: unrecognized members value")
-                if status_members:
-                    raise ValueError(f"ltm pool {name}: status has unrecognized members {sorted(status_members)}")
-                entry["members"] = members
+                entry["members"] = pool_members_by_endpoint(name, member_block or "", status_block or "")
             parsed[name] = entry
         return parsed, None
     except ValueError as exc:
@@ -2058,6 +2112,16 @@ def virtual_pairs(source: dict | None, target: dict | None,
     return pairs
 
 
+def expected_ssl_profile_default(kind: str, field: str, source: object, target: object) -> bool:
+    """Recognize only the requested version defaults; keep custom settings visible."""
+    if kind not in ("client_ssl", "server_ssl") or source not in (None, "none"):
+        return False
+    if field == "log-publisher":
+        return target in ("sys-ssl-publisher", "/Common/sys-ssl-publisher")
+    parent = "clientssl" if kind == "client_ssl" else "serverssl"
+    return field == "defaults-from" and target in (parent, f"/Common/{parent}")
+
+
 def compare_references(reporter: Reporter, side: str, source: dict | None,
                        target: dict | None) -> None:
     """Compare the statically reachable configuration of migrated VIPs."""
@@ -2113,7 +2177,9 @@ def compare_references(reporter: Reporter, side: str, source: dict | None,
                     if kind in ("client_ssl", "server_ssl") and field in {
                             "cert", "key", "chain", "cert-key-chain", "ca-file", "trusted-cert-authority",
                             "crl-file", "cipher-group", "inherit-ca-certkeychain",
-                            "revoked-cert-status-response-control"}:
+                            "revoked-cert-status-response-control", "sys-ssl-publisher"}:
+                        continue
+                    if expected_ssl_profile_default(kind, field, value, new_fields.get(field)):
                         continue
                     if kind in ("client_ssl", "server_ssl") and field == "options":
                         target_value = new_fields.get(field)
