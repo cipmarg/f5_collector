@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 import getpass
 import hashlib
 import ipaddress
@@ -74,6 +75,24 @@ def parse_status_filter(spec: str | None) -> set[str] | None:
     if "" in selected or not selected <= set(STATUSES):
         raise ValueError("--filter accepts comma-separated PASS,FAIL,WARN,ERROR,SKIP,INFO or all")
     return selected
+
+
+def hostname_suffixes(value: str) -> tuple[str, ...]:
+    """Allow one or more private DNS suffixes, one per line or comma-separated."""
+    entries = [item for line in value.splitlines() for item in
+               re.split(r"[,\s]+", line.split("#", 1)[0].strip()) if item]
+    if any(not re.fullmatch(r"\.[A-Za-z0-9.-]+", item) for item in entries):
+        raise ValueError("Hostname suffix must begin with a dot and contain DNS labels")
+    return tuple(dict.fromkeys(item.casefold() for item in entries))
+
+
+def hostname_identity(host: str, suffixes: tuple[str, ...]) -> str:
+    """Compare short and configured fully qualified hostnames as one identity."""
+    name = host.strip().rstrip(".").casefold()
+    for suffix in sorted(suffixes, key=len, reverse=True):
+        if name.endswith(suffix) and len(name) > len(suffix):
+            return name[:-len(suffix)]
+    return name
 
 
 def checked_name(value: str, pattern: re.Pattern[str], label: str) -> str:
@@ -736,7 +755,31 @@ def system_data(record: dict | None, kind: str) -> tuple[dict[str, object] | Non
         return None, str(exc)
 
 
-def pool_members_by_endpoint(pool: str, configuration: str, status: str) -> dict[str, dict]:
+def parse_services(path: Path) -> dict[str, frozenset[int]]:
+    """Parse the local BIG-IP /etc/services copy, including service aliases."""
+    ports: dict[str, set[int]] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        columns = line.split("#", 1)[0].split()
+        if len(columns) < 2:
+            continue
+        match = re.fullmatch(r"(\d+)/(tcp|udp|sctp)", columns[1], re.I)
+        if not match or int(match.group(1)) > 65535:
+            continue
+        for name in (columns[0], *columns[2:]):
+            ports.setdefault(name.casefold(), set()).add(int(match.group(1)))
+    return {name: frozenset(values) for name, values in ports.items()}
+
+
+@lru_cache(maxsize=8)
+def version_services(version: str | None) -> dict[str, frozenset[int]] | None:
+    if not version or not re.match(r"^\d+\.", version):
+        return None
+    path = Path(__file__).resolve().parent / "etc" / f"services.v{version.split('.', 1)[0]}"
+    return parse_services(path) if path.is_file() else None
+
+
+def pool_members_by_endpoint(pool: str, configuration: str, status: str,
+                             services: dict[str, frozenset[int]] | None = None) -> dict[str, dict]:
     """Pair config and status members before comparing their resolved endpoints."""
     configured: list[dict] = []
     for member_name, body in tmsh_objects_from_block(configuration):
@@ -751,6 +794,27 @@ def pool_members_by_endpoint(pool: str, configuration: str, status: str) -> dict
             raise ValueError(f"ltm pool {pool}: status member {member_name} has no valid numeric port")
         observed.append({"key": scoped_name(member_name, pool),
                          "address": tmsh_property(body, "addr"), "port": str(int(port))})
+    if not observed and configured and services is not None:
+        members: dict[str, dict] = {}
+        for member in configured:
+            name = member["name"]
+            suffix = name.rsplit(":", 1)[-1]
+            possible = {int(suffix)} if suffix.isdigit() else services.get(suffix.casefold(), frozenset())
+            if len(possible) != 1:
+                raise ValueError(f"ltm pool {pool}: member {name} service has "
+                                 f"{len(possible)} possible ports in local version-specific services file")
+            address = member["address"]
+            if not address:
+                candidate = name.rsplit(":", 1)[0].rsplit("/", 1)[-1]
+                try:
+                    address = str(ipaddress.ip_address(candidate))
+                except ValueError as exc:
+                    raise ValueError(f"ltm pool {pool}: member {name} has no resolved address") from exc
+            endpoint = f"{address}:{next(iter(possible))}"
+            if endpoint in members:
+                raise ValueError(f"ltm pool {pool}: repeated member endpoint {endpoint}")
+            members[endpoint] = {"name": name, "fields": member["fields"]}
+        return members
     if len(configured) != len(observed):
         raise ValueError(f"ltm pool {pool}: configured {len(configured)} members, "
                          f"field-fmt reports {len(observed)}")
@@ -792,8 +856,21 @@ def pool_members_by_endpoint(pool: str, configuration: str, status: str) -> dict
                              "cannot be confirmed in field-fmt status")
         assign(index, matches[0])
 
-    # A service alias cannot identify a port; pair only a unique remaining
-    # member at this address. Multiple unresolved ports must remain an error.
+    # Resolve service aliases locally only when status name matching was inconclusive.
+    for index, member in enumerate(configured):
+        if index in paired or services is None:
+            continue
+        suffix = member["key"].rsplit(":", 1)[-1]
+        possible = services.get(suffix.casefold(), frozenset())
+        if len(possible) != 1:
+            continue
+        matches = [j for j in unused if member["address"] is not None
+                   and observed[j]["address"] == member["address"]
+                   and int(observed[j]["port"]) in possible]
+        if len(matches) == 1:
+            assign(index, matches[0])
+
+    # A remaining service alias can pair only a unique status member at its address.
     for index, member in enumerate(configured):
         if index in paired:
             continue
@@ -826,9 +903,10 @@ def application_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | 
     if error:
         return None, error
     status_pools: dict[str, str] = {}
+    services = version_services(bigip_data(record).get("version")) if kind == "pool" else None
     if kind == "pool":
         status_output, status_error = inventory_section(record, POOL_MEMBER_PORT_COMMAND)
-        if status_error:
+        if status_error and services is None:
             return None, status_error
         try:
             for status_name, status_body in tmsh_objects(status_output or "", "ltm pool").items():
@@ -858,7 +936,7 @@ def application_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | 
                                      monitor_expressions=kind == "pool")
             except ValueError as exc:
                 raise ValueError(f"ltm {kind} {name}: {exc}") from exc
-            entry: dict = {"fields": fields}
+            entry: dict = {"fields": fields, "body": body}
             if kind == "virtual":
                 entry["destination"] = fields.get("destination")
                 entry["protocol"] = fields.get("ip-protocol", "tcp")
@@ -870,7 +948,10 @@ def application_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | 
                 status_block = tmsh_block(status_body, "members") if status_body is not None else None
                 if member_block is None and fields.get("members") not in (None, "none"):
                     raise ValueError(f"ltm pool {name}: unrecognized members value")
-                entry["members"] = pool_members_by_endpoint(name, member_block or "", status_block or "")
+                entry["members"] = pool_members_by_endpoint(name, member_block or "", status_block or "",
+                                                              services)
+                if member_block and not status_block and services is not None:
+                    entry["port_source"] = "local version-specific services file"
             parsed[name] = entry
         return parsed, None
     except ValueError as exc:
@@ -1408,7 +1489,7 @@ class Reporter:
 
     def compare(self, label: str, expected: object, actual: object,
                 error: str | None = None, *, casefold: bool = False,
-                hostname_suffix: str | None = None) -> None:
+                hostname_suffix: tuple[str, ...] | None = None) -> None:
         if error:
             self.add("ERROR", label, error)
         elif actual is None or str(actual).strip() == "":
@@ -1417,9 +1498,10 @@ class Reporter:
             self.add("SKIP", label, "No expected value in manifest")
         else:
             a, b = str(actual).strip(), str(expected).strip()
-            if hostname_suffix and not b.casefold().endswith(hostname_suffix.casefold()):
-                b += hostname_suffix
-            matches = a.casefold() == b.casefold() if casefold else a == b
+            if hostname_suffix is not None:
+                matches = hostname_identity(a, hostname_suffix) == hostname_identity(b, hostname_suffix)
+            else:
+                matches = a.casefold() == b.casefold() if casefold else a == b
             self.add("PASS" if matches else "FAIL", label,
                      f"expected={b!r} actual={a!r}")
 
@@ -1434,7 +1516,7 @@ class Reporter:
 
 
 def compare_bigip(reporter: Reporter, side: str, role: str, expected: dict,
-                  observed: dict, hostname_suffix: str) -> None:
+                  observed: dict, hostname_suffix: tuple[str, ...]) -> None:
     prefix = f"{side.upper()} {role} BIG-IP"
     reporter.compare(f"{prefix} hostname", expected["expected_hostname"],
                      observed.get("hostname"), observed.get("hostname_error"),
@@ -1496,14 +1578,12 @@ def hardware_base_mac(output: str) -> str:
 
 
 def compare_target_ha(reporter: Reporter, manifest: dict, collected: dict[str, dict | None],
-                      hostname_suffix: str, members: tuple[str, ...]) -> None:
+                      hostname_suffix: tuple[str, ...], members: tuple[str, ...]) -> None:
     """Check the target pair, including evidence from a single selected member."""
     expected_hosts = {}
     for side in ("a", "b"):
         host = manifest["devices"][side]["target"]["expected_hostname"]
-        if not host.casefold().endswith(hostname_suffix.casefold()):
-            host += hostname_suffix
-        expected_hosts[side] = host.casefold()
+        expected_hosts[side] = hostname_identity(host, hostname_suffix)
     observed_macs: dict[str, str] = {}
     base_candidates: dict[str, str] = {}
     for side in members:
@@ -1518,7 +1598,8 @@ def compare_target_ha(reporter: Reporter, manifest: dict, collected: dict[str, d
                 reporter.add("ERROR", f"{prefix} HA device states", "No device HA states parsed")
             else:
                 for device_side, wanted in (("a", "standby"), ("b", "active")):
-                    actual = states.get(expected_hosts[device_side])
+                    actual = {hostname_identity(name, hostname_suffix): state
+                              for name, state in states.items()}.get(expected_hosts[device_side])
                     reporter.add("ERROR" if actual is None else "PASS" if actual == wanted else "FAIL",
                                  f"{prefix} member {device_side.upper()} HA state",
                                  f"expected={wanted} actual={actual or 'not found'}")
@@ -1597,7 +1678,7 @@ def compare_target_ha(reporter: Reporter, manifest: dict, collected: dict[str, d
 
 
 def compare_platform(reporter: Reporter, side: str, expected: dict, observed: dict,
-                     hostname_suffix: str) -> None:
+                     hostname_suffix: tuple[str, ...]) -> None:
     prefix = f"{side.upper()} F5OS"
     host = expected["rseries_host"]
     target = expected["target"]
@@ -1937,6 +2018,22 @@ def virtual_traffic_pool(body: str) -> str | None:
     return value
 
 
+def virtual_profile_settings(body: str, owner: str) -> dict[str, dict]:
+    """Compare VIP profile names and context without depending on tmsh list order."""
+    block = tmsh_block(body, "profiles")
+    if block is None:
+        return {}
+    entries = tmsh_objects_from_block(block) if "{" in block else [
+        (name, "") for name in re.findall(r'"(?:\\.|[^"\\])*"|[^\s{}]+', block)]
+    result: dict[str, dict] = {}
+    for name, contents in entries:
+        path = scoped_name(name.strip('"'), owner)
+        if path in result:
+            raise ValueError(f"Duplicate VIP profile {path}")
+        result[path] = tmsh_fields(contents)
+    return result
+
+
 def virtual_vlan_tags(name: str, fields: dict, vlans: dict[str, dict]) -> tuple[str, ...]:
     """Resolve a virtual's VLAN list to tags, preserving duplicate references."""
     references = fields.get("vlans")
@@ -2032,7 +2129,20 @@ def compare_applications(reporter: Reporter, side: str, source: dict | None,
                                  f"source={before_tags!r} target={after_tags!r}")
                 except ValueError as exc:
                     reporter.add("ERROR", f"{label} VLAN tags", str(exc))
-            for field in ("profiles", "rules", "persist", "fallback-persistence",
+            try:
+                source_profiles = virtual_profile_settings(old[name]["body"], name)
+                target_profiles = virtual_profile_settings(new[target_name]["body"], target_name)
+                if source_profiles.keys() != target_profiles.keys():
+                    reporter.compare_items(f"{label} profiles", tuple(source_profiles), tuple(target_profiles),
+                                           status="WARN")
+                for profile in sorted(source_profiles.keys() & target_profiles.keys()):
+                    if source_profiles[profile] != target_profiles[profile]:
+                        reporter.add("WARN", f"{label} profile {profile}",
+                                     f"source={source_profiles[profile]!r} "
+                                     f"target={target_profiles[profile]!r}")
+            except ValueError as exc:
+                reporter.add("ERROR", f"{label} profiles", str(exc))
+            for field in ("rules", "persist", "fallback-persistence",
                           "source-address-translation", "vlans-enabled", "vlans-disabled"):
                 before, after = src_fields.get(field), dst_fields.get(field)
                 if before != after:
@@ -2054,6 +2164,10 @@ def compare_applications(reporter: Reporter, side: str, source: dict | None,
             matched.add(target_name)
             reporter.add("PASS", label, f"target={target_name}")
             migrated = new[target_name]
+            for role, pool_entry in (("source", entry), ("target", migrated)):
+                if pool_entry.get("port_source"):
+                    reporter.add("WARN", f"{label} {role} member ports",
+                                 "Field-format status unavailable; ports resolved from local services file")
             src_members, dst_members = entry["members"], migrated["members"]
             for identity, member in sorted(src_members.items()):
                 target_member = dst_members.get(identity)
@@ -2213,6 +2327,22 @@ def expected_ssl_profile_default(kind: str, field: str, source: object, target: 
     return field == "defaults-from" and target in (parent, f"/Common/{parent}")
 
 
+def effective_ssl_options(source: tuple[str, ...], target: tuple[str, ...],
+                          source_major: int | None) -> tuple[str, ...]:
+    """Ignore only newly added DTLS 1.2 exclusions from pre-16 migrations."""
+    if source_major is None or source_major >= 16:
+        return target
+    ignored = (Counter(target) - Counter(source)) & Counter({
+        "no-dtlsv1.2": len(target), "no-dtls1.2": len(target)})
+    kept = []
+    for option in target:
+        if ignored[option]:
+            ignored[option] -= 1
+        else:
+            kept.append(option)
+    return tuple(kept)
+
+
 def compare_references(reporter: Reporter, side: str, source: dict | None,
                        target: dict | None, irule_byte_diff: bool = True) -> None:
     """Compare the statically reachable configuration of migrated VIPs."""
@@ -2276,11 +2406,11 @@ def compare_references(reporter: Reporter, side: str, source: dict | None,
                         target_value = new_fields.get(field)
                         if isinstance(value, (tuple, type(None))) and isinstance(target_value, (tuple, type(None))):
                             old_options = value or ()
-                            new_options = target_value or ()
+                            new_options = effective_ssl_options(old_options, target_value or (), source_major)
                             if Counter(old_options) == Counter(new_options):
                                 continue
                             old_option_set, new_option_set = set(old_options), set(new_options)
-                            expected = {"no-tlsv1.3", "no-dtlsv1.2", "no-tls1.3", "no-dtls1.2"}
+                            expected = {"no-tlsv1.3", "no-tls1.3"}
                             conversion = (source_major is not None and source_major < 14 and
                                           not (old_option_set - new_option_set) and
                                           bool(new_option_set - old_option_set) and
@@ -2288,7 +2418,7 @@ def compare_references(reporter: Reporter, side: str, source: dict | None,
                             if conversion:
                                 reporter.compare_items(f"{label} options", old_options, new_options, status="WARN")
                                 reporter.add("INFO", f"{label} options conversion",
-                                             f"Source BIG-IP {source_version}: migration adds TLS 1.3 / DTLS 1.2 "
+                                             f"Source BIG-IP {source_version}: migration adds TLS 1.3 "
                                              "exclusions because TLS 1.3 was introduced in newer releases")
                             else:
                                 reporter.compare_items(f"{label} options", old_options, new_options)
@@ -3092,7 +3222,7 @@ def main() -> int:
     ap.add_argument("--member", choices=("a", "b"), help="check only this cluster member (default: both)")
     ap.add_argument("--issuer-upgrades", type=Path,
                     help="private JSON list of approved source_cn/target_cn issuer renewals")
-    ap.add_argument("--hostname-suffix", help="private BIG-IP and F5OS hostname DNS suffix for comparison")
+    ap.add_argument("--hostname-suffix", help="accepted BIG-IP/F5OS hostname suffixes (comma-separated)")
     ap.add_argument("--ntp-sync", action="store_true", help="compatibility option; NTP sync runs automatically for system checks when SSHPASSNET is set")
     ap.add_argument("--snapshot-dir", type=Path, help="write restricted raw SSH snapshots here")
     ap.add_argument("--from-snapshot", type=Path, help="compare previously saved snapshots offline")
@@ -3110,12 +3240,13 @@ def main() -> int:
     if args.cli_ready_timeout < 1 or args.cli_ready_timeout > args.timeout:
         ap.error("--cli-ready-timeout must be between 1 and --timeout")
     checks = parse_checks(args.checks)
-    hostname_suffix = args.hostname_suffix or os.environ.get("F5_HOSTNAME_SUFFIX")
-    if not hostname_suffix:
-        suffix_file = Path(__file__).resolve().parent / ".private" / "hostname-suffix.txt"
-        hostname_suffix = suffix_file.read_text(encoding="utf-8").strip() if suffix_file.is_file() else ""
-    if "basic" in checks and (not hostname_suffix or not re.fullmatch(r"\.[A-Za-z0-9.-]+", hostname_suffix)):
-        ap.error("Basic hostname check requires --hostname-suffix, F5_HOSTNAME_SUFFIX, or a private hostname-suffix.txt")
+    suffix_spec = args.hostname_suffix or os.environ.get("F5_HOSTNAME_SUFFIX")
+    if not suffix_spec:
+        base = Path(__file__).resolve().parent
+        suffix_file = next((path for path in (base / ".private" / "hostname-suffix.txt",
+                                             base / "hostname-suffix.txt") if path.is_file()), None)
+        suffix_spec = suffix_file.read_text(encoding="utf-8") if suffix_file else ""
+    hostname_suffix = hostname_suffixes(suffix_spec)
     issuer_map_path = args.issuer_upgrades
     if issuer_map_path is None:
         default_map_path = Path(__file__).resolve().parent / ".private" / "issuer-upgrades.json"
