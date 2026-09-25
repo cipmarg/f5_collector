@@ -2078,11 +2078,11 @@ def load_issuer_upgrades(path: Path | None) -> set[tuple[str, str]]:
 def allowed_issuer_upgrade(source: str | None, target: str | None,
                            approved: set[tuple[str, str]]) -> bool:
     old_cn, new_cn = certificate_cn(source), certificate_cn(target)
-    if (old_cn, new_cn) not in approved:
+    if not source or not target or not old_cn or not new_cn or (old_cn, new_cn) not in approved:
         return False
-    def without_cn(dn: str) -> str:
-        return re.sub(r"(?:^|,)\s*CN\s*=\s*[^,]+", "", dn, count=1, flags=re.I).strip(" ,")
-    return without_cn(source or "") == without_cn(target or "")
+    # The renewed CA name may appear in both CN and OU. Only the approved
+    # name replacement is allowed; every other DN component must stay equal.
+    return source.replace(old_cn, new_cn) == target
 
 
 def is_default_file(ref: str | None, suffix: str) -> bool:
