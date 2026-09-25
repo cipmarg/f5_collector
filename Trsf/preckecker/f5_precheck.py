@@ -536,6 +536,8 @@ VIRTUAL_BARE_FLAGS = frozenset({"dhcp-relay", "ip-forward", "internal", "l2-forw
                                 "reject", "enabled", "disabled", "vlans-enabled",
                                 "vlans-disabled"})
 NTP_SYNC_COMMAND = 'bash -c "ntpq -np"'
+HA_COMMANDS = ("show cm device", "show cm sync-status", "show cm failover-status",
+               "list cm traffic-group", 'show sys hardware | grep "Base MAC"')
 
 
 def tmsh_objects(output: str, kind: str, *, allow_identical_duplicates: bool = False) -> dict[str, str]:
@@ -737,7 +739,8 @@ def application_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | 
         parsed: dict[str, dict] = {}
         for name, body in objects.items():
             try:
-                fields = tmsh_fields(body, bare_flags=VIRTUAL_BARE_FLAGS if kind == "virtual" else ())
+                fields = tmsh_fields(body, bare_flags=VIRTUAL_BARE_FLAGS if kind == "virtual" else (),
+                                     monitor_expressions=kind == "pool")
             except ValueError as exc:
                 raise ValueError(f"ltm {kind} {name}: {exc}") from exc
             entry: dict = {"fields": fields}
@@ -750,7 +753,7 @@ def application_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | 
                 member_block = tmsh_block(body, "members")
                 members: dict[str, dict] = {}
                 for member, member_body in tmsh_objects_from_block(member_block or ""):
-                    properties = tmsh_fields(member_body)
+                    properties = tmsh_fields(member_body, monitor_expressions=True)
                     # The node name can change; an explicit address and service port
                     # identify the actual backend more reliably.
                     port = member.rsplit(":", 1)[-1] if ":" in member else ""
@@ -785,7 +788,8 @@ def tmsh_property(body: str, name: str) -> str | None:
     return match.group(1).strip('"') if match else None
 
 
-def tmsh_fields(body: str, *, bare_flags: frozenset[str] | tuple = ()) -> dict[str, str | tuple[str, ...]]:
+def tmsh_fields(body: str, *, bare_flags: frozenset[str] | tuple = (),
+                monitor_expressions: bool = False) -> dict[str, str | tuple[str, ...]]:
     """Read every top-level property, preserving nested properties as tokens."""
     tokens = re.findall(r'"(?:\\.|[^"\\])*"|[{}]|[^\s{}"]+', body)
     fields: dict[str, str | tuple[str, ...]] = {}
@@ -800,6 +804,31 @@ def tmsh_fields(body: str, *, bare_flags: frozenset[str] | tuple = ()) -> dict[s
             continue
         if index >= len(tokens):
             raise ValueError(f"Malformed tmsh property near {key!r}")
+        if monitor_expressions and key == "monitor":
+            expression: list[str] = []
+            if tokens[index:index + 1] == ["min"]:
+                if (index + 4 >= len(tokens) or not tokens[index + 1].isdigit() or
+                        tokens[index + 2:index + 4] != ["of", "{"]):
+                    raise ValueError("Malformed pool monitor min N of expression")
+                start = index
+                index += 4
+                depth = 1
+                while index < len(tokens) and depth:
+                    depth += (tokens[index] == "{") - (tokens[index] == "}")
+                    index += 1
+                if depth:
+                    raise ValueError("Incomplete pool monitor expression")
+                expression.extend(tokens[start:index])
+            else:
+                expression.append(tokens[index])
+                index += 1
+            while index < len(tokens) and tokens[index] in ("and", "or"):
+                if index + 1 >= len(tokens):
+                    raise ValueError("Incomplete pool monitor conjunction")
+                expression.extend(tokens[index:index + 2])
+                index += 2
+            fields[key] = " ".join(expression)
+            continue
         if tokens[index] == "{":
             index += 1
             depth = 1
@@ -1205,6 +1234,32 @@ class Reporter:
             print(f"{token} {detail}" if inline else f"{token} {label:<45} {detail}")
             self.displayed += 1
 
+    def red(self, value: object) -> str:
+        rendered = str(value)
+        return f"\x1b[31m{rendered}\x1b[0m" if self.color else rendered
+
+    def compare_items(self, label: str, source: object, target: object,
+                      *, status: str = "FAIL", ordered: bool = False) -> None:
+        """Show item deltas without hiding a difference in order-sensitive lists."""
+        before = list(source) if isinstance(source, (tuple, list, set)) else [source]
+        after = list(target) if isinstance(target, (tuple, list, set)) else [target]
+        before, after = [repr(item) for item in before], [repr(item) for item in after]
+        if before == after or (not ordered and Counter(before) == Counter(after)):
+            self.add("PASS", label, f"{len(before)} items match")
+            return
+        missing, extra = Counter(before) - Counter(after), Counter(after) - Counter(before)
+        def display(items: Counter) -> str:
+            return ", ".join(f"{item} (x{count})" if count > 1 else item
+                             for item, count in sorted(items.items()))
+        pieces = []
+        if missing:
+            pieces.append("missing on target: " + self.red(display(missing)))
+        if extra:
+            pieces.append("extra on target: " + self.red(display(extra)))
+        if ordered and not pieces:
+            pieces.append("order differs: source=" + self.red(before) + " target=" + self.red(after))
+        self.add(status, label, "; ".join(pieces))
+
     def compare(self, label: str, expected: object, actual: object,
                 error: str | None = None, *, casefold: bool = False,
                 hostname_suffix: str | None = None) -> None:
@@ -1261,12 +1316,142 @@ def compare_bigip(reporter: Reporter, side: str, role: str, expected: dict,
                              observed.get("management_gateway"), observed.get("management_gateway_error"))
 
 
-def compare_platform(reporter: Reporter, side: str, expected: dict, observed: dict) -> None:
+def parse_device_ha(output: str) -> dict[str, str]:
+    parts = re.split(r"(?im)^\s*CentMgmt::Device:\s*(\S+)", output)
+    states: dict[str, str] = {}
+    for index in range(1, len(parts), 2):
+        name, body = parts[index:index + 2]
+        hostname = re.search(r"(?im)^\s*Hostname\s+(\S+)", body)
+        state = re.search(r"(?im)^\s*Device HA State\s+(\S+)", body)
+        if state:
+            states[(hostname.group(1) if hostname else name).casefold()] = state.group(1).casefold()
+    return states
+
+
+def derive_masquerade_mac(value: str) -> str:
+    if not re.fullmatch(r"[\da-fA-F]{2}(?::[\da-fA-F]{2}){5}", value):
+        raise ValueError("Invalid base MAC address")
+    octets = value.lower().split(":")
+    first = int(octets[0], 16)
+    if first & 1:
+        raise ValueError("Base MAC is multicast; cannot derive a unicast masquerade MAC")
+    octets[0] = f"{first | 2:02x}"
+    return ":".join(octets)
+
+
+def compare_target_ha(reporter: Reporter, manifest: dict, collected: dict[str, dict | None],
+                      hostname_suffix: str, members: tuple[str, ...]) -> None:
+    """Check the target pair, including evidence from a single selected member."""
+    expected_hosts = {}
+    for side in ("a", "b"):
+        host = manifest["devices"][side]["target"]["expected_hostname"]
+        if not host.casefold().endswith(hostname_suffix.casefold()):
+            host += hostname_suffix
+        expected_hosts[side] = host.casefold()
+    observed_macs: dict[str, str] = {}
+    base_candidates: dict[str, str] = {}
+    for side in members:
+        record = collected.get(side)
+        prefix = f"{side.upper()} target"
+        output, error = section(record, "show cm device")
+        if error:
+            reporter.add("ERROR", f"{prefix} HA device states", error)
+        else:
+            states = parse_device_ha(output)
+            if not states:
+                reporter.add("ERROR", f"{prefix} HA device states", "No device HA states parsed")
+            else:
+                for device_side, wanted in (("a", "standby"), ("b", "active")):
+                    actual = states.get(expected_hosts[device_side])
+                    reporter.add("ERROR" if actual is None else "PASS" if actual == wanted else "FAIL",
+                                 f"{prefix} member {device_side.upper()} HA state",
+                                 f"expected={wanted} actual={actual or 'not found'}")
+        output, error = section(record, "show cm sync-status")
+        if error:
+            reporter.add("ERROR", f"{prefix} sync", error)
+        else:
+            match = re.search(r"(?im)^\s*status\s+(.+?)\s*$", output)
+            groups = re.findall(r"(?im)^\s*\S+\s+\(([^)]+)\):", output)
+            actual = match.group(1).strip() if match else None
+            if actual is None:
+                reporter.add("ERROR", f"{prefix} sync", "Sync status missing from output")
+            else:
+                healthy = actual.casefold() == "in sync" and all(g.casefold() == "in sync" for g in groups)
+                reporter.add("PASS" if healthy else "FAIL", f"{prefix} sync",
+                             f"status={actual}; device groups={groups or '(not listed)'}")
+        output, error = section(record, "show cm failover-status")
+        if error:
+            reporter.add("ERROR", f"{prefix} failover", error)
+        else:
+            match = re.search(r"(?im)^\s*status\s+(ACTIVE|STANDBY|OFFLINE|UNKNOWN)\s*$", output)
+            expected = "STANDBY" if side == "a" else "ACTIVE"
+            actual = match.group(1).upper() if match else None
+            reporter.add("ERROR" if actual is None else "PASS" if actual == expected else "FAIL",
+                         f"{prefix} failover role", f"expected={expected} actual={actual or 'missing'}")
+            connections = output.split("CM::Failover Connections", 1)
+            statuses = re.findall(
+                r"(?im)^\s*(?:(?:\d{1,3}\.){3}\d{1,3}:\d+|eth\S+\s+\S+:\d+)\s+.+?\s+(ok|error)\s*$",
+                connections[1] if len(connections) == 2 else "")
+            good = sum(item.casefold() == "ok" for item in statuses)
+            failed = sum(item.casefold() != "ok" for item in statuses)
+            reporter.add("ERROR" if not statuses else "FAIL" if not good else "WARN" if failed else "PASS",
+                         f"{prefix} failover links",
+                         f"working={good} failed={failed}" if statuses else "No failover connection rows parsed")
+        output, error = section(record, "list cm traffic-group")
+        if error:
+            reporter.add("ERROR", f"{prefix} masquerade configuration", error)
+        else:
+            try:
+                groups = tmsh_objects(output, "cm traffic-group")
+                group = next((body for name, body in groups.items()
+                              if name.rsplit("/", 1)[-1].casefold() == "traffic-group-1"), None)
+                mac = tmsh_property(group, "mac") if group is not None else None
+                if not mac or not re.fullmatch(r"[\da-fA-F]{2}(?::[\da-fA-F]{2}){5}", mac):
+                    reporter.add("FAIL", f"{prefix} masquerade configuration",
+                                 "traffic-group-1 MAC missing or invalid")
+                else:
+                    observed_macs[side] = mac.casefold()
+                    reporter.add("PASS" if int(mac[:2], 16) & 3 == 2 else "FAIL",
+                                 f"{prefix} masquerade MAC format",
+                                 f"mac={mac}; locally administered unicast required")
+            except ValueError as exc:
+                reporter.add("ERROR", f"{prefix} masquerade configuration", str(exc))
+        output, error = section(record, 'show sys hardware | grep "Base MAC"')
+        if error:
+            reporter.add("ERROR", f"{prefix} base MAC", error)
+        else:
+            match = re.search(r"(?im)^\s*Base MAC\s+([\da-fA-F]{2}(?::[\da-fA-F]{2}){5})\s*$", output)
+            if not match:
+                reporter.add("ERROR", f"{prefix} base MAC", "No base MAC found in hardware output")
+            else:
+                try:
+                    base_candidates[side] = derive_masquerade_mac(match.group(1))
+                except ValueError as exc:
+                    reporter.add("ERROR", f"{prefix} base MAC", str(exc))
+    if len(observed_macs) == 2:
+        reporter.add("PASS" if len(set(observed_macs.values())) == 1 else "FAIL",
+                     "Target pair masquerade MAC consistency", f"configured={observed_macs}")
+    if observed_macs and base_candidates:
+        if len(members) == 1 and next(iter(observed_macs.values())) not in base_candidates.values():
+            reporter.add("WARN", "Target masquerade MAC derivation",
+                         "Does not derive from selected member; peer base MAC not collected")
+        elif len(members) == 2 and len(base_candidates) < 2:
+            reporter.add("WARN", "Target masquerade MAC derivation",
+                         "Peer base MAC unavailable; cannot rule out peer-derived masquerade")
+        else:
+            matches = set(observed_macs.values()) <= set(base_candidates.values())
+            reporter.add("PASS" if matches else "FAIL", "Target masquerade MAC derivation",
+                         f"configured={observed_macs}; derived from members={base_candidates}")
+
+
+def compare_platform(reporter: Reporter, side: str, expected: dict, observed: dict,
+                     hostname_suffix: str) -> None:
     prefix = f"{side.upper()} F5OS"
     host = expected["rseries_host"]
     target = expected["target"]
     reporter.compare(f"{prefix} host hostname", host["expected_hostname"],
-                     observed.get("hostname"), observed.get("hostname_error"), casefold=True)
+                     observed.get("hostname"), observed.get("hostname_error"),
+                     casefold=True, hostname_suffix=hostname_suffix)
     reporter.compare(f"{prefix} host management IP", host["management_ip"],
                      observed.get("management_ip"), observed.get("management_ip_error"))
     reporter.compare(f"{prefix} host product", host["model"],
@@ -1477,6 +1662,8 @@ def compare_network(reporter: Reporter, side: str, source: dict | None,
                 new = network_name(str(new)) if new is not None else None
             if new is None:
                 reporter.add("FAIL", f"{label} {field}", f"Source property {old!r} absent from target")
+            elif field == "allow-service" and isinstance(old, (tuple, list)) and isinstance(new, (tuple, list)):
+                reporter.compare_items(f"{label} {field}", old, new)
             else:
                 reporter.compare(f"{label} {field}", old, new)
         # A floating self IP can be represented by either the explicit flag
@@ -1817,6 +2004,8 @@ def virtual_pairs(source: dict | None, target: dict | None,
 def compare_references(reporter: Reporter, side: str, source: dict | None,
                        target: dict | None) -> None:
     """Compare the statically reachable configuration of migrated VIPs."""
+    source_version = bigip_data(source).get("version")
+    source_major = int(source_version.split(".", 1)[0]) if source_version else None
     inventories: dict[str, tuple[dict, dict]] = {}
     for kind, (command, header) in REFERENCE_KINDS.items():
         old, old_error = object_inventory(source, command, header)
@@ -1862,23 +2051,44 @@ def compare_references(reporter: Reporter, side: str, source: dict | None,
                 # Certificate semantics are compared separately below.
                 old_fields = tmsh_fields(re.sub(r"\blast-modified\s+(?:\"[^\"]*\"|\S+)", "", before))
                 new_fields = tmsh_fields(re.sub(r"\blast-modified\s+(?:\"[^\"]*\"|\S+)", "", after))
-                for field, value in sorted(old_fields.items()):
+                for field in sorted(old_fields.keys() | new_fields.keys()):
+                    value = old_fields.get(field)
                     if kind in ("client_ssl", "server_ssl") and field in {
                             "cert", "key", "chain", "cert-key-chain", "ca-file", "trusted-cert-authority",
                             "crl-file", "cipher-group"}:
                         continue
                     if kind in ("client_ssl", "server_ssl") and field == "options":
-                        old_options = tuple(v for v in value if v != "no-dtlsv1.2") if isinstance(value, tuple) else value
                         target_value = new_fields.get(field)
-                        new_options = tuple(v for v in target_value if v != "no-dtlsv1.2") if isinstance(target_value, tuple) else target_value
-                        if old_options == new_options and (not isinstance(value, tuple) or
-                                                             "no-dtlsv1.2" not in value or
-                                                             isinstance(target_value, tuple) and "no-dtlsv1.2" in target_value):
+                        if isinstance(value, (tuple, type(None))) and isinstance(target_value, (tuple, type(None))):
+                            old_options = value or ()
+                            new_options = target_value or ()
+                            if Counter(old_options) == Counter(new_options):
+                                continue
+                            old_option_set, new_option_set = set(old_options), set(new_options)
+                            expected = {"no-tlsv1.3", "no-dtlsv1.2", "no-tls1.3", "no-dtls1.2"}
+                            conversion = (source_major is not None and source_major < 14 and
+                                          not (old_option_set - new_option_set) and
+                                          bool(new_option_set - old_option_set) and
+                                          (new_option_set - old_option_set) <= expected)
+                            if conversion:
+                                reporter.compare_items(f"{label} options", old_options, new_options, status="WARN")
+                                reporter.add("INFO", f"{label} options conversion",
+                                             f"Source BIG-IP {source_version}: migration adds TLS 1.3 / DTLS 1.2 "
+                                             "exclusions because TLS 1.3 was introduced in newer releases")
+                            else:
+                                reporter.compare_items(f"{label} options", old_options, new_options)
                             continue
+                    if isinstance(value, (tuple, type(None))) and isinstance(new_fields.get(field), tuple):
+                        if value != new_fields[field]:
+                            reporter.compare_items(f"{label} {field}", value or (), new_fields[field])
+                        continue
+                    if isinstance(value, tuple) and new_fields.get(field) is None:
+                        reporter.compare_items(f"{label} {field}", value, ())
+                        continue
                     if value != new_fields.get(field):
                         reporter.add("FAIL", f"{label} {field}",
                                      f"source={value!r} target={new_fields.get(field)!r}")
-                if not any(status == "FAIL" and entry.startswith(label + " ")
+                if not any(status in ("FAIL", "WARN") and entry.startswith(label + " ")
                            for status, entry, _ in reporter.results):
                     reporter.add("PASS", label, f"Target {new_name}: source attributes match")
             except ValueError as exc:
@@ -1925,8 +2135,24 @@ def compare_references(reporter: Reporter, side: str, source: dict | None,
         elif after is None:
             reporter.add("FAIL", label, "Source data group absent on target")
         else:
-            reporter.add("PASS" if before == after else "FAIL", label,
-                         f"source={before!r} target={after!r}" if before != after else f"target={new_name} records match")
+            if before == after:
+                reporter.add("PASS", label, f"target={new_name} records match")
+            else:
+                before_fields, after_fields = before["fields"], after["fields"]
+                for field in sorted(before_fields.keys() | after_fields.keys()):
+                    old_value, new_value = before_fields.get(field), after_fields.get(field)
+                    if old_value == new_value:
+                        continue
+                    if field == "records":
+                        reporter.compare_items(f"{label} records", old_value or (), new_value or ())
+                    elif isinstance(old_value, tuple) and isinstance(new_value, tuple):
+                        reporter.compare_items(f"{label} {field}", old_value, new_value)
+                    else:
+                        reporter.add("FAIL", f"{label} {field}",
+                                     f"source={reporter.red(repr(old_value))} target={reporter.red(repr(new_value))}")
+                if before["subtype"] != after["subtype"]:
+                    reporter.add("FAIL", f"{label} subtype",
+                                 f"source={before['subtype']} target={after['subtype']}")
 
     def compare_rule(old_ref: str, new_ref: str, old_owner: str, new_owner: str,
                      depth: int = 0) -> None:
@@ -2033,6 +2259,21 @@ def certificate_properties(body: str) -> dict[str, str | None]:
              "certificate-key-size", "certificate-key-curve-name", "cert-type",
              "version", "expiration-date", "expiration-string", "serial-number", "fingerprint")
     return {name: tmsh_property(body, name) for name in names}
+
+
+def san_items(value: str | None) -> tuple[str, ...]:
+    """Preserve SAN types and multiplicity while ignoring presentation order."""
+    if not value or value.casefold() == "none":
+        return ()
+    items = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        kind, sep, name = item.partition(":")
+        items.append(f"{kind.upper()}:{name.casefold()}" if sep and kind.casefold() == "dns" else
+                     f"{kind.upper()}:{name}" if sep else item)
+    return tuple(items)
 
 
 def certificate_cn(subject: str | None) -> str | None:
@@ -2148,6 +2389,24 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
     visited_server_eku: set[tuple[str, str]] = set()
     visited_bundles: set[tuple[str, str]] = set()
 
+    def compare_cipher_fields(label: str, before: str, after: str) -> None:
+        old_fields, new_fields = tmsh_fields(before), tmsh_fields(after)
+        if old_fields == new_fields:
+            reporter.add("PASS", label, "Attributes match")
+            return
+        for field in sorted(old_fields.keys() | new_fields.keys()):
+            old_value, new_value = old_fields.get(field), new_fields.get(field)
+            if old_value == new_value:
+                continue
+            if field == "ciphers" and isinstance(old_value, str) and isinstance(new_value, str):
+                reporter.compare_items(f"{label} {field}", old_value.split(":"),
+                                       new_value.split(":"), ordered=True)
+            elif isinstance(old_value, (tuple, type(None))) and isinstance(new_value, (tuple, type(None))):
+                reporter.compare_items(f"{label} {field}", old_value or (), new_value or (), ordered=True)
+            else:
+                reporter.add("FAIL", f"{label} {field}",
+                             f"source={reporter.red(repr(old_value))} target={reporter.red(repr(new_value))}")
+
     def compare_ciphers(old_ref: str | None, new_ref: str | None,
                         old_owner: str, new_owner: str) -> None:
         if not old_ref or old_ref == "none":
@@ -2166,10 +2425,7 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
             reporter.add("FAIL", label, f"source={'present' if before is not None else 'missing'} "
                          f"target={'present' if after is not None else 'missing'}")
             return
-        old_fields, new_fields = tmsh_fields(before), tmsh_fields(after)
-        reporter.add("PASS" if old_fields == new_fields else "FAIL", label,
-                     f"source={old_fields!r} target={new_fields!r}" if old_fields != new_fields
-                     else f"target={new_name} attributes match")
+        compare_cipher_fields(label, before, after)
         old_rules, new_rules = inventories["cipher_rule"]
         for field in ("allow", "exclude", "require"):
             src_refs, dst_refs = named_references(before, field), named_references(after, field)
@@ -2182,10 +2438,7 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                 if src_rule is None or dst_rule is None:
                     reporter.add("FAIL", rule_label, "Cipher rule absent from source or target inventory")
                 else:
-                    src_fields, dst_fields = tmsh_fields(src_rule), tmsh_fields(dst_rule)
-                    reporter.add("PASS" if src_fields == dst_fields else "FAIL", rule_label,
-                                 f"source={src_fields!r} target={dst_fields!r}" if src_fields != dst_fields
-                                 else "Rule attributes match")
+                    compare_cipher_fields(rule_label, src_rule, dst_rule)
 
     def compare_bundle(old_ref: str | None, new_ref: str | None,
                        old_owner: str, new_owner: str) -> None:
@@ -2238,13 +2491,20 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
             if not missing and not extra:
                 reporter.add("PASS", label, f"{matched}/{len(old_members)} fingerprints match")
             else:
+                standard_ca_bundle = any(os.path.basename(ref).casefold() == "ca-bundle.crt"
+                                         for ref in (old_name, new_name))
                 source_cn = {fingerprint: cn for fingerprint, cn in old_members}
-                missing_list = [f"CN={source_cn.get(fingerprint) or '(unavailable)'} "
-                                f"fingerprint={fingerprint}"
-                                for fingerprint, count in sorted(missing.items()) for _ in range(count)]
-                reporter.add("FAIL", label, f"matched={matched}/{len(old_members)} source fingerprints; "
-                             f"missing={sum(missing.values())} {missing_list}; "
-                             f"extra on target={sum(extra.values())}")
+                target_cn = {fingerprint: cn for fingerprint, cn in new_members}
+                detail = (f"matched={matched}/{len(old_members)} source fingerprints; "
+                          f"missing on target={sum(missing.values())}; extra on target={sum(extra.values())}")
+                if not standard_ca_bundle:
+                    for heading, entries, names in (("missing", missing, source_cn),
+                                                     ("extra", extra, target_cn)):
+                        for fingerprint, count in sorted(entries.items()):
+                            detail += (f"; {heading}: " + reporter.red(
+                                f"CN={names.get(fingerprint) or '(unavailable)'} "
+                                f"fingerprint={fingerprint}" + (f" x{count}" if count > 1 else "")))
+                reporter.add("WARN" if standard_ca_bundle else "FAIL", label, detail)
 
     def compare_certificate(old_ref: str | None, new_ref: str | None, kind: str,
                             old_owner: str, new_owner: str) -> bool:
@@ -2294,6 +2554,9 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                      f"source={old_props['subject']!r} target={new_props['subject']!r}")
         for field in ("issuer", "subject-alternative-name"):
             old_value, new_value = old_props[field], new_props[field]
+            if field == "subject-alternative-name":
+                reporter.compare_items(f"{label} {field}", san_items(old_value), san_items(new_value))
+                continue
             status = ("PASS" if old_value == new_value else
                       "WARN" if field == "issuer" and allowed_issuer_upgrade(
                           old_value, new_value, issuer_upgrades) else "FAIL")
@@ -2313,7 +2576,8 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                                              (old_props["issuer"] == new_props["issuer"] or
                                               allowed_issuer_upgrade(old_props["issuer"], new_props["issuer"],
                                                                      issuer_upgrades))
-                                             and old_props["subject-alternative-name"] == new_props["subject-alternative-name"]):
+                                             and Counter(san_items(old_props["subject-alternative-name"])) ==
+                                             Counter(san_items(new_props["subject-alternative-name"]))):
             reporter.add("INFO", label, f"Valid replacement {new_name}; expires {expires:%d %b %Y %H:%M UTC}")
         reporter.add("WARN", f"{label} signature/key usage",
                      "Complete X.509 extensions not exposed by validated tmsh output; unverified")
@@ -2340,9 +2604,15 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
             old_value, new_value = tmsh_property(before, field), tmsh_property(after, field)
             if old_value == new_value:
                 matching.append(field)
+            elif field == "ciphers" and old_value and new_value:
+                # OpenSSL directives are order-sensitive: report individual
+                # differences, and still fail if their order alone changes.
+                reporter.compare_items(f"{label} {field}", old_value.split(":"),
+                                       new_value.split(":"), ordered=True)
             else:
                 reporter.add("FAIL", f"{label} {field}",
-                             f"source={old_value!r} target={new_value!r}")
+                             f"source={reporter.red(repr(old_value))} "
+                             f"target={reporter.red(repr(new_value))}")
         if matching:
             reporter.add("PASS", f"{label} SSL attributes", f"Identical: {', '.join(matching)}")
         compare_ciphers(tmsh_property(before, "cipher-group"),
@@ -2366,7 +2636,7 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                 return None
             props = certificate_properties(body)
             cn = certificate_cn(props["subject"])
-            return (cn, props["issuer"], props["subject-alternative-name"]) if cn else None
+            return (cn, props["issuer"], tuple(sorted(san_items(props["subject-alternative-name"])))) if cn else None
 
         for old_slot in old_slots:
             identity = certificate_identity(old_slot, old_name, 0)
@@ -2593,7 +2863,7 @@ def main() -> int:
     ap.add_argument("--member", choices=("a", "b"), help="check only this cluster member (default: both)")
     ap.add_argument("--issuer-upgrades", type=Path,
                     help="private JSON list of approved source_cn/target_cn issuer renewals")
-    ap.add_argument("--hostname-suffix", help="private BIG-IP hostname DNS suffix for comparison")
+    ap.add_argument("--hostname-suffix", help="private BIG-IP and F5OS hostname DNS suffix for comparison")
     ap.add_argument("--ntp-sync", action="store_true", help="compatibility option; NTP sync runs automatically for system checks when SSHPASSNET is set")
     ap.add_argument("--snapshot-dir", type=Path, help="write restricted raw SSH snapshots here")
     ap.add_argument("--from-snapshot", type=Path, help="compare previously saved snapshots offline")
@@ -2653,6 +2923,7 @@ def main() -> int:
                           offline=bool(args.from_snapshot), check_system="system" in checks,
                           check_bigip=True, members=members)
 
+    target_records: dict[str, dict | None] = {}
     for side in members:
         device = manifest["devices"][side]
         roles = (["source", "target"] if checks & {"basic", "network", "routes", "system", "applications", "references", "certificates"} else []) + (["rseries_host"] if checks & {"platform", "network"} else [])
@@ -2665,6 +2936,8 @@ def main() -> int:
             if cli == "bigip":
                 commands = ["show sys version", "list sys global-settings hostname",
                             "list sys management-ip", "list sys management-route default"]
+                if role == "target" and "basic" in checks:
+                    commands += HA_COMMANDS
                 if "network" in checks:
                     commands += list(NETWORK_COMMANDS.values())
                 elif checks & {"applications", "references", "certificates"}:
@@ -2707,6 +2980,8 @@ def main() -> int:
                 reporter.add("ERROR", label, str(exc))
                 collected[role] = None
 
+        if "basic" in checks:
+            target_records[side] = collected.get("target")
         if args.collect_only:
             continue
         if "basic" in checks:
@@ -2718,7 +2993,7 @@ def main() -> int:
             record = collected.get("rseries_host")
             if record is not None and not record.get("error"):
                 compare_platform(reporter, side, device, f5os_data(
-                    record, device["target"]["tenant_name_candidates"]))
+                    record, device["target"]["tenant_name_candidates"]), hostname_suffix)
         if "network" in checks:
             compare_network(reporter, side, collected.get("source"), collected.get("target"),
                             collected.get("rseries_host"), device["target"]["tenant_name_candidates"])
@@ -2736,6 +3011,8 @@ def main() -> int:
         if "certificates" in checks:
             compare_certificates(reporter, side, collected.get("source"), collected.get("target"),
                                  manifest.get("migration_date"), issuer_upgrades)
+    if "basic" in checks and not args.collect_only:
+        compare_target_ha(reporter, manifest, target_records, hostname_suffix, members)
     return reporter.finish()
 
 
