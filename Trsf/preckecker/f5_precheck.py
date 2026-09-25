@@ -270,6 +270,7 @@ def collect_bigip_mux(host: str, commands: list[str], account: str,
         reuse_options = ["-o", "BatchMode=yes", "-S", socket_path]
         try:
             for index, command in enumerate(commands):
+                print(f"  [{index + 1}/{len(commands)}] {command}", flush=True)
                 argv = (["sshpass", "-e", "ssh"] if index == 0 else ["ssh"])
                 argv += options + (master_options if index == 0 else reuse_options)
                 argv += ["-l", username, host, command]
@@ -367,10 +368,14 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
         next_probe = started
         ready = False
         eof = False
+        probe_announced = False
         try:
             while time.monotonic() < deadline:
                 now = time.monotonic()
                 if not ready and now >= next_probe and proc.poll() is None:
+                    if not probe_announced:
+                        print(f"  [1/{len(commands)}] {commands[0]}", flush=True)
+                        probe_announced = True
                     try:
                         proc.stdin.write((commands[0] + "\n").encode())
                         proc.stdin.flush()
@@ -387,6 +392,8 @@ def collect_ssh(host: str, cli: str, commands: list[str], account: str,
                     if not ready and F5OS_READY.search(clean_transcript(collected.decode("utf-8", "replace"))):
                         ready = True
                         try:
+                            for index, command in enumerate(commands[1:], start=2):
+                                print(f"  [queued {index}/{len(commands)}] {command}", flush=True)
                             proc.stdin.write(("\n".join([*commands[1:], "exit", ""])).encode())
                             proc.stdin.flush()
                             proc.stdin.close()
@@ -518,6 +525,8 @@ ROUTE_COMMANDS = {"traffic": "list net route one-line",
 SYSTEM_COMMANDS = {"dns": "list sys dns one-line", "ntp": "list sys ntp one-line"}
 APPLICATION_COMMANDS = {"virtual": "list ltm virtual one-line",
                         "pool": "list ltm pool one-line"}
+# Status field-fmt resolves version-dependent service aliases to numeric ports.
+POOL_MEMBER_PORT_COMMAND = "show ltm pool members field-fmt"
 REFERENCE_COMMANDS = {
     "http": "cd /Common; list ltm profile http one-line",
     "tcp": "cd /Common; list ltm profile tcp one-line",
@@ -625,6 +634,7 @@ def inventory_section(record: dict | None, command: str) -> tuple[str | None, st
     if error and not error.startswith("Command boundary missing:"):
         # tmsh can report an empty object inventory as 'No entries found'.
         if not (command in (*ROUTE_COMMANDS.values(), *APPLICATION_COMMANDS.values(),
+                            POOL_MEMBER_PORT_COMMAND,
                             *REFERENCE_COMMANDS.values(), *CERTIFICATE_COMMANDS.values()) and
                 re.search(r"(?i)no entries (?:found|to display)",
                           record.get("sections", {}).get(command, ""))):
@@ -731,6 +741,19 @@ def application_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | 
     output, error = inventory_section(record, command)
     if error:
         return None, error
+    status_pools: dict[str, str] = {}
+    if kind == "pool":
+        status_output, status_error = inventory_section(record, POOL_MEMBER_PORT_COMMAND)
+        if status_error:
+            return None, status_error
+        try:
+            for status_name, status_body in tmsh_objects(status_output or "", "ltm pool").items():
+                path = object_path(status_name)
+                if path in status_pools:
+                    raise ValueError(f"Repeated pool status for {path}")
+                status_pools[path] = status_body
+        except ValueError as exc:
+            return None, f"{POOL_MEMBER_PORT_COMMAND}: {exc}"
     try:
         objects = tmsh_objects(output or "", f"ltm {kind}")
         if not objects and record:
@@ -760,18 +783,38 @@ def application_data(record: dict | None, kind: str) -> tuple[dict[str, dict] | 
             else:
                 member_block = tmsh_block(body, "members")
                 members: dict[str, dict] = {}
+                status_body = status_pools.get(object_path(name))
+                status_block = tmsh_block(status_body, "members") if status_body is not None else None
+                status_members: dict[str, str] = {}
+                for status_member_name, status_member_body in tmsh_objects_from_block(status_block or ""):
+                    status_key = scoped_name(status_member_name, name)
+                    if status_key in status_members:
+                        raise ValueError(f"ltm pool {name}: ambiguous member status {status_key}")
+                    status_members[status_key] = status_member_body
                 for member, member_body in tmsh_objects_from_block(member_block or ""):
                     properties = tmsh_fields(member_body, monitor_expressions=True)
-                    # The node name can change; an explicit address and service port
-                    # identify the actual backend more reliably.
-                    port = member.rsplit(":", 1)[-1] if ":" in member else ""
-                    address = properties.get("address") or member.rsplit(":", 1)[0]
+                    status_key = scoped_name(member, name)
+                    if status_key not in status_members:
+                        raise ValueError(f"ltm pool {name}: member {member} missing from field-fmt status")
+                    status_member = status_members.pop(status_key)
+                    port = tmsh_property(status_member, "port")
+                    if port is None or not port.isdigit() or not 0 <= int(port) <= 65535:
+                        raise ValueError(f"ltm pool {name}: member {member} has no valid numeric status port")
+                    address = properties.get("address") or tmsh_property(status_member, "addr")
+                    if not address:
+                        raise ValueError(f"ltm pool {name}: member {member} has no resolved address")
+                    status_address = tmsh_property(status_member, "addr")
+                    if status_address and status_address != address:
+                        raise ValueError(f"ltm pool {name}: member {member} status address differs from configuration")
+                    # Compare the actual endpoint even when a service alias changes.
                     identity = f"{address}:{port}"
                     if identity in members:
                         raise ValueError(f"ltm pool {name}: repeated member endpoint {identity}")
                     members[identity] = {"name": member, "fields": properties}
                 if member_block is None and fields.get("members") not in (None, "none"):
                     raise ValueError(f"ltm pool {name}: unrecognized members value")
+                if status_members:
+                    raise ValueError(f"ltm pool {name}: status has unrecognized members {sorted(status_members)}")
                 entry["members"] = members
             parsed[name] = entry
         return parsed, None
@@ -2069,7 +2112,8 @@ def compare_references(reporter: Reporter, side: str, source: dict | None,
                     value = old_fields.get(field)
                     if kind in ("client_ssl", "server_ssl") and field in {
                             "cert", "key", "chain", "cert-key-chain", "ca-file", "trusted-cert-authority",
-                            "crl-file", "cipher-group"}:
+                            "crl-file", "cipher-group", "inherit-ca-certkeychain",
+                            "revoked-cert-status-response-control"}:
                         continue
                     if kind in ("client_ssl", "server_ssl") and field == "options":
                         target_value = new_fields.get(field)
@@ -2961,7 +3005,7 @@ def main() -> int:
                 if "system" in checks:
                     commands += list(SYSTEM_COMMANDS.values())
                 if checks & {"applications", "references", "certificates"}:
-                    commands += list(APPLICATION_COMMANDS.values())
+                    commands += [*APPLICATION_COMMANDS.values(), POOL_MEMBER_PORT_COMMAND]
                 if "references" in checks:
                     commands += list(REFERENCE_COMMANDS.values())
                 if checks & {"references", "certificates"}:
