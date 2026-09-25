@@ -527,12 +527,13 @@ APPLICATION_COMMANDS = {"virtual": "list ltm virtual one-line",
                         "pool": "list ltm pool one-line"}
 # Status field-fmt resolves version-dependent service aliases to numeric ports.
 POOL_MEMBER_PORT_COMMAND = "show ltm pool members field-fmt"
+SNATPOOL_COMMAND = "list ltm snatpool one-line"
 REFERENCE_COMMANDS = {
     "http": "cd /Common; list ltm profile http one-line",
     "tcp": "cd /Common; list ltm profile tcp one-line",
     "fastl4": "cd /Common; list ltm profile fastl4 one-line",
     "one_connect": "cd /Common; list ltm profile one-connect one-line",
-    "snatpool": "cd /Common; list ltm snatpool one-line",
+    "snatpool": SNATPOOL_COMMAND,
     "rule": "cd /Common; list ltm rule",
     "policy": "cd /Common; list ltm policy one-line",
     "data_group": "cd /Common; list ltm data-group one-line",
@@ -1926,6 +1927,16 @@ def virtual_endpoint(name: str, entry: dict) -> tuple[str, ...]:
             str(fields.get("source", "0.0.0.0/0")), str(fields.get("mask", "")))
 
 
+def virtual_traffic_pool(body: str) -> str | None:
+    """Read only the VIP's top-level traffic pool, never its nested SNAT pool."""
+    value = tmsh_fields(body, bare_flags=VIRTUAL_BARE_FLAGS).get("pool")
+    if value is None or value == "none":
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"Unexpected virtual traffic pool {value!r}")
+    return value
+
+
 def virtual_vlan_tags(name: str, fields: dict, vlans: dict[str, dict]) -> tuple[str, ...]:
     """Resolve a virtual's VLAN list to tags, preserving duplicate references."""
     references = fields.get("vlans")
@@ -2068,6 +2079,46 @@ def compare_applications(reporter: Reporter, side: str, source: dict | None,
         for name in sorted(new.keys() - matched):
             reporter.add("WARN", f"{side.upper()} target pool {name}",
                          "No matching source pool; review target-only configuration")
+
+    old_snats, old_snat_error = object_inventory(source, SNATPOOL_COMMAND, "ltm snatpool")
+    new_snats, new_snat_error = object_inventory(target, SNATPOOL_COMMAND, "ltm snatpool")
+    for role, error in (("source", old_snat_error), ("target", new_snat_error)):
+        if error:
+            reporter.add("ERROR", f"{side.upper()} {role} snatpool inventory", error)
+    if old_snats is not None and new_snats is not None:
+        if not old_snats and not new_snats:
+            reporter.add("PASS", f"{side.upper()} snatpool inventory", "No configured objects on either device")
+        for name, body in sorted(old_snats.items()):
+            label = f"{side.upper()} snatpool {name}"
+            target_body = new_snats.get(name)
+            if target_body is None:
+                reporter.add("FAIL", label, "Source SNAT pool missing from target")
+                continue
+            try:
+                before, after = tmsh_fields(body), tmsh_fields(target_body)
+                differences = False
+                for field in sorted(before.keys() | after.keys()):
+                    original, actual = before.get(field), after.get(field)
+                    if field == "members":
+                        original_members = original if isinstance(original, tuple) else ()
+                        actual_members = actual if isinstance(actual, tuple) else ()
+                        if ((original not in (None, "none") and not isinstance(original, tuple)) or
+                                (actual not in (None, "none") and not isinstance(actual, tuple))):
+                            raise ValueError(f"SNAT pool {name}: unrecognized members field")
+                        if Counter(original_members) != Counter(actual_members):
+                            differences = True
+                            reporter.compare_items(f"{label} members", original_members, actual_members)
+                    elif original != actual:
+                        differences = True
+                        reporter.add("FAIL", f"{label} {field}",
+                                     f"source={original!r} target={actual!r}")
+                if not differences:
+                    reporter.add("PASS", label, "SNAT pool members and attributes match")
+            except ValueError as exc:
+                reporter.add("ERROR", label, str(exc))
+        for name in sorted(new_snats.keys() - old_snats.keys()):
+            reporter.add("WARN", f"{side.upper()} target snatpool {name}",
+                         "No matching source SNAT pool")
 
 
 REFERENCE_KINDS = {
@@ -2957,11 +3008,15 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                 if name in source_monitors or name in target_monitors]
 
     for old_vip, new_vip in pairs:
-        old_pool = tmsh_property(old_vips[old_vip], "pool")
-        new_pool = tmsh_property(new_vips[new_vip], "pool")
-        if not old_pool or old_pool == "none":
+        try:
+            old_pool = virtual_traffic_pool(old_vips[old_vip])
+            new_pool = virtual_traffic_pool(new_vips[new_vip])
+        except ValueError as exc:
+            reporter.add("ERROR", f"{side.upper()} VIP {old_vip} HTTPS monitors", str(exc))
             continue
-        if not new_pool or new_pool == "none":
+        if not old_pool:
+            continue
+        if not new_pool:
             reporter.add("FAIL", f"{side.upper()} VIP {old_vip} HTTPS monitors", "Target pool missing")
             continue
         src_pool_name, dst_pool_name = scoped_name(old_pool, old_vip), scoped_name(new_pool, new_vip)
@@ -3121,9 +3176,11 @@ def main() -> int:
                 if "system" in checks:
                     commands += list(SYSTEM_COMMANDS.values())
                 if checks & {"applications", "references", "certificates"}:
-                    commands += [*APPLICATION_COMMANDS.values(), POOL_MEMBER_PORT_COMMAND]
+                    commands += [*APPLICATION_COMMANDS.values(), POOL_MEMBER_PORT_COMMAND,
+                                 SNATPOOL_COMMAND]
                 if "references" in checks:
-                    commands += list(REFERENCE_COMMANDS.values())
+                    commands += [command for command in REFERENCE_COMMANDS.values()
+                                 if command not in commands]
                 if checks & {"references", "certificates"}:
                     commands += list(CERTIFICATE_COMMANDS.values())
                 if "certificates" in checks and "references" not in checks:
