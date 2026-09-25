@@ -260,6 +260,7 @@ def collect_bigip_mux(host: str, commands: list[str], account: str,
     sections: dict[str, str] = {}
     raw_parts: list[str] = []
     confirmed: dict[str, int] = {}
+    command_errors: dict[str, str] = {}
     error = None
     returncode = 0
     with tempfile.TemporaryDirectory(prefix="f5-precheck-") as socket_dir:
@@ -289,7 +290,12 @@ def collect_bigip_mux(host: str, commands: list[str], account: str,
                 raw_parts.append(f"$ {command}\n{output}" + (f"\n[ssh stderr] {stderr}" if stderr else ""))
                 returncode = completed.returncode
                 if returncode:
-                    error = f"{command} exited {returncode}: {(stderr or output).strip()[:180]}"
+                    failure = f"{command} exited {returncode}: {(stderr or output).strip()[:180]}"
+                    if command in HA_COMMANDS and index > 0:
+                        command_errors[command] = failure
+                        sections[command] = output
+                        continue  # An HA probe must not hide other collected inventories.
+                    error = failure
                     break
                 if index == 0:
                     if not BIGIP_READY.search(clean_transcript(output)):
@@ -320,7 +326,7 @@ def collect_bigip_mux(host: str, commands: list[str], account: str,
             password = ""
     return {"host": host, "cli": "bigip", "account": account,
             "commands": commands, "returncode": returncode, "error": error,
-            "raw": "\n".join(raw_parts), "sections": sections,
+            "raw": "\n".join(raw_parts), "sections": sections, "command_errors": command_errors,
             "confirmed_display_prompts": confirmed}
 
 
@@ -444,6 +450,8 @@ def section(record: dict | None, command: str) -> tuple[str | None, str | None]:
         return None, "No snapshot or SSH output"
     if record.get("error"):
         return None, record["error"]
+    if command in record.get("command_errors", {}):
+        return None, record["command_errors"][command]
     output = record.get("sections", {}).get(command)
     if output is None:
         return None, f"Command boundary missing: {command}; inspect raw snapshot"
@@ -537,7 +545,7 @@ VIRTUAL_BARE_FLAGS = frozenset({"dhcp-relay", "ip-forward", "internal", "l2-forw
                                 "vlans-disabled"})
 NTP_SYNC_COMMAND = 'bash -c "ntpq -np"'
 HA_COMMANDS = ("show cm device", "show cm sync-status", "show cm failover-status",
-               "list cm traffic-group", 'show sys hardware | grep "Base MAC"')
+               "list cm traffic-group", "show sys hardware")
 
 
 def tmsh_objects(output: str, kind: str, *, allow_identical_duplicates: bool = False) -> dict[str, str]:
@@ -1339,6 +1347,16 @@ def derive_masquerade_mac(value: str) -> str:
     return ":".join(octets)
 
 
+def hardware_base_mac(output: str) -> str:
+    """Read the base MAC from an unfiltered `show sys hardware` transcript."""
+    candidates = {item.casefold() for item in re.findall(
+        r"(?im)^[ \t]*Base MAC[ \t]*:?[ \t]+([\da-fA-F]{2}(?::[\da-fA-F]{2}){5})\b", output)}
+    if len(candidates) != 1:
+        raise ValueError("Base MAC missing from hardware output" if not candidates else
+                         "Multiple different base MACs in hardware output")
+    return next(iter(candidates))
+
+
 def compare_target_ha(reporter: Reporter, manifest: dict, collected: dict[str, dict | None],
                       hostname_suffix: str, members: tuple[str, ...]) -> None:
     """Check the target pair, including evidence from a single selected member."""
@@ -1416,18 +1434,14 @@ def compare_target_ha(reporter: Reporter, manifest: dict, collected: dict[str, d
                                  f"mac={mac}; locally administered unicast required")
             except ValueError as exc:
                 reporter.add("ERROR", f"{prefix} masquerade configuration", str(exc))
-        output, error = section(record, 'show sys hardware | grep "Base MAC"')
+        output, error = section(record, "show sys hardware")
         if error:
             reporter.add("ERROR", f"{prefix} base MAC", error)
         else:
-            match = re.search(r"(?im)^\s*Base MAC\s+([\da-fA-F]{2}(?::[\da-fA-F]{2}){5})\s*$", output)
-            if not match:
-                reporter.add("ERROR", f"{prefix} base MAC", "No base MAC found in hardware output")
-            else:
-                try:
-                    base_candidates[side] = derive_masquerade_mac(match.group(1))
-                except ValueError as exc:
-                    reporter.add("ERROR", f"{prefix} base MAC", str(exc))
+            try:
+                base_candidates[side] = derive_masquerade_mac(hardware_base_mac(output))
+            except ValueError as exc:
+                reporter.add("ERROR", f"{prefix} base MAC", str(exc))
     if len(observed_macs) == 2:
         reporter.add("PASS" if len(set(observed_macs.values())) == 1 else "FAIL",
                      "Target pair masquerade MAC consistency", f"configured={observed_macs}")
