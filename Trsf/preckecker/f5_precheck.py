@@ -2939,6 +2939,10 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
         cert_name, chain_name = scoped_name(cert_ref, owner), scoped_name(chain_ref, owner)
         which = "source" if role == 0 else "target"
         label = f"{side.upper()} {which} profile {owner} certificate chain"
+        if is_default_file(cert_ref, "crt"):
+            reporter.add("SKIP", label,
+                         "default.crt attached on this device; chain membership not applicable")
+            return
         if (which, cert_name, chain_name) in visited_chains:
             return
         visited_chains.add((which, cert_name, chain_name))
@@ -3125,14 +3129,15 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                              f"Identical: {', '.join(matches)}")
             expired_default = compare_certificate(old_slot["cert"], new_slot["cert"],
                                                   kind, old_name, new_name)
+            validate_chain(old_slot["cert"], old_slot["chain"], old_name, 0)
+            validate_chain(new_slot["cert"], new_slot["chain"], new_name, 1)
             if expired_default or (is_default_file(new_slot["cert"], "crt") and
                                    not is_default_file(old_slot["cert"], "crt")):
                 # The external renewal process intentionally leaves this slot at
-                # default.crt/default.key; dependent chain/key checks are irrelevant.
+                # default.crt/default.key; cross-device bundle and key comparisons
+                # are irrelevant. The real certificate's own chain was checked above.
                 continue
             compare_bundle(old_slot["chain"], new_slot["chain"], old_name, new_name)
-            validate_chain(old_slot["cert"], old_slot["chain"], old_name, 0)
-            validate_chain(new_slot["cert"], new_slot["chain"], new_name, 1)
             key_name = new_slot["key"]
             old_key = old_slot["key"]
             old_has_key = old_key not in (None, "none")
