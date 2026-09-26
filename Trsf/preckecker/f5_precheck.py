@@ -118,6 +118,13 @@ def load_manifest(path: Path) -> dict:
     return manifest
 
 
+def default_snapshot_dir(manifest: dict) -> Path:
+    package = manifest.get("migration_package")
+    if not isinstance(package, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", package):
+        raise ValueError("migration_package must be a safe directory name for snapshots")
+    return Path("snapshots") / package
+
+
 def clean_transcript(raw: str) -> str:
     return ANSI.sub("", raw.replace("\r\n", "\n").replace("\r", "\n")).replace("\x08", "")
 
@@ -2624,6 +2631,26 @@ def san_items(value: str | None) -> tuple[str, ...]:
     return tuple(items)
 
 
+def swapped_cn_and_san(old_cn: str | None, new_cn: str | None,
+                       old_san: str | None, new_san: str | None) -> bool:
+    """Accept only a true swap with exactly the same combined DNS identities."""
+    if not old_cn or not new_cn or old_cn.casefold() == new_cn.casefold():
+        return False
+    before, after = san_items(old_san), san_items(new_san)
+    return (f"DNS:{new_cn.casefold()}" in before and
+            f"DNS:{old_cn.casefold()}" in after and
+            Counter((f"DNS:{old_cn.casefold()}", *before)) ==
+            Counter((f"DNS:{new_cn.casefold()}", *after)))
+
+
+def certificate_dns_identity(body: str) -> tuple[str, ...] | None:
+    properties = certificate_properties(body)
+    cn = certificate_cn(properties["subject"])
+    if not cn:
+        return None
+    return tuple(sorted((f"DNS:{cn.casefold()}", *san_items(properties["subject-alternative-name"]))))
+
+
 def certificate_cn(subject: str | None) -> str | None:
     if not subject:
         return None
@@ -2689,6 +2716,56 @@ def bundle_members(body: str) -> tuple[tuple[str, str | None], ...] | None:
     return tuple(sorted(members, key=lambda member: member[0]))
 
 
+def chain_name_linkage(leaf_body: str, bundle_body: str) -> tuple[str, str]:
+    """Trace issuer DN to subject DN; tmsh metadata cannot verify signatures."""
+    block = tmsh_block(bundle_body, "bundle-certificates")
+    if block is None:
+        rows = [bundle_body] if tmsh_property(bundle_body, "subject") else []
+    else:
+        rows = [contents for _, contents in tmsh_objects_from_block(block)]
+    leaf_subject = tmsh_property(leaf_body, "subject")
+    issuer = tmsh_property(leaf_body, "issuer")
+    if not rows or not leaf_subject or not issuer:
+        return "WARN", "Chain linkage unverified: leaf or bundle subject/issuer unavailable"
+    def dn(value: str | None) -> str:
+        return re.sub(r"\s*,\s*", ",", (value or "").strip()).casefold()
+    candidates = [(tmsh_property(row, "subject"), tmsh_property(row, "issuer"),
+                   tmsh_property(row, "fingerprint"), tmsh_property(row, "cert-type")) for row in rows]
+    if any(not subject or not row_issuer for subject, row_issuer, _, _ in candidates):
+        return "WARN", "Chain linkage unverified: bundle member subject/issuer unavailable"
+    # A bundle may contain its own leaf. Skip that identical entry before
+    # finding the issuing CA so the count represents actual CA levels.
+    leaf_fp = tmsh_property(leaf_body, "fingerprint")
+    available = [(subject, row_issuer, fingerprint, cert_type)
+                 for subject, row_issuer, fingerprint, cert_type in candidates
+                 if not (leaf_fp and fingerprint == leaf_fp)]
+    matched = 0
+    while available:
+        matches = [(index, row) for index, row in enumerate(available) if dn(row[0]) == dn(issuer)]
+        if not matches:
+            break
+        if len(matches) > 1:
+            return "WARN", (f"Issuer/subject names link through {matched} CA level(s); "
+                            "ambiguous next issuer; signatures and root status unverified")
+        index, (subject, row_issuer, _, cert_type) = matches[0]
+        available.pop(index)
+        matched += 1
+        if cert_type and cert_type.casefold() != "ca":
+            return "FAIL", (f"Issuer/subject names link through {matched} CA level(s); "
+                            f"matched issuer is not a CA (cert-type={cert_type})")
+        if dn(subject) == dn(row_issuer):
+            return "WARN", (f"Issuer/subject names link through {matched} CA level(s); "
+                            "topmost certificate is self-issued" +
+                            (" CA/root candidate" if cert_type else " (CA type unverified)") +
+                            "; self-signature unverified")
+        issuer = row_issuer
+    if not matched:
+        return "FAIL", "0 CA levels match: leaf issuer absent from attached chain bundle"
+    return "WARN", (f"Issuer/subject names link through {matched} CA level(s); "
+                    "topmost certificate is not a self-issued root in this bundle; "
+                    "signatures unverified")
+
+
 def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                          target: dict | None, migration_date: str | None = None,
                          issuer_upgrades: set[tuple[str, str]] | None = None) -> None:
@@ -2736,6 +2813,7 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
     visited_certs: set[tuple[str, str]] = set()
     visited_server_eku: set[tuple[str, str]] = set()
     visited_bundles: set[tuple[str, str]] = set()
+    visited_chains: set[tuple[str, str, str]] = set()
 
     def compare_cipher_fields(label: str, before: str, after: str) -> None:
         old_fields, new_fields = tmsh_fields(before), tmsh_fields(after)
@@ -2848,11 +2926,33 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                 if not standard_ca_bundle:
                     for heading, entries, names in (("missing", missing, source_cn),
                                                      ("extra", extra, target_cn)):
-                        for fingerprint, count in sorted(entries.items()):
-                            detail += (f"; {heading}: " + reporter.red(
+                        for index, (fingerprint, count) in enumerate(sorted(entries.items()), 1):
+                            detail += (f"; {heading}[{index}/{len(entries)}]: " + reporter.red(
                                 f"CN={names.get(fingerprint) or '(unavailable)'} "
                                 f"fingerprint={fingerprint}" + (f" x{count}" if count > 1 else "")))
                 reporter.add("WARN" if standard_ca_bundle else "FAIL", label, detail)
+
+    def validate_chain(cert_ref: str | None, chain_ref: str | None,
+                       owner: str, role: int) -> None:
+        if not cert_ref or cert_ref == "none" or not chain_ref or chain_ref == "none":
+            return
+        cert_name, chain_name = scoped_name(cert_ref, owner), scoped_name(chain_ref, owner)
+        which = "source" if role == 0 else "target"
+        label = f"{side.upper()} {which} profile {owner} certificate chain"
+        if (which, cert_name, chain_name) in visited_chains:
+            return
+        visited_chains.add((which, cert_name, chain_name))
+        if "cert" not in inventories or "bundle" not in inventories:
+            reporter.add("ERROR", label, "Certificate or chain inventory unavailable")
+            return
+        leaf = inventories["cert"][role].get(cert_name)
+        chain = (inventories["bundle"][role].get(chain_name) or
+                 inventories["cert"][role].get(chain_name))
+        if leaf is None or chain is None:
+            reporter.add("FAIL", label, "Certificate or attached chain missing from inventory")
+            return
+        status, detail = chain_name_linkage(leaf, chain)
+        reporter.add(status, label, detail)
 
     def compare_certificate(old_ref: str | None, new_ref: str | None, kind: str,
                             old_owner: str, new_owner: str) -> bool:
@@ -2896,14 +2996,21 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
             return False
         old_props, new_props = certificate_properties(before), certificate_properties(after)
         old_cn, new_cn = certificate_cn(old_props["subject"]), certificate_cn(new_props["subject"])
-        subject_status = ("WARN" if not old_cn or not new_cn else "FAIL" if old_cn != new_cn
+        swapped = swapped_cn_and_san(old_cn, new_cn, old_props["subject-alternative-name"],
+                                     new_props["subject-alternative-name"])
+        subject_status = ("WARN" if swapped or not old_cn or not new_cn else "FAIL" if old_cn != new_cn
                           else "PASS" if old_props["subject"] == new_props["subject"] else "WARN")
         reporter.add(subject_status, f"{label} subject",
+                     ("SAN and CN have been swapped; " if swapped else "") +
                      f"source={old_props['subject']!r} target={new_props['subject']!r}")
         for field in ("issuer", "subject-alternative-name"):
             old_value, new_value = old_props[field], new_props[field]
             if field == "subject-alternative-name":
-                reporter.compare_items(f"{label} {field}", san_items(old_value), san_items(new_value))
+                if swapped:
+                    reporter.add("WARN", f"{label} {field}",
+                                 "SAN and CN have been swapped; combined DNS identities match")
+                else:
+                    reporter.compare_items(f"{label} {field}", san_items(old_value), san_items(new_value))
                 continue
             status = ("PASS" if old_value == new_value else
                       "WARN" if field == "issuer" and allowed_issuer_upgrade(
@@ -2920,12 +3027,13 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
             reporter.add("WARN", f"{label} expiration", "Target expiration-string missing or unparseable")
         elif expires <= datetime.now(timezone.utc):
             reporter.add("FAIL", f"{label} expiration", f"Target expired {expires:%d %b %Y %H:%M UTC}")
-        elif old_cn and old_cn == new_cn and (old_props["issuer"] and
+        elif old_cn and (old_cn == new_cn or swapped) and (old_props["issuer"] and
                                              (old_props["issuer"] == new_props["issuer"] or
                                               allowed_issuer_upgrade(old_props["issuer"], new_props["issuer"],
                                                                      issuer_upgrades))
-                                             and Counter(san_items(old_props["subject-alternative-name"])) ==
-                                             Counter(san_items(new_props["subject-alternative-name"]))):
+                                             and (swapped or
+                                                  Counter(san_items(old_props["subject-alternative-name"])) ==
+                                                  Counter(san_items(new_props["subject-alternative-name"])))):
             reporter.add("INFO", label, f"Valid replacement {new_name}; expires {expires:%d %b %Y %H:%M UTC}")
         reporter.add("WARN", f"{label} signature/key usage",
                      "Complete X.509 extensions not exposed by validated tmsh output; unverified")
@@ -2984,7 +3092,8 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                 return None
             props = certificate_properties(body)
             cn = certificate_cn(props["subject"])
-            return (cn, props["issuer"], tuple(sorted(san_items(props["subject-alternative-name"])))) if cn else None
+            dns_names = certificate_dns_identity(body)
+            return (props["issuer"], dns_names) if dns_names else None
 
         for old_slot in old_slots:
             identity = certificate_identity(old_slot, old_name, 0)
@@ -3014,11 +3123,16 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
             if matches:
                 reporter.add("PASS", f"{label} slot {old_slot['slot']} attributes",
                              f"Identical: {', '.join(matches)}")
-            if compare_certificate(old_slot["cert"], new_slot["cert"], kind, old_name, new_name):
+            expired_default = compare_certificate(old_slot["cert"], new_slot["cert"],
+                                                  kind, old_name, new_name)
+            if expired_default or (is_default_file(new_slot["cert"], "crt") and
+                                   not is_default_file(old_slot["cert"], "crt")):
                 # The external renewal process intentionally leaves this slot at
                 # default.crt/default.key; dependent chain/key checks are irrelevant.
                 continue
             compare_bundle(old_slot["chain"], new_slot["chain"], old_name, new_name)
+            validate_chain(old_slot["cert"], old_slot["chain"], old_name, 0)
+            validate_chain(new_slot["cert"], new_slot["chain"], new_name, 1)
             key_name = new_slot["key"]
             old_key = old_slot["key"]
             old_has_key = old_key not in (None, "none")
@@ -3097,8 +3211,12 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                     continue
                 old_value, new_value = old_fields.get(field), new_fields.get(field)
                 if old_value != new_value:
-                    reporter.add("FAIL", f"{label} {field}",
-                                 f"source={old_value!r} target={new_value!r}")
+                    equivalent = (field == "destination" and
+                                  old_value in (None, "none") and new_value == "*:*")
+                    reporter.add("WARN" if equivalent else "FAIL", f"{label} {field}",
+                                 f"source={old_value!r} target={new_value!r}" +
+                                 ("; default destination is functionally equivalent"
+                                  if equivalent else ""))
         except ValueError as exc:
             reporter.add("ERROR", label, str(exc))
         expired_default = compare_certificate(tmsh_property(src_body, "cert"),
@@ -3106,6 +3224,10 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                                               "https_monitor", source_name, target_name)
         compare_bundle(tmsh_property(src_body, "ca-file"), tmsh_property(dst_body, "ca-file"),
                        source_name, target_name)
+        validate_chain(tmsh_property(src_body, "cert"), tmsh_property(src_body, "chain"),
+                       source_name, 0)
+        validate_chain(tmsh_property(dst_body, "cert"), tmsh_property(dst_body, "chain"),
+                       target_name, 1)
         old_key, new_key = tmsh_property(src_body, "key"), tmsh_property(dst_body, "key")
         if old_key and old_key != "none" and not expired_default:
             if is_default_file(new_key, "key") and not is_default_file(old_key, "key"):
@@ -3214,7 +3336,7 @@ def compare_ntp_sync(reporter: Reporter, side: str, role: str, record: dict | No
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("manifest", type=Path, help="JSON from Export-F5Migration.ps1")
-    ap.add_argument("--checks", default="permissions,basic,platform", help="permissions,basic,platform,network,routes,system,applications,references,certificates,all and !category exclusions")
+    ap.add_argument("--checks", default="all", help="permissions,basic,platform,network,routes,system,applications,references,certificates,all and !category exclusions (default: all)")
     ap.add_argument("--filter", metavar="STATUSES", help="show only listed result labels, e.g. FAIL or FAIL,ERROR; summary still counts all")
     ap.add_argument("--nocolor", action="store_true", help="disable colored status labels")
     ap.add_argument("--no-irule-byte-diff", action="store_true",
@@ -3224,8 +3346,9 @@ def main() -> int:
                     help="private JSON list of approved source_cn/target_cn issuer renewals")
     ap.add_argument("--hostname-suffix", help="accepted BIG-IP/F5OS hostname suffixes (comma-separated)")
     ap.add_argument("--ntp-sync", action="store_true", help="compatibility option; NTP sync runs automatically for system checks when SSHPASSNET is set")
-    ap.add_argument("--snapshot-dir", type=Path, help="write restricted raw SSH snapshots here")
-    ap.add_argument("--from-snapshot", type=Path, help="compare previously saved snapshots offline")
+    ap.add_argument("--snapshot-dir", type=Path, help="override default snapshots/MIGRATION_PACKAGE live output directory")
+    ap.add_argument("--from-snapshot", nargs="?", const=Path("__DEFAULT_SNAPSHOT__"), type=Path,
+                    help="compare saved snapshots; omit directory to use snapshots/MIGRATION_PACKAGE")
     ap.add_argument("--collect-only", action="store_true")
     ap.add_argument("--f5os-account", choices=("regular", "privileged"), default="regular")
     ap.add_argument("--timeout", type=int, default=90, help="seconds per BIG-IP command or F5OS SSH session")
@@ -3252,19 +3375,18 @@ def main() -> int:
         default_map_path = Path(__file__).resolve().parent / ".private" / "issuer-upgrades.json"
         issuer_map_path = default_map_path if default_map_path.is_file() else None
     issuer_upgrades = load_issuer_upgrades(issuer_map_path) if "certificates" in checks else set()
-    if checks != {"permissions"} and not args.from_snapshot and not args.snapshot_dir:
-        ap.error("A live run requires --snapshot-dir for raw CLI evidence")
     try:
         status_filter = parse_status_filter(args.filter)
     except ValueError as exc:
         ap.error(str(exc))
     manifest = load_manifest(args.manifest)
+    if args.from_snapshot == Path("__DEFAULT_SNAPSHOT__"):
+        args.from_snapshot = default_snapshot_dir(manifest)
+    elif args.from_snapshot is None and args.snapshot_dir is None:
+        args.snapshot_dir = default_snapshot_dir(manifest)
     color = (not args.nocolor and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
              and "NO_COLOR" not in os.environ)
     reporter = Reporter(status_filter=status_filter, color=color)
-    if "certificates" in checks and issuer_map_path is None:
-        reporter.add("WARN", "Issuer renewal mapping",
-                     "Private issuer upgrade map missing; any changed issuer will fail")
     members = (args.member,) if args.member else ("a", "b")
     package = manifest.get("package_details") or {}
     parsed_date = parse_migration_date(manifest.get("migration_date"))
@@ -3278,7 +3400,22 @@ def main() -> int:
     reporter.add("INFO", "Migration", "\t".join(
         f"{name}: {re.sub(r'\s+', ' ', str(value)).strip() if value not in (None, '') else '(missing)'}"
         for name, value in metadata), force=True, inline=True)
+    environment = (("Environment", package.get("environment_2")),
+                   ("Purpose", package.get("purpose")),
+                   ("Silo", package.get("silo")),
+                   ("Environment (package)", package.get("environment")),
+                   ("Environment 1", package.get("environment_1")))
+    reporter.add("INFO", "Environment", "\t".join(
+        f"{name}: {re.sub(r'\s+', ' ', str(value)).strip() if value not in (None, '') else '(missing)'}"
+        for name, value in environment), force=True, inline=True)
+    if "certificates" in checks and issuer_map_path is None:
+        reporter.add("WARN", "Issuer renewal mapping",
+                     "Private issuer upgrade map missing; any changed issuer will fail")
+    def category(name: str, side: str | None = None) -> None:
+        reporter.add("INFO", "Check category", f"{side.upper() + ' ' if side else ''}{name}",
+                     force=True)
     if "permissions" in checks:
+        category("permissions")
         check_permissions(reporter, manifest, args.host_key_mode,
                           offline=bool(args.from_snapshot), check_system="system" in checks,
                           check_bigip=True, members=members)
@@ -3347,31 +3484,39 @@ def main() -> int:
         if args.collect_only:
             continue
         if "basic" in checks:
+            category("basic", side)
             for role in ("source", "target"):
                 record = collected.get(role)
                 if record is not None and not record.get("error"):
                     compare_bigip(reporter, side, role, device[role], bigip_data(record), hostname_suffix)
         if "platform" in checks:
+            category("platform", side)
             record = collected.get("rseries_host")
             if record is not None and not record.get("error"):
                 compare_platform(reporter, side, device, f5os_data(
                     record, device["target"]["tenant_name_candidates"]), hostname_suffix)
         if "network" in checks:
+            category("network", side)
             compare_network(reporter, side, collected.get("source"), collected.get("target"),
                             collected.get("rseries_host"), device["target"]["tenant_name_candidates"])
         if "routes" in checks:
+            category("routes", side)
             compare_routes(reporter, side, collected.get("source"), collected.get("target"),
                            device["target"]["management_gateway"])
         if "system" in checks:
+            category("system", side)
             compare_system(reporter, side, collected.get("source"), collected.get("target"))
             for role in ("source", "target"):
                 compare_ntp_sync(reporter, side, role, collected.get(role))
         if "applications" in checks:
+            category("applications", side)
             compare_applications(reporter, side, collected.get("source"), collected.get("target"))
         if "references" in checks:
+            category("references", side)
             compare_references(reporter, side, collected.get("source"), collected.get("target"),
                                irule_byte_diff=not args.no_irule_byte_diff)
         if "certificates" in checks:
+            category("certificates", side)
             compare_certificates(reporter, side, collected.get("source"), collected.get("target"),
                                  manifest.get("migration_date"), issuer_upgrades)
     if "basic" in checks and not args.collect_only:
