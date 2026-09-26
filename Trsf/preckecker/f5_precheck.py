@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3.12
 """Read-only F5 migration validator (manifest schema 2).
 
 `permissions`, `basic`, `platform`, `network`, `routes`, `system`, `applications`,
