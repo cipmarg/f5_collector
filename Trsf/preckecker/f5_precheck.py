@@ -2924,12 +2924,14 @@ def compare_certificates(reporter: Reporter, side: str, source: dict | None,
                 detail = (f"matched={matched}/{len(old_members)} source fingerprints; "
                           f"missing on target={sum(missing.values())}; extra on target={sum(extra.values())}")
                 if not standard_ca_bundle:
+                    subitems = []
                     for heading, entries, names in (("missing", missing, source_cn),
                                                      ("extra", extra, target_cn)):
                         for index, (fingerprint, count) in enumerate(sorted(entries.items()), 1):
-                            detail += (f"; {heading}[{index}/{len(entries)}]: " + reporter.red(
+                            subitems.append(f"\t{heading}[{index}/{len(entries)}]: " + reporter.red(
                                 f"CN={names.get(fingerprint) or '(unavailable)'} "
                                 f"fingerprint={fingerprint}" + (f" x{count}" if count > 1 else "")))
+                    detail += "\n" + "\n".join(subitems)
                 reporter.add("WARN" if standard_ca_bundle else "FAIL", label, detail)
 
     def validate_chain(cert_ref: str | None, chain_ref: str | None,
