@@ -3404,17 +3404,26 @@ def main() -> int:
                 ("PM", package.get("project_manager")),
                 ("TL", package.get("technical_lead")),
                 ("ACI engineer", package.get("aci_engineer")))
-    reporter.add("INFO", "Migration", "\t".join(
-        f"{name}: {re.sub(r'\s+', ' ', str(value)).strip() if value not in (None, '') else '(missing)'}"
-        for name, value in metadata), force=True, inline=True)
     environment = (("Environment", package.get("environment_2")),
                    ("Purpose", package.get("purpose")),
                    ("Silo", package.get("silo")),
                    ("Environment (package)", package.get("environment")),
                    ("Environment 1", package.get("environment_1")))
-    reporter.add("INFO", "Environment", "\t".join(
-        f"{name}: {re.sub(r'\s+', ' ', str(value)).strip() if value not in (None, '') else '(missing)'}"
-        for name, value in environment), force=True, inline=True)
+    def info_items(items: tuple[tuple[str, object], ...]) -> list[str]:
+        return [f"{name}: {re.sub(r'\s+', ' ', str(value)).strip() if value not in (None, '') else '(missing)'}"
+                for name, value in items]
+
+    metadata_items, environment_items = info_items(metadata), info_items(environment)
+    widths = [max(len(metadata_items[index]),
+                  len(environment_items[index]) if index < len(environment_items) else 0) + 2
+              for index in range(len(metadata_items))]
+
+    def info_row(items: list[str]) -> str:
+        return "".join(item.ljust(widths[index]) if index < len(items) - 1 else item
+                       for index, item in enumerate(items))
+
+    reporter.add("INFO", "Migration", info_row(metadata_items), force=True, inline=True)
+    reporter.add("INFO", "Environment", info_row(environment_items), force=True, inline=True)
     if "certificates" in checks and issuer_map_path is None:
         reporter.add("WARN", "Issuer renewal mapping",
                      "Private issuer upgrade map missing; any changed issuer will fail")
